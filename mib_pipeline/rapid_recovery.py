@@ -12,6 +12,7 @@ contains one stronger, exact-case biometric value.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from datetime import date
 from pathlib import Path
@@ -26,6 +27,16 @@ from .extraction import (
 )
 from .ingestion import Rect, RenderedCase, RenderedPage
 from .models import PredictionRow
+from .recovery_audit import (
+    CandidateValidationPolicy,
+    RecoveryAuditOverlay,
+    RecoveryFieldAudit,
+    VisibleRecoveryResult,
+    observed_applicant_scopes,
+    recovered_field_audit,
+    unchanged_field_audit,
+    visible_repair_field_audit,
+)
 from .resolution import FieldState, ResolvedCase, ResolvedField
 
 
@@ -45,6 +56,7 @@ RAPID_OUTPUT_FIELDS = frozenset(
     }
 )
 RAPID_RISK_FIELD = "risk_flags"
+RAPID_RECOVERY_ROUTE_ID = "targeted_rapidocr"
 RAPID_RISK_ROUTE_FIELDS = frozenset(
     {
         "species_code",
@@ -63,6 +75,7 @@ BIOMETRIC_APPLICANT_MINIMUM_CONFIDENCE = 0.80
 SOURCE_PRIORITY_MINIMUM_CONFIDENCE = 0.90
 RAPID_BAD_CUES = frozenset({"strikethrough", "sample_denial_watermark"})
 SEMANTIC_DENIAL_CONFIDENCE = 0.9166666666666666
+SEMANTIC_EVIDENCE_MINIMUM_CONFIDENCE = 0.90
 REVIEW_APPROVAL_CONFIDENCE = 0.80
 XW1_MULTISOURCE_REVIEW_APPROVAL_CONFIDENCE = 0.98
 XW1_MULTISOURCE_COMPLETE_REVIEW_RECOVERY = (
@@ -108,12 +121,27 @@ class RapidOcrEngine:
     from the installed wheel; no URL or user cache is consulted.
     """
 
+    _VERSION = "3.9.2"
+    _MODEL_SHA256 = {
+        "PP-OCRv6_det_small.onnx": (
+            "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f"
+        ),
+        "PP-OCRv6_rec_small.onnx": (
+            "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884"
+        ),
+        "ch_ppocr_mobile_v2.0_cls_mobile.onnx": (
+            "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c"
+        ),
+    }
+    _TEXT_SCORE = 0.30
+
     def __init__(
         self,
         *,
         engine_factory: Callable[..., Any] | None = None,
         package_root: Path | str | None = None,
     ) -> None:
+        verify_bundled_models = engine_factory is None
         if engine_factory is None:
             try:
                 import rapidocr as rapidocr_package
@@ -127,15 +155,48 @@ class RapidOcrEngine:
         if package_root is None:
             raise ValueError("package_root is required with a custom engine_factory")
 
-        model_root = str(Path(package_root).resolve() / "models")
+        model_root_path = Path(package_root).resolve() / "models"
+        if verify_bundled_models:
+            self._verify_bundled_models(model_root_path)
+        model_root = str(model_root_path)
         self._engine = engine_factory(
             params={
                 "Global.model_root_dir": model_root,
                 "Global.log_level": "error",
-                "Global.text_score": 0.30,
+                "Global.text_score": self._TEXT_SCORE,
                 "EngineConfig.onnxruntime.intra_op_num_threads": 1,
                 "EngineConfig.onnxruntime.inter_op_num_threads": 1,
             }
+        )
+
+    @classmethod
+    def _verify_bundled_models(cls, model_root: Path) -> None:
+        """Fail closed when the installed OCR weights differ from the pin."""
+
+        for filename, expected_sha256 in sorted(cls._MODEL_SHA256.items()):
+            model_path = model_root / filename
+            try:
+                actual_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"RapidOCR model is unavailable: {filename}"
+                ) from exc
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"RapidOCR model digest mismatch: {filename}"
+                )
+
+    @property
+    def provenance_id(self) -> str:
+        """Identify the exact pinned model set and inference configuration."""
+
+        model_set = ",".join(
+            f"{filename}={digest}"
+            for filename, digest in sorted(self._MODEL_SHA256.items())
+        )
+        return (
+            f"rapidocr:version={self._VERSION}:models={model_set}:"
+            f"text_score={self._TEXT_SCORE:.2f}:ort_threads=1/1"
         )
 
     def read_page(self, page: RenderedPage) -> tuple[OcrToken, ...]:
@@ -186,6 +247,8 @@ def build_rapid_extractor() -> VisibleEvidenceExtractor:
         orientation_retry=False,
         trusted_scope_repair=False,
         risk_flag_retry=False,
+        ocr_route_id=RAPID_RECOVERY_ROUTE_ID,
+        ocr_view_id="rendered_page",
     )
 
 
@@ -270,10 +333,12 @@ class RapidOutputRecoveryProcessor:
             )
         )
 
-    @staticmethod
+    @classmethod
     def _authoritative_rapid_decision(
+        cls,
         *,
         case_id: str,
+        source_sha256: str,
         primary_resolved: ResolvedCase,
         primary_outcome: AdjudicationOutcome,
         rapid_candidates: Iterable[CandidateEvidence],
@@ -301,6 +366,15 @@ class RapidOutputRecoveryProcessor:
             and candidate.case_id_hint == case_id
             and candidate.applicant_hint in {None, active_applicant}
             and not (RAPID_BAD_CUES & set(candidate.visual_cues))
+            and cls._complete_candidate_provenance(
+                candidate,
+                source_sha256=source_sha256,
+                linked_applicant=active_applicant,
+            )
+            and any(
+                provenance.route_id == RAPID_RECOVERY_ROUTE_ID
+                for provenance in candidate.ocr_provenance
+            )
         )
         decisions = {candidate.value for candidate in eligible}
         return next(iter(decisions)) if len(decisions) == 1 else None
@@ -366,12 +440,35 @@ class RapidOutputRecoveryProcessor:
         )
 
     @staticmethod
+    def _complete_candidate_provenance(
+        candidate: CandidateEvidence,
+        *,
+        source_sha256: str,
+        linked_applicant: str | None,
+    ) -> bool:
+        """Validate the physical observation before it can affect a decision."""
+
+        if not candidate.ocr_provenance:
+            return False
+        allowed_scopes = {None, linked_applicant}
+        return all(
+            provenance.observation.source_sha256 == source_sha256
+            and provenance.observation.page_index == candidate.page_index
+            and provenance.observation.applicant_scope in allowed_scopes
+            and provenance.observation.box.width > 0.0
+            and provenance.observation.box.height > 0.0
+            for provenance in candidate.ocr_provenance
+        )
+
+    @staticmethod
     def _visible_resolved_value(
         *,
         case_id: str,
+        source_sha256: str,
         resolved: ResolvedCase,
         field_name: str,
         unsafe_pages: frozenset[int],
+        minimum_confidence: float = SEMANTIC_EVIDENCE_MINIMUM_CONFIDENCE,
     ) -> str | None:
         """Return one exact-case visible winner, never a serialization prior."""
 
@@ -391,13 +488,54 @@ class RapidOutputRecoveryProcessor:
             or evidence.superseded
             or evidence.source != "visible_ocr"
             or evidence.evidence_type is EvidenceType.TEXT_LAYER
+            or evidence.ocr_confidence < minimum_confidence
             or evidence.case_id_hint != case_id
             or evidence.applicant_hint not in {None, resolved.active_applicant}
             or evidence.page_index in unsafe_pages
             or RAPID_BAD_CUES.intersection(evidence.visual_cues)
+            or not RapidOutputRecoveryProcessor._complete_candidate_provenance(
+                evidence,
+                source_sha256=source_sha256,
+                linked_applicant=resolved.active_applicant,
+            )
         ):
             return None
         return resolved_field.value
+
+    @classmethod
+    def _has_explicit_visible_none_risk(
+        cls,
+        *,
+        case_id: str,
+        source_sha256: str,
+        primary_candidates: Iterable[CandidateEvidence],
+        primary_resolved: ResolvedCase,
+        rapid_candidates: Iterable[CandidateEvidence],
+        rapid_resolved: ResolvedCase | None,
+    ) -> bool:
+        """Require a resolved visible ``none`` fact, never the row fallback."""
+
+        sources = (
+            (tuple(primary_candidates), primary_resolved),
+            (tuple(rapid_candidates), rapid_resolved),
+        )
+        for candidates, resolved in sources:
+            if resolved is None:
+                continue
+            value = cls._visible_resolved_value(
+                case_id=case_id,
+                source_sha256=source_sha256,
+                resolved=resolved,
+                field_name=RAPID_RISK_FIELD,
+                unsafe_pages=cls._unsafe_pages(candidates),
+                minimum_confidence=REVIEW_APPROVAL_CONFIDENCE,
+            )
+            if (
+                value is not None
+                and " ".join(value.strip().split()).casefold() == "none"
+            ):
+                return True
+        return False
 
     @staticmethod
     def _parse_risk_flags(value: str | None) -> frozenset[str]:
@@ -414,6 +552,7 @@ class RapidOutputRecoveryProcessor:
         cls,
         *,
         case_id: str,
+        source_sha256: str,
         payload: dict[str, object],
         primary_candidates: Iterable[CandidateEvidence],
         rapid_candidates: Iterable[CandidateEvidence],
@@ -451,6 +590,7 @@ class RapidOutputRecoveryProcessor:
             if (
                 value := cls._visible_resolved_value(
                     case_id=case_id,
+                    source_sha256=source_sha256,
                     resolved=primary_resolved,
                     field_name=field_name,
                     unsafe_pages=primary_unsafe_pages,
@@ -464,6 +604,7 @@ class RapidOutputRecoveryProcessor:
         for field_name in SEMANTIC_EVIDENCE_FIELDS & unknown_fields:
             value = cls._visible_resolved_value(
                 case_id=case_id,
+                source_sha256=source_sha256,
                 resolved=rapid_resolved,
                 field_name=field_name,
                 unsafe_pages=rapid_unsafe_pages,
@@ -473,6 +614,7 @@ class RapidOutputRecoveryProcessor:
         if recover_risk:
             rapid_risk = cls._visible_resolved_value(
                 case_id=case_id,
+                source_sha256=source_sha256,
                 resolved=rapid_resolved,
                 field_name=RAPID_RISK_FIELD,
                 unsafe_pages=rapid_unsafe_pages,
@@ -503,12 +645,213 @@ class RapidOutputRecoveryProcessor:
             matches.append(SEMANTIC_DENIAL_RULE_IDS[3])
         return tuple(matches)
 
-    @staticmethod
-    def _rapid_value(resolved: ResolvedCase, field_name: str) -> str | None:
+    @classmethod
+    def _recoverable_rapid_field(
+        cls,
+        *,
+        case_id: str,
+        source_sha256: str,
+        resolved: ResolvedCase,
+        field_name: str,
+    ) -> ResolvedField | None:
+        """Return a visible, provenance-complete Rapid winner for serialization."""
+
         field = resolved.fields.get(field_name)
-        if field is None or field.state is not FieldState.RESOLVED:
+        if (
+            field is None
+            or field.state is not FieldState.RESOLVED
+            or field.value is None
+        ):
             return None
-        return field.value
+        evidence = field.winning_evidence
+        if (
+            evidence is None
+            or evidence.field_name != field_name
+            or evidence.value != field.value
+            or not evidence.legible
+            or evidence.superseded
+            or evidence.source != "visible_ocr"
+            or evidence.evidence_type is EvidenceType.TEXT_LAYER
+            or evidence.case_id_hint != case_id
+            or evidence.applicant_hint not in {None, resolved.active_applicant}
+            or RAPID_BAD_CUES.intersection(evidence.visual_cues)
+            or not cls._complete_candidate_provenance(
+                evidence,
+                source_sha256=source_sha256,
+                linked_applicant=resolved.active_applicant,
+            )
+            or not any(
+                provenance.route_id == RAPID_RECOVERY_ROUTE_ID
+                for provenance in evidence.ocr_provenance
+            )
+        ):
+            return None
+        return field
+
+    @staticmethod
+    def _audit_primary_field(
+        resolved: ResolvedCase,
+        field_name: str,
+    ) -> ResolvedField:
+        """Return the primary field, making an absent resolver slot explicit."""
+
+        field = resolved.fields.get(field_name)
+        if field is not None:
+            return field
+        return ResolvedField(
+            field_name=field_name,
+            state=FieldState.UNKNOWN,
+            value=None,
+            winning_evidence=None,
+            considered=(),
+            reason="field absent from primary resolver output",
+        )
+
+    @classmethod
+    def _visible_recovery_result(
+        cls,
+        *,
+        row: PredictionRow,
+        primary_resolved: ResolvedCase,
+        recovered_audits: dict[str, RecoveryFieldAudit] | None = None,
+        linked_recovery_scope: str | None = None,
+    ) -> VisibleRecoveryResult:
+        """Pair the row with a complete immutable field-state audit overlay."""
+
+        recovered_audits = dict(recovered_audits or {})
+        audits: list[RecoveryFieldAudit] = []
+        for field_name in _COMPLETE_REVIEW_OUTPUT_FIELDS:
+            recovered = recovered_audits.get(field_name)
+            if recovered is not None:
+                audits.append(recovered)
+                continue
+            audits.append(
+                unchanged_field_audit(
+                    primary=cls._audit_primary_field(
+                        primary_resolved,
+                        field_name,
+                    ),
+                    serialized_value=getattr(row, field_name),
+                    linked_recovery_scope=linked_recovery_scope,
+                )
+            )
+        return VisibleRecoveryResult(
+            row=row,
+            audit=RecoveryAuditOverlay.from_fields(
+                case_id=row.case_id,
+                fields=audits,
+            ),
+        )
+
+    @staticmethod
+    def _scope_key(value: str) -> str:
+        return " ".join(value.split()).casefold()
+
+    @classmethod
+    def _recovery_scope_contract(
+        cls,
+        *,
+        field_name: str,
+        candidate: CandidateEvidence,
+        primary_resolved: ResolvedCase,
+        rapid_resolved: ResolvedCase,
+    ) -> tuple[str | None, str] | None:
+        """Bind recovered facts to the pre-existing active applicant.
+
+        Applicant-name recovery is the sole exception: when primary linking
+        has no active applicant, one unambiguous Rapid-linked name may establish
+        the serialized name.  This records linkage; it does not fuse cases.
+        """
+
+        if field_name == "applicant_name" and primary_resolved.active_applicant is None:
+            linked_scope = rapid_resolved.active_applicant
+        else:
+            if (
+                primary_resolved.unresolved_linkage
+                or primary_resolved.active_applicant is None
+            ):
+                return None
+            linked_scope = primary_resolved.active_applicant
+            if (
+                rapid_resolved.active_applicant is not None
+                and cls._scope_key(rapid_resolved.active_applicant)
+                != cls._scope_key(linked_scope)
+            ):
+                return None
+
+        if (
+            linked_scope is None
+            or rapid_resolved.unresolved_linkage
+        ):
+            return None
+        scopes = observed_applicant_scopes(candidate)
+        if any(
+            cls._scope_key(scope) != cls._scope_key(linked_scope)
+            for scope in scopes
+        ):
+            return None
+        expected_observed_scope = linked_scope if scopes else None
+        return expected_observed_scope, linked_scope
+
+    @classmethod
+    def _primary_visible_repair_audit(
+        cls,
+        *,
+        field_name: str,
+        candidate: CandidateEvidence,
+        source_sha256: str,
+        serialization_before: str,
+        serialization_after: str,
+        primary_resolved: ResolvedCase,
+    ) -> RecoveryFieldAudit | None:
+        """Validate and record an output-only repair over primary evidence."""
+
+        if primary_resolved.unresolved_linkage:
+            return None
+        scopes = observed_applicant_scopes(candidate)
+        if field_name == "applicant_name":
+            if candidate.value is None:
+                return None
+            linked_scope = candidate.value
+        else:
+            linked_scope = primary_resolved.active_applicant
+            if linked_scope is None:
+                return None
+        if any(
+            cls._scope_key(scope) != cls._scope_key(linked_scope)
+            for scope in scopes
+        ):
+            return None
+        route_ids = tuple(
+            sorted(
+                {
+                    provenance.route_id
+                    for provenance in candidate.ocr_provenance
+                    if (
+                        provenance.view_box == candidate.box
+                        or provenance.observation.box == candidate.box
+                    )
+                }
+            )
+        )
+        if not route_ids:
+            return None
+        audit, _validation = visible_repair_field_audit(
+            primary=cls._audit_primary_field(primary_resolved, field_name),
+            serialization_before=serialization_before,
+            serialization_after=serialization_after,
+            candidate=candidate,
+            recovery_source=route_ids[0],
+            linked_recovery_scope=linked_scope,
+            validation_policy=CandidateValidationPolicy(
+                expected_field_name=field_name,
+                expected_source_sha256=source_sha256,
+                expected_page_index=candidate.page_index,
+                expected_applicant_scope=linked_scope if scopes else None,
+                minimum_confidence=0.0,
+            ),
+        )
+        return audit
 
     @staticmethod
     def _review_approval_arrival_age(value: str) -> int | None:
@@ -528,6 +871,7 @@ class RapidOutputRecoveryProcessor:
         cls,
         *,
         final_row: PredictionRow,
+        source_sha256: str,
         primary_candidates: Iterable[CandidateEvidence],
         primary_outcome: AdjudicationOutcome,
         primary_resolved: ResolvedCase,
@@ -543,8 +887,14 @@ class RapidOutputRecoveryProcessor:
 
         if (
             final_row.adjudication != "NEEDS_REVIEW"
-            or " ".join(final_row.risk_flags.strip().split()).casefold()
-            != "none"
+            or not cls._has_explicit_visible_none_risk(
+                case_id=primary_resolved.case_id,
+                source_sha256=source_sha256,
+                primary_candidates=primary_candidates,
+                primary_resolved=primary_resolved,
+                rapid_candidates=rapid_candidates,
+                rapid_resolved=rapid_resolved,
+            )
             or cls._primary_authoritative_decision(primary_outcome)
             or (
                 rapid_resolved is not None
@@ -592,8 +942,14 @@ class RapidOutputRecoveryProcessor:
             fallback_case_id=final_row.case_id,
         )
 
-    @staticmethod
-    def _clean_multisource_candidate(candidate: object) -> bool:
+    @classmethod
+    def _clean_multisource_candidate(
+        cls,
+        candidate: object,
+        *,
+        source_sha256: str,
+        linked_applicant: str,
+    ) -> bool:
         """Accept only live, legible facts read from rendered pixels."""
 
         return bool(
@@ -604,6 +960,11 @@ class RapidOutputRecoveryProcessor:
             and candidate.source == "visible_ocr"
             and candidate.evidence_type is not EvidenceType.TEXT_LAYER
             and not RAPID_BAD_CUES.intersection(candidate.visual_cues)
+            and cls._complete_candidate_provenance(
+                candidate,
+                source_sha256=source_sha256,
+                linked_applicant=linked_applicant,
+            )
         )
 
     @staticmethod
@@ -625,6 +986,7 @@ class RapidOutputRecoveryProcessor:
         cls,
         *,
         case_id: str,
+        source_sha256: str,
         active_applicant: str,
         field_name: str,
         expected_value: str,
@@ -636,7 +998,11 @@ class RapidOutputRecoveryProcessor:
         facts = tuple(
             candidate
             for candidate in candidates
-            if cls._clean_multisource_candidate(candidate)
+            if cls._clean_multisource_candidate(
+                candidate,
+                source_sha256=source_sha256,
+                linked_applicant=active_applicant,
+            )
             and candidate.field_name == field_name
             and candidate.value == expected_value
             and candidate.evidence_type is evidence_type
@@ -648,7 +1014,11 @@ class RapidOutputRecoveryProcessor:
         anchored_pages = {
             candidate.page_index
             for candidate in candidates
-            if cls._clean_multisource_candidate(candidate)
+            if cls._clean_multisource_candidate(
+                candidate,
+                source_sha256=source_sha256,
+                linked_applicant=active_applicant,
+            )
             and candidate.field_name == "applicant_name"
             and candidate.value == active_applicant
             and candidate.evidence_type is evidence_type
@@ -662,6 +1032,7 @@ class RapidOutputRecoveryProcessor:
         cls,
         *,
         case_id: str,
+        source_sha256: str,
         active_applicant: str,
         expected: tuple[tuple[str, str, EvidenceType], ...],
         candidates: tuple[CandidateEvidence, ...],
@@ -670,7 +1041,11 @@ class RapidOutputRecoveryProcessor:
 
         for field_name, expected_value, evidence_type in expected:
             if any(
-                cls._clean_multisource_candidate(candidate)
+                cls._clean_multisource_candidate(
+                    candidate,
+                    source_sha256=source_sha256,
+                    linked_applicant=active_applicant,
+                )
                 and candidate.field_name == field_name
                 and candidate.evidence_type is evidence_type
                 and candidate.case_id_hint in {None, case_id}
@@ -688,6 +1063,7 @@ class RapidOutputRecoveryProcessor:
         cls,
         *,
         final_row: PredictionRow,
+        source_sha256: str,
         primary_candidates: Iterable[CandidateEvidence],
         primary_outcome: AdjudicationOutcome,
         primary_resolved: ResolvedCase,
@@ -725,8 +1101,14 @@ class RapidOutputRecoveryProcessor:
             or active_applicant is None
             or final_row.applicant_name != active_applicant
             or final_row.visa_class != "XW-1"
-            or " ".join(final_row.risk_flags.strip().split()).casefold()
-            != "none"
+            or not cls._has_explicit_visible_none_risk(
+                case_id=primary_resolved.case_id,
+                source_sha256=source_sha256,
+                primary_candidates=primary_candidates,
+                primary_resolved=primary_resolved,
+                rapid_candidates=rapid_candidates,
+                rapid_resolved=rapid_resolved,
+            )
             or final_row.fee_status not in {"paid", "waived"}
             or not cls._complete_review_output(final_row)
             or trace.denial_reasons
@@ -777,7 +1159,11 @@ class RapidOutputRecoveryProcessor:
         ):
             return final_row
         if any(
-            cls._clean_multisource_candidate(candidate)
+            cls._clean_multisource_candidate(
+                candidate,
+                source_sha256=source_sha256,
+                linked_applicant=active_applicant,
+            )
             and candidate.field_name == RAPID_RISK_FIELD
             and " ".join(str(candidate.value).strip().split()).casefold()
             not in {"", "none", "unknown", "null"}
@@ -804,6 +1190,7 @@ class RapidOutputRecoveryProcessor:
         )
         if cls._multisource_conflict(
             case_id=primary_resolved.case_id,
+            source_sha256=source_sha256,
             active_applicant=active_applicant,
             expected=expected,
             candidates=all_candidates,
@@ -812,6 +1199,7 @@ class RapidOutputRecoveryProcessor:
         if not all(
             cls._same_page_source_fact(
                 case_id=primary_resolved.case_id,
+                source_sha256=source_sha256,
                 active_applicant=active_applicant,
                 field_name=field_name,
                 expected_value=expected_value,
@@ -835,6 +1223,7 @@ class RapidOutputRecoveryProcessor:
         cls,
         *,
         final_row: PredictionRow,
+        source_sha256: str,
         primary_candidates: Iterable[CandidateEvidence],
         primary_outcome: AdjudicationOutcome,
         primary_resolved: ResolvedCase,
@@ -847,6 +1236,7 @@ class RapidOutputRecoveryProcessor:
         rapid_candidates = tuple(rapid_candidates)
         recovered = cls._xw1_multisource_complete_review_recovery(
             final_row=final_row,
+            source_sha256=source_sha256,
             primary_candidates=primary_candidates,
             primary_outcome=primary_outcome,
             primary_resolved=primary_resolved,
@@ -855,6 +1245,7 @@ class RapidOutputRecoveryProcessor:
         )
         return cls._review_approval_head(
             final_row=recovered,
+            source_sha256=source_sha256,
             primary_candidates=primary_candidates,
             primary_outcome=primary_outcome,
             primary_resolved=primary_resolved,
@@ -868,7 +1259,7 @@ class RapidOutputRecoveryProcessor:
         case_id: str,
         primary_row: PredictionRow,
         primary_candidates: Iterable[CandidateEvidence],
-    ) -> tuple[PredictionRow, bool]:
+    ) -> tuple[PredictionRow, CandidateEvidence | None]:
         """Prefer one stronger exact-case biometric name over one intake name.
 
         This is deliberately an output-only repair over evidence already read
@@ -891,7 +1282,7 @@ class RapidOutputRecoveryProcessor:
             or RAPID_BAD_CUES.intersection(candidate.visual_cues)
             for candidate in scoped
         ):
-            return primary_row, False
+            return primary_row, None
 
         relevant = tuple(
             candidate
@@ -919,22 +1310,45 @@ class RapidOutputRecoveryProcessor:
         biometric_values = {candidate.value for candidate in biometrics}
         intake_values = {candidate.value for candidate in intakes}
         if len(biometric_values) != 1 or len(intake_values) != 1:
-            return primary_row, False
+            return primary_row, None
 
         biometric_value = next(iter(biometric_values))
         intake_value = next(iter(intake_values))
         if biometric_value == intake_value:
-            return primary_row, False
+            return primary_row, None
         if max(candidate.ocr_confidence for candidate in biometrics) < max(
             candidate.ocr_confidence for candidate in intakes
         ):
-            return primary_row, False
+            return primary_row, None
 
         payload = primary_row.to_dict()
         payload["applicant_name"] = biometric_value
         return (
             PredictionRow.from_mapping(payload, fallback_case_id=case_id),
-            True,
+            RapidOutputRecoveryProcessor._best_candidate(biometrics),
+        )
+
+    @staticmethod
+    def _best_candidate(
+        candidates: Iterable[CandidateEvidence],
+    ) -> CandidateEvidence:
+        """Select one equal-value support deterministically for the audit."""
+
+        candidates = tuple(candidates)
+        if not candidates:
+            raise ValueError("at least one candidate is required")
+        return min(
+            candidates,
+            key=lambda candidate: (
+                -candidate.ocr_confidence,
+                candidate.page_index,
+                candidate.box.left,
+                candidate.box.bottom,
+                candidate.box.right,
+                candidate.box.top,
+                candidate.evidence_type.value,
+                candidate.value or "",
+            ),
         )
 
     @staticmethod
@@ -981,7 +1395,7 @@ class RapidOutputRecoveryProcessor:
         primary_row: PredictionRow,
         primary_candidates: Iterable[CandidateEvidence],
         primary_resolved: ResolvedCase,
-    ) -> tuple[PredictionRow, frozenset[str]]:
+    ) -> tuple[PredictionRow, dict[str, CandidateEvidence]]:
         """Repair three serialized fields without changing policy state.
 
         The frozen gates cover values redundantly visible on a sponsor or
@@ -997,7 +1411,7 @@ class RapidOutputRecoveryProcessor:
         )
         active_applicant = primary_resolved.active_applicant
         payload = primary_row.to_dict()
-        repaired: set[str] = set()
+        repaired: dict[str, CandidateEvidence] = {}
 
         def intake_winner(field_name: str) -> CandidateEvidence | None:
             field = primary_resolved.fields.get(field_name)
@@ -1057,7 +1471,7 @@ class RapidOutputRecoveryProcessor:
             )
             if visa is not None and visa[0] != payload["visa_class"]:
                 payload["visa_class"] = visa[0]
-                repaired.add("visa_class")
+                repaired["visa_class"] = cls._best_candidate(visa[1])
 
         sponsor_winner = intake_winner("sponsor_id")
         if sponsor_winner is not None and active_applicant is not None:
@@ -1085,7 +1499,7 @@ class RapidOutputRecoveryProcessor:
                 > sponsor_winner.ocr_confidence
             ):
                 payload["sponsor_id"] = sponsor[0]
-                repaired.add("sponsor_id")
+                repaired["sponsor_id"] = cls._best_candidate(sponsor[1])
 
         arrival_winner = intake_winner("arrival_date")
         if arrival_winner is not None and active_applicant is not None:
@@ -1107,13 +1521,13 @@ class RapidOutputRecoveryProcessor:
                 > arrival_winner.ocr_confidence
             ):
                 payload["arrival_date"] = arrival[0]
-                repaired.add("arrival_date")
+                repaired["arrival_date"] = cls._best_candidate(arrival[1])
 
         if not repaired:
-            return primary_row, frozenset()
+            return primary_row, {}
         return (
             PredictionRow.from_mapping(payload, fallback_case_id=case_id),
-            frozenset(repaired),
+            repaired,
         )
 
     def _recover(
@@ -1126,32 +1540,65 @@ class RapidOutputRecoveryProcessor:
         primary_outcome: AdjudicationOutcome,
         unknown_fields: frozenset[str],
         recover_risk: bool,
-    ) -> PredictionRow:
+        pre_recovery_audits: dict[str, RecoveryFieldAudit],
+    ) -> VisibleRecoveryResult:
         rapid_candidates = tuple(self._rapid_extractor().extract(rendered))
         rapid_linked = self._linker.link(rendered.case_id, rapid_candidates)
         rapid_resolved = self._resolver.resolve(rapid_linked)
         payload = primary_row.to_dict()
+        recovered_audits = dict(pre_recovery_audits)
 
-        # Overlay only fields whose primary state is truly UNKNOWN.  Starting
-        # from the primary row preserves its existing serialization priors
-        # whenever Rapid is also unresolved.
-        for field_name in unknown_fields:
-            if field_name == "applicant_name":
-                value = rapid_linked.active_applicant
-            else:
-                value = self._rapid_value(rapid_resolved, field_name)
-            # ``unknown`` is a schema-valid fee literal, but it is not a
-            # recovered fact.  Keep the primary serialization prior (``paid``)
-            # when both OCR passes remain substantively unresolved.
-            if value is not None and not (
-                field_name == "fee_status" and value == "unknown"
-            ):
-                payload[field_name] = value
-
+        # Overlay only fields whose primary state is truly UNKNOWN and whose
+        # Rapid winner retains a complete physical observation.  Literal
+        # ``unknown`` and ``none`` are visible values when a winning candidate
+        # supports them; they must not be confused with serialization defaults.
+        recovery_targets = set(unknown_fields)
         if recover_risk:
-            rapid_risk = self._rapid_value(rapid_resolved, RAPID_RISK_FIELD)
-            if rapid_risk not in {None, "none"}:
-                payload[RAPID_RISK_FIELD] = rapid_risk
+            recovery_targets.add(RAPID_RISK_FIELD)
+        for field_name in sorted(recovery_targets):
+            recovered_field = self._recoverable_rapid_field(
+                case_id=primary_resolved.case_id,
+                source_sha256=rendered.source_sha256,
+                resolved=rapid_resolved,
+                field_name=field_name,
+            )
+            if (
+                recovered_field is None
+                or recovered_field.winning_evidence is None
+                or recovered_field.value is None
+            ):
+                continue
+            candidate = recovered_field.winning_evidence
+            scope_contract = self._recovery_scope_contract(
+                field_name=field_name,
+                candidate=candidate,
+                primary_resolved=primary_resolved,
+                rapid_resolved=rapid_resolved,
+            )
+            if scope_contract is None:
+                continue
+            expected_scope, linked_recovery_scope = scope_contract
+            audit, _validation = recovered_field_audit(
+                primary=self._audit_primary_field(
+                    primary_resolved,
+                    field_name,
+                ),
+                serialization_before=getattr(primary_row, field_name),
+                serialization_after=recovered_field.value,
+                candidate=candidate,
+                recovery_source=RAPID_RECOVERY_ROUTE_ID,
+                linked_recovery_scope=linked_recovery_scope,
+                validation_policy=CandidateValidationPolicy(
+                    expected_field_name=field_name,
+                    expected_source_sha256=rendered.source_sha256,
+                    expected_page_index=candidate.page_index,
+                    expected_applicant_scope=expected_scope,
+                    minimum_confidence=0.0,
+                ),
+            )
+            if audit is not None:
+                payload[field_name] = recovered_field.value
+                recovered_audits[field_name] = audit
 
         # Ordinary output recovery and the signed-decision override preserve
         # primary identity and calibration. The frozen semantic denial head
@@ -1161,6 +1608,7 @@ class RapidOutputRecoveryProcessor:
 
         decision = self._authoritative_rapid_decision(
             case_id=primary_resolved.case_id,
+            source_sha256=rendered.source_sha256,
             primary_resolved=primary_resolved,
             primary_outcome=primary_outcome,
             rapid_candidates=rapid_candidates,
@@ -1169,6 +1617,7 @@ class RapidOutputRecoveryProcessor:
             payload["adjudication"] = decision
         elif self._semantic_denial_rules(
             case_id=primary_resolved.case_id,
+            source_sha256=rendered.source_sha256,
             payload=payload,
             primary_candidates=primary_candidates,
             rapid_candidates=rapid_candidates,
@@ -1184,50 +1633,111 @@ class RapidOutputRecoveryProcessor:
             payload,
             fallback_case_id=primary_row.case_id,
         )
-        return self._apply_review_approval_heads(
+        final_row = self._apply_review_approval_heads(
             final_row=final_row,
+            source_sha256=rendered.source_sha256,
             primary_candidates=primary_candidates,
             primary_outcome=primary_outcome,
             primary_resolved=primary_resolved,
             rapid_candidates=rapid_candidates,
             rapid_resolved=rapid_resolved,
         )
+        return self._visible_recovery_result(
+            row=final_row,
+            primary_resolved=primary_resolved,
+            recovered_audits=recovered_audits,
+            linked_recovery_scope=(
+                primary_resolved.active_applicant
+                or rapid_resolved.active_applicant
+            ),
+        )
 
-    def process_case(self, pdf_path: Path) -> PredictionRow:
+    def process_case_with_audit(self, pdf_path: Path) -> VisibleRecoveryResult:
+        """Process one case and retain explicit evidence/default distinctions."""
+
         rendered = self._renderer.render(pdf_path)
         primary_candidates = tuple(self._primary_extractor.extract(rendered))
         primary_linked = self._linker.link(rendered.case_id, primary_candidates)
         primary_resolved = self._resolver.resolve(primary_linked)
         primary_outcome = self._adjudicator.adjudicate_case(primary_resolved)
 
+        base_primary_row = primary_outcome.row
         primary_row, repaired_applicant = self._repair_biometric_applicant(
             case_id=rendered.case_id,
-            primary_row=primary_outcome.row,
+            primary_row=base_primary_row,
             primary_candidates=primary_candidates,
         )
-        primary_row, source_repaired_fields = self._repair_source_priority_fields(
+        pre_recovery_audits: dict[str, RecoveryFieldAudit] = {}
+        if repaired_applicant is not None:
+            applicant_audit = self._primary_visible_repair_audit(
+                field_name="applicant_name",
+                candidate=repaired_applicant,
+                source_sha256=rendered.source_sha256,
+                serialization_before=base_primary_row.applicant_name,
+                serialization_after=primary_row.applicant_name,
+                primary_resolved=primary_resolved,
+            )
+            if applicant_audit is None:
+                primary_row = base_primary_row
+                repaired_applicant = None
+            else:
+                pre_recovery_audits["applicant_name"] = applicant_audit
+
+        before_source_repairs = primary_row
+        primary_row, source_repair_candidates = self._repair_source_priority_fields(
             case_id=rendered.case_id,
             primary_row=primary_row,
             primary_candidates=primary_candidates,
             primary_resolved=primary_resolved,
         )
+        accepted_source_fields: set[str] = set()
+        repaired_payload = primary_row.to_dict()
+        for field_name, candidate in sorted(source_repair_candidates.items()):
+            repair_audit = self._primary_visible_repair_audit(
+                field_name=field_name,
+                candidate=candidate,
+                source_sha256=rendered.source_sha256,
+                serialization_before=getattr(before_source_repairs, field_name),
+                serialization_after=getattr(primary_row, field_name),
+                primary_resolved=primary_resolved,
+            )
+            if repair_audit is None:
+                repaired_payload[field_name] = getattr(
+                    before_source_repairs,
+                    field_name,
+                )
+                continue
+            accepted_source_fields.add(field_name)
+            pre_recovery_audits[field_name] = repair_audit
+        if accepted_source_fields != set(source_repair_candidates):
+            primary_row = PredictionRow.from_mapping(
+                repaired_payload,
+                fallback_case_id=rendered.case_id,
+            )
 
         unknown_fields = self._unknown_output_fields(primary_resolved)
         if repaired_applicant:
             # The exact-case biometric fact is already frozen into the output;
             # an independent OCR pass must not replace it again.
             unknown_fields = unknown_fields - {"applicant_name"}
-        unknown_fields = unknown_fields - source_repaired_fields
+        unknown_fields = unknown_fields - accepted_source_fields
         recover_risk = self._recover_non_none_risk(
             primary_resolved,
             unknown_fields,
         )
         if not unknown_fields and not recover_risk:
-            return self._apply_review_approval_heads(
+            final_row = self._apply_review_approval_heads(
                 final_row=primary_row,
+                source_sha256=rendered.source_sha256,
                 primary_candidates=primary_candidates,
                 primary_outcome=primary_outcome,
                 primary_resolved=primary_resolved,
+            )
+            return self._visible_recovery_result(
+                row=final_row,
+                primary_resolved=primary_resolved,
+                recovered_audits=pre_recovery_audits,
+                linked_recovery_scope=primary_resolved.active_applicant,
             )
 
         try:
@@ -1239,13 +1749,26 @@ class RapidOutputRecoveryProcessor:
                 primary_outcome=primary_outcome,
                 unknown_fields=unknown_fields,
                 recover_risk=recover_risk,
+                pre_recovery_audits=pre_recovery_audits,
             )
         except Exception:
             # RapidOCR is optional recovery, never a reason to lose a primary
             # prediction or abort the batch.
-            return self._apply_review_approval_heads(
+            final_row = self._apply_review_approval_heads(
                 final_row=primary_row,
+                source_sha256=rendered.source_sha256,
                 primary_candidates=primary_candidates,
                 primary_outcome=primary_outcome,
                 primary_resolved=primary_resolved,
             )
+            return self._visible_recovery_result(
+                row=final_row,
+                primary_resolved=primary_resolved,
+                recovered_audits=pre_recovery_audits,
+                linked_recovery_scope=primary_resolved.active_applicant,
+            )
+
+    def process_case(self, pdf_path: Path) -> PredictionRow:
+        """Return the schema row while keeping the audit API opt-in."""
+
+        return self.process_case_with_audit(pdf_path).row

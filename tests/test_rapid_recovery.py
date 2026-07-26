@@ -6,6 +6,8 @@ from mib_pipeline.adjudication import AdjudicationOutcome, DecisionTrace
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
 from mib_pipeline.ingestion import Rect
 from mib_pipeline.models import PredictionRow
+from mib_pipeline.provenance import CoordinateTransform, make_ocr_provenance
+from mib_pipeline.recovery_audit import SerializationOrigin
 from mib_pipeline.rapid_recovery import (
     RapidOcrEngine,
     RapidOutputRecoveryProcessor,
@@ -22,6 +24,7 @@ from mib_pipeline.resolution import (
 
 CASE_ID = "MIB-000001"
 APPLICANT = "Zed Zarnax"
+SOURCE_SHA256 = "a" * 64
 BASE_VALUES = {
     "applicant_name": APPLICANT,
     "species_code": "ORION_GRAYS",
@@ -48,13 +51,30 @@ def evidence(
     legible=True,
     source="visible_ocr",
     page=0,
+    provenance=True,
+    source_sha256=SOURCE_SHA256,
+    route_id="targeted_rapidocr",
 ):
+    box = Rect(1, 2, 3, 4)
+    ocr_provenance = ()
+    if source == "visible_ocr" and provenance:
+        ocr_provenance = (
+            make_ocr_provenance(
+                source_sha256=source_sha256,
+                page_index=page,
+                view_box=box,
+                applicant_scope=applicant,
+                route_id=route_id,
+                engine_id="test:ocr",
+                view_id="rendered_page",
+            ),
+        )
     return CandidateEvidence(
         field_name=field_name,
         value=value,
         evidence_type=evidence_type,
         page_index=page,
-        box=Rect(1, 2, 3, 4),
+        box=box,
         legible=legible,
         superseded=superseded,
         ocr_confidence=confidence,
@@ -62,6 +82,7 @@ def evidence(
         source=source,
         case_id_hint=case_id,
         applicant_hint=applicant,
+        ocr_provenance=ocr_provenance,
     )
 
 
@@ -188,7 +209,10 @@ class FakeRenderer:
 
     def render(self, path):
         self.calls += 1
-        return types.SimpleNamespace(case_id=path.stem)
+        return types.SimpleNamespace(
+            case_id=path.stem,
+            source_sha256=SOURCE_SHA256,
+        )
 
 
 class FakeExtractor:
@@ -329,6 +353,11 @@ class RapidOcrEngineTests(unittest.TestCase):
         self.assertEqual(
             params["EngineConfig.onnxruntime.inter_op_num_threads"], 1
         )
+        self.assertEqual(params["Global.text_score"], 0.30)
+        self.assertIn("rapidocr:version=3.9.2", adapter.provenance_id)
+        for digest in RapidOcrEngine._MODEL_SHA256.values():
+            self.assertIn(digest, adapter.provenance_id)
+        self.assertIn("text_score=0.30:ort_threads=1/1", adapter.provenance_id)
 
         tokens = adapter.read_page(
             types.SimpleNamespace(index=2, image_png=b"png")
@@ -390,6 +419,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 biometric_name,
                 evidence_type=EvidenceType.BIOMETRIC_SLIP,
                 confidence=0.91,
+                applicant=biometric_name,
             ),
         )
         primary = resolved_case(unknown={"applicant_name"})
@@ -406,7 +436,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary_candidates=candidates,
         )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
         expected = primary_row.to_dict()
         expected["applicant_name"] = biometric_name
@@ -416,6 +447,13 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(resolver.calls, 1)
         self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(factory.calls, 0)
+        applicant_audit = audited.audit.field("applicant_name")
+        self.assertEqual(
+            applicant_audit.serialization_after_origin,
+            SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+        )
+        self.assertEqual(applicant_audit.final_evidence_value, biometric_name)
+        self.assertIs(applicant_audit.winning_evidence, candidates[1])
 
     def test_biometric_applicant_repair_abstains_on_every_scope_ambiguity(self):
         intake = evidence(
@@ -429,6 +467,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             "Zed Zornax",
             evidence_type=EvidenceType.BIOMETRIC_SLIP,
             confidence=0.91,
+            applicant="Zed Zornax",
         )
         variants = {
             "biometric_below_minimum": (
@@ -648,7 +687,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary_candidates=candidates,
         )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
         expected = primary_row.to_dict()
         expected.update(
@@ -664,6 +704,74 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(resolver.calls, 1)
         self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(factory.calls, 0)
+        expected_winners = {
+            "visa_class": sponsor_visa,
+            "sponsor_id": sponsor_sponsor,
+            "arrival_date": registry_arrival,
+        }
+        for field_name, winner in expected_winners.items():
+            with self.subTest(audit_field=field_name):
+                field_audit = audited.audit.field(field_name)
+                self.assertEqual(
+                    field_audit.serialization_after_origin,
+                    SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+                )
+                self.assertIs(field_audit.winning_evidence, winner)
+
+    def test_primary_visible_repair_selects_route_that_produced_candidate_box(self):
+        candidate_box = Rect(1, 2, 3, 4)
+        unrelated_box = Rect(20, 30, 40, 50)
+        candidate = CandidateEvidence(
+            field_name="visa_class",
+            value="XW-1",
+            evidence_type=EvidenceType.SPONSOR_ATTESTATION,
+            page_index=1,
+            box=candidate_box,
+            legible=True,
+            superseded=False,
+            ocr_confidence=0.94,
+            source="visible_ocr",
+            case_id_hint=CASE_ID,
+            applicant_hint=APPLICANT,
+            ocr_provenance=(
+                make_ocr_provenance(
+                    source_sha256=SOURCE_SHA256,
+                    page_index=1,
+                    view_box=unrelated_box,
+                    applicant_scope=APPLICANT,
+                    route_id="a_supporting_route",
+                    engine_id="test:ocr",
+                    view_id="supporting_view",
+                ),
+                make_ocr_provenance(
+                    source_sha256=SOURCE_SHA256,
+                    page_index=1,
+                    view_box=candidate_box,
+                    applicant_scope=APPLICANT,
+                    route_id="z_candidate_route",
+                    engine_id="test:ocr",
+                    view_id="cropped_view",
+                    transform=CoordinateTransform.crop_translation(
+                        left=100,
+                        upper=200,
+                    ),
+                ),
+            ),
+        )
+
+        audit = RapidOutputRecoveryProcessor._primary_visible_repair_audit(
+            field_name="visa_class",
+            candidate=candidate,
+            source_sha256=SOURCE_SHA256,
+            serialization_before="TRANSIT-7",
+            serialization_after="XW-1",
+            primary_resolved=resolved_case(
+                values={"visa_class": "TRANSIT-7"},
+            ),
+        )
+
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit.recovery_source, "z_candidate_route")
 
     def test_source_priority_repairs_abstain_on_scope_and_conflicts(self):
         intake = evidence(
@@ -766,6 +874,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(factory.calls, 0)
 
     def test_overlays_only_unknown_values_and_preserves_existing_priors(self):
+        recovered_species = evidence("species_code", "ARCTURIAN")
         primary = resolved_case(
             values={"fee_status": "unknown"},
             unknown={"species_code", "home_world"},
@@ -776,6 +885,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 "fee_status": "paid",
             },
             unknown={"home_world"},
+            considered={"species_code": (recovered_species,)},
         )
         primary_row = row(
             species_code="TRIANGULAN",
@@ -788,6 +898,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary,
             rapid,
             primary_outcome=outcome(primary_row),
+            rapid_candidates=(recovered_species,),
         )
 
         result = recovery.process_case(Path(CASE_ID + ".pdf"))
@@ -802,9 +913,17 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(factory.calls, 1)
 
-    def test_rapid_literal_unknown_preserves_primary_fee_prior(self):
+    def test_visible_rapid_literal_unknown_replaces_primary_fee_default(self):
+        visible_unknown = evidence(
+            "fee_status",
+            "unknown",
+            applicant=None,
+        )
         primary = resolved_case(unknown={"fee_status"})
-        rapid = resolved_case(values={"fee_status": "unknown"})
+        rapid = resolved_case(
+            values={"fee_status": "unknown"},
+            considered={"fee_status": (visible_unknown,)},
+        )
         primary_row = row(
             fee_status="paid",
             adjudication="NEEDS_REVIEW",
@@ -814,17 +933,92 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary,
             rapid,
             primary_outcome=outcome(primary_row),
+            rapid_candidates=(visible_unknown,),
         )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
-        self.assertEqual(result.fee_status, "paid")
+        self.assertEqual(result.fee_status, "unknown")
         self.assertEqual(result.adjudication, "NEEDS_REVIEW")
         self.assertEqual(result.confidence, 0.37)
+        fee_audit = audited.audit.field("fee_status")
+        self.assertEqual(fee_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(
+            fee_audit.serialization_before_origin,
+            SerializationOrigin.OUTPUT_DEFAULT,
+        )
+        self.assertEqual(
+            fee_audit.serialization_after_origin,
+            SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+        )
+        self.assertEqual(fee_audit.final_evidence_value, "unknown")
+        self.assertEqual(
+            fee_audit.ocr_provenance,
+            visible_unknown.ocr_provenance,
+        )
+
+    def test_non_applicant_recovery_cannot_switch_active_applicant_scope(self):
+        foreign_species = evidence(
+            "species_code",
+            "ARCTURIAN",
+            applicant="Other Applicant",
+        )
+        primary = resolved_case(unknown={"species_code"})
+        rapid = resolved_case(
+            values={"species_code": "ARCTURIAN"},
+            considered={"species_code": (foreign_species,)},
+            active="Other Applicant",
+        )
+        primary_row = row(species_code="TRIANGULAN")
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            primary_outcome=outcome(primary_row),
+            rapid_active="Other Applicant",
+            rapid_candidates=(foreign_species,),
+        )
+
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(audited.row.species_code, "TRIANGULAN")
+        species_audit = audited.audit.field("species_code")
+        self.assertEqual(species_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(species_audit.final_evidence_state, FieldState.UNKNOWN)
+        self.assertTrue(species_audit.after_is_output_default)
+        self.assertIsNone(species_audit.recovery_source)
+
+    def test_missing_rapid_winner_keeps_default_explicit_in_audit(self):
+        primary = resolved_case(unknown={"fee_status"})
+        rapid = resolved_case(values={"fee_status": "unknown"})
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            primary_outcome=outcome(row(fee_status="paid")),
+        )
+
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(audited.row.fee_status, "paid")
+        fee_audit = audited.audit.field("fee_status")
+        self.assertEqual(fee_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(fee_audit.final_evidence_state, FieldState.UNKNOWN)
+        self.assertIsNone(fee_audit.recovery_source)
+        self.assertTrue(fee_audit.before_is_output_default)
+        self.assertTrue(fee_audit.after_is_output_default)
 
     def test_recovers_rapid_active_applicant_when_primary_is_absent(self):
+        recovered_applicant = evidence(
+            "applicant_name",
+            "Miraul Miraquell",
+            applicant="Miraul Miraquell",
+        )
         primary = resolved_case(unknown={"applicant_name"}, active=None)
-        rapid = resolved_case(values={"applicant_name": "Miraul Miraquell"})
+        rapid = resolved_case(
+            values={"applicant_name": "Miraul Miraquell"},
+            considered={"applicant_name": (recovered_applicant,)},
+            active="Miraul Miraquell",
+        )
         primary_row = row(applicant_name="unknown")
         recovery, *_rest = processor(
             primary,
@@ -832,6 +1026,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary_outcome=outcome(primary_row),
             primary_active=None,
             rapid_active="Miraul Miraquell",
+            rapid_candidates=(recovered_applicant,),
         )
 
         result = recovery.process_case(Path(CASE_ID + ".pdf"))
@@ -840,12 +1035,24 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
     def test_non_none_risk_recovers_only_when_primary_risk_is_unknown(self):
         anchor = evidence("risk_flags", None, applicant=None)
+        visible_warrant = evidence(
+            "risk_flags",
+            "active_warrant",
+            applicant=None,
+        )
         primary = resolved_case(
             unknown={"risk_flags"},
             considered={"risk_flags": (anchor,)},
         )
-        rapid = resolved_case(values={"risk_flags": "active_warrant"})
-        recovery, *_rest = processor(primary, rapid)
+        rapid = resolved_case(
+            values={"risk_flags": "active_warrant"},
+            considered={"risk_flags": (visible_warrant,)},
+        )
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            rapid_candidates=(visible_warrant,),
+        )
 
         recovered = recovery.process_case(Path(CASE_ID + ".pdf"))
 
@@ -864,18 +1071,33 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
         self.assertEqual(protected_row.risk_flags, "none")
 
-    def test_rapid_none_does_not_fill_an_unknown_risk(self):
+    def test_visible_rapid_none_fills_unknown_risk_as_explicit_evidence(self):
         anchor = evidence("risk_flags", None, applicant=None)
+        visible_none = evidence("risk_flags", "none", applicant=None)
         primary = resolved_case(
             unknown={"risk_flags"},
             considered={"risk_flags": (anchor,)},
         )
-        rapid = resolved_case(values={"risk_flags": "none"})
-        recovery, *_rest = processor(primary, rapid)
+        rapid = resolved_case(
+            values={"risk_flags": "none"},
+            considered={"risk_flags": (visible_none,)},
+        )
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            rapid_candidates=(visible_none,),
+        )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
         self.assertEqual(result.risk_flags, "none")
+        risk_audit = audited.audit.field("risk_flags")
+        self.assertEqual(risk_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(risk_audit.final_evidence_state, FieldState.RESOLVED)
+        self.assertEqual(risk_audit.final_evidence_value, "none")
+        self.assertTrue(risk_audit.before_is_output_default)
+        self.assertTrue(risk_audit.after_is_explicit_visible_value)
 
     def test_semantic_head_denies_each_visible_disqualifying_rapid_risk(self):
         for risk_flag in (
@@ -1216,6 +1438,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             "Zed Zornax",
             evidence_type=EvidenceType.BIOMETRIC_SLIP,
             confidence=0.91,
+            applicant="Zed Zornax",
         )
         risk_anchor = evidence("risk_flags", None, applicant=None)
         rapid_risk = evidence(
@@ -1273,26 +1496,35 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(result.adjudication, "DENIED")
         self.assertEqual(result.confidence, 0.37)
 
-    def test_xw1_multisource_recovery_accepts_only_the_two_audited_fee_shapes(self):
+    def test_xw1_multisource_recovery_requires_visible_none_risk(self):
         required_facts = (
             "application_date_current_or_exempt",
             "sponsor_present_and_not_publicly_barred",
         )
+        visible_none = evidence("risk_flags", "none", applicant=None)
         variants = {
-            "paid_with_only_unknown_risk": {
+            "paid_with_only_serialized_default_risk_abstains": {
                 "fee_status": "paid",
                 "unknown": {"risk_flags"},
+                "considered": {},
                 "review_reasons": (
                     "required_output_unknown:risk_flags",
                     "risk_flags_unknown",
                 ),
                 "approval_facts": (*required_facts, "fee_paid"),
+                "expected_adjudication": "NEEDS_REVIEW",
+                "expected_confidence": 0.25,
             },
-            "unsupported_waiver_only": {
+            "unsupported_waiver_with_visible_none_risk": {
                 "fee_status": "waived",
                 "unknown": set(),
+                "considered": {"risk_flags": (visible_none,)},
                 "review_reasons": ("unsupported_fee_waiver",),
                 "approval_facts": required_facts,
+                "expected_adjudication": "APPROVED",
+                "expected_confidence": (
+                    XW1_MULTISOURCE_REVIEW_APPROVAL_CONFIDENCE
+                ),
             },
         }
 
@@ -1309,6 +1541,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                         "fee_status": values["fee_status"],
                     },
                     unknown=values["unknown"],
+                    considered=values["considered"],
                 )
                 recovery, _renderer, _linker, _resolver, _adjudicator, factory = (
                     processor(
@@ -1319,7 +1552,10 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                             review_reasons=values["review_reasons"],
                             approval_facts=values["approval_facts"],
                         ),
-                        primary_candidates=xw1_multisource_candidates(),
+                        primary_candidates=(
+                            *xw1_multisource_candidates(),
+                            *((visible_none,) if values["considered"] else ()),
+                        ),
                     )
                 )
 
@@ -1328,10 +1564,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 expected = primary_row.to_dict()
                 expected.update(
                     {
-                        "adjudication": "APPROVED",
-                        "confidence": (
-                            XW1_MULTISOURCE_REVIEW_APPROVAL_CONFIDENCE
-                        ),
+                        "adjudication": values["expected_adjudication"],
+                        "confidence": values["expected_confidence"],
                     }
                 )
                 self.assertEqual(result.to_dict(), expected)
@@ -1573,6 +1807,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(rapid_result.confidence, 0.25)
 
     def test_frozen_review_approval_head_matches_each_early_return_branch(self):
+        visible_none = evidence("risk_flags", "none", applicant=None)
         six_applicant_candidates = tuple(
             evidence("applicant_name", APPLICANT, page=page)
             for page in range(6)
@@ -1603,14 +1838,19 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 primary_row = values["prediction"]
                 recovery, _renderer, _linker, _resolver, _adjudicator, factory = (
                     processor(
-                        resolved_case(),
+                        resolved_case(
+                            considered={"risk_flags": (visible_none,)},
+                        ),
                         resolved_case(),
                         primary_outcome=outcome(
                             primary_row,
                             review_reasons=values["review_reasons"],
                             approval_facts=values["approval_facts"],
                         ),
-                        primary_candidates=values["candidates"],
+                        primary_candidates=(
+                            *values["candidates"],
+                            visible_none,
+                        ),
                     )
                 )
 
@@ -1692,11 +1932,12 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 self.assertEqual(result, primary_row)
 
         normalized_risk_row = row(risk_flags="NoNe")
+        visible_none = evidence("risk_flags", "none", applicant=None)
         recovery, *_rest = processor(
-            resolved_case(),
+            resolved_case(considered={"risk_flags": (visible_none,)}),
             resolved_case(),
             primary_outcome=outcome(normalized_risk_row),
-            primary_candidates=six_applicant_candidates,
+            primary_candidates=(*six_applicant_candidates, visible_none),
         )
 
         normalized_risk = recovery.process_case(Path(CASE_ID + ".pdf"))
@@ -1708,17 +1949,26 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         )
 
     def test_review_approval_head_runs_after_rapid_output_recovery(self):
+        visible_none = evidence("risk_flags", "none", applicant=None)
+        recovered_species = evidence("species_code", "ARCTURIAN")
         six_applicant_candidates = tuple(
             evidence("applicant_name", APPLICANT, page=page)
             for page in range(6)
         )
-        primary = resolved_case(unknown={"species_code"})
-        rapid = resolved_case(values={"species_code": "ARCTURIAN"})
+        primary = resolved_case(
+            unknown={"species_code"},
+            considered={"risk_flags": (visible_none,)},
+        )
+        rapid = resolved_case(
+            values={"species_code": "ARCTURIAN"},
+            considered={"species_code": (recovered_species,)},
+        )
         recovery, _renderer, _linker, _resolver, _adjudicator, factory = (
             processor(
                 primary,
                 rapid,
-                primary_candidates=six_applicant_candidates,
+                primary_candidates=(*six_applicant_candidates, visible_none),
+                rapid_candidates=(recovered_species,),
             )
         )
 
