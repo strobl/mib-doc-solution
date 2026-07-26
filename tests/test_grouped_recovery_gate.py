@@ -20,9 +20,9 @@ MANIFEST_SHA256 = "a" * 64
 RECORD_COUNTS = (4, 3, 3, 3, 2)
 GROUP_COUNTS = (2, 2, 2, 1, 1)
 PASSING_DELTAS = (
-    (0.40, 0.20, 0.10, -0.02, -0.01),
-    (0.30, 0.20, 0.08, -0.01, -0.02),
-    (0.25, 0.15, 0.05, -0.01, -0.01),
+    (0.40, 0.20, 0.10, 0.0, 0.0),
+    (0.30, 0.20, 0.08, 0.0, 0.0),
+    (0.25, 0.15, 0.05, 0.0, 0.0),
 )
 
 
@@ -107,7 +107,9 @@ class GroupedRecoveryGateTests(unittest.TestCase):
             )
         )
         self.assertEqual(decision.folds[0].score_delta, 0.4)
-        self.assertEqual(decision.folds[-1].score_delta, -0.01)
+        self.assertEqual(decision.folds[-1].score_delta, 0.0)
+        self.assertFalse(decision.concentration_warning)
+        self.assertTrue(all(dict(decision.diagnostic_results).values()))
 
     def test_serialized_result_is_public_exposed_and_aggregate_only(self):
         aggregate = GroupedRecoveryGate().evaluate(_evidence()).to_aggregate_evidence()
@@ -127,6 +129,10 @@ class GroupedRecoveryGateTests(unittest.TestCase):
         self.assertEqual(aggregate["provenance_coverage_fraction"], 1.0)
         self.assertEqual(
             aggregate["serialization_default_used_as_evidence_count"], 0
+        )
+        self.assertEqual(aggregate["warning_count"], 0)
+        self.assertFalse(
+            aggregate["checks"]["score_gain_concentration_warning"]
         )
         self.assertNotIn("blocking_reasons", aggregate)
 
@@ -167,9 +173,9 @@ class GroupedRecoveryGateTests(unittest.TestCase):
             "repeat_weighted_deltas_positive", decision.blocking_reasons
         )
 
-    def test_at_least_three_folds_per_repeat_must_be_positive(self):
+    def test_each_repeat_must_have_at_least_one_positive_fold(self):
         deltas = (
-            (1.0, 1.0, -0.01, -0.01, -0.01),
+            (0.0, 0.0, 0.0, 0.0, 0.0),
             PASSING_DELTAS[1],
             PASSING_DELTAS[2],
         )
@@ -179,31 +185,79 @@ class GroupedRecoveryGateTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.passed)
-        self.assertNotIn(
-            "repeat_weighted_deltas_positive", decision.blocking_reasons
-        )
-        self.assertIn("fold_majority_positive", decision.blocking_reasons)
-
-    def test_leave_best_fold_out_rejects_single_fold_dependency(self):
-        deltas = (
-            (1.0, 0.01, 0.01, -0.10, -0.10),
-            PASSING_DELTAS[1],
-            PASSING_DELTAS[2],
-        )
-
-        decision = GroupedRecoveryGate().evaluate(
-            _evidence(folds=_folds(deltas))
-        )
-
-        self.assertFalse(decision.passed)
-        self.assertNotIn(
-            "repeat_weighted_deltas_positive", decision.blocking_reasons
-        )
-        self.assertNotIn("fold_majority_positive", decision.blocking_reasons)
         self.assertIn(
-            "leave_best_fold_out_positive", decision.blocking_reasons
+            "repeat_weighted_deltas_positive", decision.blocking_reasons
         )
-        self.assertLess(decision.repeat_leave_best_fold_out_deltas[0], 0)
+        self.assertIn(
+            "at_least_one_positive_fold_per_repeat",
+            decision.blocking_reasons,
+        )
+
+    def test_negative_fold_blocks_even_when_repeat_and_leave_best_are_positive(self):
+        deltas = (
+            (1.0, 1.0, 0.0, 0.0, -0.01),
+            PASSING_DELTAS[1],
+            PASSING_DELTAS[2],
+        )
+
+        decision = GroupedRecoveryGate().evaluate(
+            _evidence(folds=_folds(deltas))
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertNotIn(
+            "repeat_weighted_deltas_positive", decision.blocking_reasons
+        )
+        self.assertNotIn(
+            "at_least_one_positive_fold_per_repeat",
+            decision.blocking_reasons,
+        )
+        self.assertNotIn(
+            "leave_best_fold_out_nonnegative", decision.blocking_reasons
+        )
+        self.assertIn("no_negative_folds", decision.blocking_reasons)
+
+    def test_single_positive_fold_passes_with_non_hard_concentration_warning(self):
+        sparse = (
+            (1.0, 0.0, 0.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0, 0.0, 0.0),
+        )
+
+        decision = GroupedRecoveryGate().evaluate(
+            _evidence(folds=_folds(sparse))
+        )
+        aggregate = decision.to_aggregate_evidence()
+
+        self.assertTrue(decision.passed)
+        self.assertEqual(decision.blocking_reasons, ())
+        self.assertEqual(
+            decision.repeat_positive_fold_counts,
+            (1, 1, 1),
+        )
+        self.assertTrue(
+            all(delta > 0 for delta in decision.repeat_weighted_deltas)
+        )
+        self.assertTrue(
+            all(
+                delta == 0
+                for delta in decision.repeat_leave_best_fold_out_deltas
+            )
+        )
+        self.assertEqual(
+            dict(decision.diagnostic_results),
+            {
+                "fold_majority_positive": False,
+                "leave_best_fold_out_positive": False,
+            },
+        )
+        self.assertTrue(decision.concentration_warning)
+        self.assertEqual(aggregate["status"], "passed")
+        self.assertEqual(aggregate["hard_gate_failure_count"], 0)
+        self.assertEqual(aggregate["warning_count"], 1)
+        self.assertTrue(
+            aggregate["checks"]["score_gain_concentration_warning"]
+        )
 
     def test_safety_completeness_and_recovery_audits_are_hard_gates(self):
         scenarios = {

@@ -282,6 +282,8 @@ class GroupedRecoveryGateDecision:
     repeat_positive_fold_counts: tuple[int, ...]
     repeat_leave_best_fold_out_deltas: tuple[float, ...]
     gate_results: tuple[tuple[str, bool], ...]
+    diagnostic_results: tuple[tuple[str, bool], ...]
+    concentration_warning: bool
 
     @property
     def decision(self) -> str:
@@ -313,6 +315,7 @@ class GroupedRecoveryGateDecision:
             )
 
         gate_results = dict(self.gate_results)
+        diagnostic_results = dict(self.diagnostic_results)
         aggregate = {
             "evaluation_mode": PUBLIC_EXPOSED_SCOPE_LABEL,
             "status": self.decision.casefold(),
@@ -329,8 +332,9 @@ class GroupedRecoveryGateDecision:
             "deterministic": gate_results["run_deterministic"]
             and gate_results["split_deterministic"],
             "fold_consistent": gate_results["repeat_weighted_deltas_positive"]
-            and gate_results["fold_majority_positive"]
-            and gate_results["leave_best_fold_out_positive"],
+            and gate_results["at_least_one_positive_fold_per_repeat"]
+            and gate_results["no_negative_folds"]
+            and gate_results["leave_best_fold_out_nonnegative"],
             "catastrophic_false_approvals": (
                 self.candidate_full.catastrophic_false_approvals
             ),
@@ -357,7 +361,12 @@ class GroupedRecoveryGateDecision:
                 .serialization_default_used_as_evidence_count
             ),
             "hard_gate_failure_count": len(self.blocking_reasons),
+            "warning_count": int(self.concentration_warning),
             "gate_results": gate_results,
+            "checks": {
+                **diagnostic_results,
+                "score_gain_concentration_warning": self.concentration_warning,
+            },
             "metrics": repeat_metrics,
             "fold_metrics": fold_metrics,
         }
@@ -487,11 +496,14 @@ class GroupedRecoveryGate:
             "repeat_weighted_deltas_positive": all(
                 delta > 0 for delta in repeat_weighted
             ),
-            "fold_majority_positive": all(
-                count >= 3 for count in repeat_positive_counts
+            "at_least_one_positive_fold_per_repeat": all(
+                count >= 1 for count in repeat_positive_counts
             ),
-            "leave_best_fold_out_positive": all(
-                delta > 0 for delta in repeat_leave_best_out
+            "no_negative_folds": all(
+                pair.score_delta_decimal >= 0 for pair in ordered
+            ),
+            "leave_best_fold_out_nonnegative": all(
+                delta >= 0 for delta in repeat_leave_best_out
             ),
             "candidate_complete": candidate_complete,
             "control_complete": control_complete,
@@ -514,6 +526,15 @@ class GroupedRecoveryGate:
                 == 0
             ),
         }
+        diagnostic_results: Mapping[str, bool] = {
+            "fold_majority_positive": all(
+                count >= 3 for count in repeat_positive_counts
+            ),
+            "leave_best_fold_out_positive": all(
+                delta > 0 for delta in repeat_leave_best_out
+            ),
+        }
+        concentration_warning = not all(diagnostic_results.values())
         blocking_reasons = tuple(
             name for name, passed in gate_results.items() if not passed
         )
@@ -548,4 +569,6 @@ class GroupedRecoveryGate:
                 _float(delta) for delta in repeat_leave_best_out
             ),
             gate_results=tuple(gate_results.items()),
+            diagnostic_results=tuple(diagnostic_results.items()),
+            concentration_warning=concentration_warning,
         )

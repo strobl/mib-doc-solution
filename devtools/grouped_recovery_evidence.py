@@ -284,11 +284,31 @@ def _full_run(
     return PredictionRuns(rows=rows, full=full)
 
 
-def load_recovery_audit(path: Path | str) -> RecoveryAuditAggregate:
-    """Accept only broker-safe aggregate counters from the recovery audit."""
+def load_recovery_audit(
+    path: Path | str,
+    *,
+    expected_source_revision_sha: str,
+) -> RecoveryAuditAggregate:
+    """Accept only revision-bound, broker-safe recovery-audit counters."""
 
     payload = _read_json_object(Path(path), label="recovery audit")
     require_aggregate_only(payload)
+    expected_source_digest = str(expected_source_revision_sha).strip().lower()
+    if not _SOURCE_DIGEST_RE.fullmatch(expected_source_digest):
+        raise GroupedRecoveryEvidenceBuildError(
+            "expected recovery audit source_revision_sha must be a full "
+            "Git commit or SHA-256 digest"
+        )
+    audit_source_digest = str(payload.get("source_revision_sha", "")).strip().lower()
+    if not _SOURCE_DIGEST_RE.fullmatch(audit_source_digest):
+        raise GroupedRecoveryEvidenceBuildError(
+            "recovery audit must include a full source_revision_sha"
+        )
+    if audit_source_digest != expected_source_digest:
+        raise GroupedRecoveryEvidenceBuildError(
+            "recovery audit source_revision_sha does not match the "
+            "evidence source revision"
+        )
     counts: Mapping[str, Any]
     nested = payload.get("counts")
     if nested is None:
@@ -415,6 +435,10 @@ def build_aggregate_evidence(
         raise GroupedRecoveryEvidenceBuildError(
             "layout manifest bytes do not match the pre-recorded frozen digest"
         )
+    audit = load_recovery_audit(
+        recovery_audit_path,
+        expected_source_revision_sha=source_digest,
+    )
     truth = _read_truth_subset(truth_path, manifest.case_ids)
     control = _full_run(
         truth, _read_distinct_runs(control_prediction_paths, arm="control")
@@ -422,7 +446,6 @@ def build_aggregate_evidence(
     candidate = _full_run(
         truth, _read_distinct_runs(candidate_prediction_paths, arm="candidate")
     )
-    audit = load_recovery_audit(recovery_audit_path)
     folds, group_exclusive, paired, split_deterministic = _fold_pairs(
         manifest=manifest,
         truth=truth,
@@ -453,12 +476,15 @@ def render_aggregate_markdown(aggregate: Mapping[str, Any]) -> str:
 
     require_aggregate_only(aggregate)
     gates = aggregate["gate_results"]
+    checks = aggregate["checks"]
     repeat_metrics = aggregate["metrics"]
+    acceptance = "PASS" if aggregate["status"] == "passed" else "FAIL"
     lines = [
         "# WO-15 grouped visible-evidence recovery",
         "",
         f"- Evidence class: `{aggregate['evaluation_mode']}`",
         f"- Status: **{str(aggregate['status']).upper()}**",
+        f"- Work Order acceptance: **{acceptance}**",
         f"- Source revision: `{aggregate['source_revision_sha']}`",
         f"- Frozen layout manifest: `{aggregate['layout_manifest_sha256']}`",
         f"- Records / layout groups: {aggregate['expected_record_count']} / "
@@ -502,6 +528,37 @@ def render_aggregate_markdown(aggregate: Mapping[str, Any]) -> str:
             f"- Serialization defaults used as evidence: "
             f"{aggregate['serialization_default_used_as_evidence_count']}",
             "",
+            "## Concentration diagnostics (non-hard)",
+            "",
+            "| Diagnostic | Result |",
+            "| --- | :---: |",
+            f"| `fold_majority_positive` | "
+            f"{'PASS' if checks['fold_majority_positive'] else 'WARN'} |",
+            f"| `leave_best_fold_out_positive` | "
+            f"{'PASS' if checks['leave_best_fold_out_positive'] else 'WARN'} |",
+            "",
+        ]
+    )
+    if checks["score_gain_concentration_warning"]:
+        lines.extend(
+            [
+                "> **Concentration warning:** the positive score gain is "
+                "concentrated in a minority of folds or becomes zero when the "
+                "strongest fold is omitted. This is disclosed as a non-hard "
+                "robustness warning; it does not change the Work Order "
+                "acceptance result.",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- No score-gain concentration warning.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
             "## Hard gates",
             "",
             "| Gate | Result |",

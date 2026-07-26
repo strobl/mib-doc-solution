@@ -118,6 +118,7 @@ class GroupedRecoveryEvidenceBuilderTests(unittest.TestCase):
                     "recovered_field_count": 20,
                     "recovered_field_complete_provenance_count": 20,
                     "serialization_default_used_as_evidence_count": 0,
+                    "source_revision_sha": SOURCE_SHA,
                 }
             )
             + "\n",
@@ -186,10 +187,26 @@ class GroupedRecoveryEvidenceBuilderTests(unittest.TestCase):
         markdown = render_aggregate_markdown(self._build())
 
         self.assertIn("public_grouped_robustness_not_unseen", markdown)
+        self.assertIn("Work Order acceptance: **PASS**", markdown)
         self.assertIn("this is not an unseen holdout result", markdown)
         self.assertNotIn("MIB-", markdown)
         self.assertNotIn(".pdf", markdown)
         self.assertNotIn(str(self.root), markdown)
+
+    def test_markdown_discloses_non_hard_concentration_warning(self):
+        aggregate = self._build()
+        aggregate["checks"] = {
+            "fold_majority_positive": False,
+            "leave_best_fold_out_positive": False,
+            "score_gain_concentration_warning": True,
+        }
+        aggregate["warning_count"] = 1
+
+        markdown = render_aggregate_markdown(aggregate)
+
+        self.assertIn("Work Order acceptance: **PASS**", markdown)
+        self.assertIn("Concentration warning", markdown)
+        self.assertIn("non-hard robustness warning", markdown)
 
     def test_new_false_positive_denial_is_counted_and_blocks(self):
         changed = [dict(row) for row in self.candidate_rows]
@@ -270,6 +287,7 @@ class GroupedRecoveryEvidenceBuilderTests(unittest.TestCase):
                     "recovered_field_count": 1,
                     "recovered_field_complete_provenance_count": 1,
                     "serialization_default_used_as_evidence_count": 0,
+                    "source_revision_sha": SOURCE_SHA,
                     "case_id": self.case_ids[0],
                 }
             ),
@@ -283,6 +301,34 @@ class GroupedRecoveryEvidenceBuilderTests(unittest.TestCase):
             GroupedRecoveryEvidenceBuildError, "source_revision_sha"
         ):
             self._build(source_revision_sha="deadbeef")
+
+    def test_recovery_audit_requires_its_own_source_revision(self):
+        payload = json.loads(self.audit.read_text(encoding="utf-8"))
+        del payload["source_revision_sha"]
+        self.audit.write_text(
+            canonical_json(payload) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            GroupedRecoveryEvidenceBuildError,
+            "must include a full source_revision_sha",
+        ):
+            self._build()
+
+    def test_recovery_audit_source_revision_must_match_evidence_revision(self):
+        payload = json.loads(self.audit.read_text(encoding="utf-8"))
+        payload["source_revision_sha"] = "b" * 40
+        self.audit.write_text(
+            canonical_json(payload) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            GroupedRecoveryEvidenceBuildError,
+            "does not match",
+        ):
+            self._build()
 
     def test_cli_writes_canonical_json_and_identity_free_markdown(self):
         output_json = self.root / "evidence" / "wo15.json"
