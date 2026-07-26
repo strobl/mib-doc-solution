@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -30,6 +31,14 @@ from devtools.evaluation import (  # noqa: E402
 
 
 RUNTIME_ARTIFACT_DIR = REPO_ROOT / "mib_pipeline" / "artifacts"
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _outside_runtime_artifacts(path: Path) -> Path:
@@ -95,10 +104,15 @@ def command_evaluate(args: argparse.Namespace) -> int:
             peak_memory_mib=args.peak_memory_mib,
             source=args.metrics_source,
         )
+    split_manifest_path = (
+        Path(args.split_manifest) if args.split_manifest else Path(args.truth)
+    )
     split = SplitEvidence(
         name=args.split_name,
         role=args.split_role,
         tuned_on_splits=tuple(args.tuned_on),
+        evidence_class=args.evidence_class,
+        split_manifest_sha256=_sha256_path(split_manifest_path),
     )
     report = EvaluationHarness(REPO_ROOT).evaluate(
         truth_path=Path(args.truth),
@@ -113,6 +127,7 @@ def command_evaluate(args: argparse.Namespace) -> int:
             else (
                 RUNTIME_ARTIFACT_DIR / "confidence_calibration.json",
                 RUNTIME_ARTIFACT_DIR / "policy_exceptions.json",
+                RUNTIME_ARTIFACT_DIR / "output_confidence_recalibration.json",
             )
         ),
         coverage=args.coverage,
@@ -175,6 +190,8 @@ def command_fit_calibration(args: argparse.Namespace) -> int:
         name=args.split_name,
         role="calibration",
         tuned_on_splits=tuple(args.tuned_on),
+        evidence_class=args.evidence_class,
+        split_manifest_sha256=_sha256_path(Path(args.split_manifest)),
     )
     manifest = read_json(Path(args.split_manifest))
     manifest_splits = manifest.get("splits", {})
@@ -246,6 +263,21 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output", required=True)
     evaluate.add_argument("--split-name", required=True)
     evaluate.add_argument(
+        "--split-manifest",
+        help=(
+            "manifest whose SHA-256 pins the measured population; "
+            "defaults to --truth for full-training diagnostics"
+        ),
+    )
+    evaluate.add_argument(
+        "--evidence-class",
+        default="public_grouped_robustness_not_unseen",
+        choices=(
+            "public_grouped_robustness_not_unseen",
+            "genuinely_unseen_holdout",
+        ),
+    )
+    evaluate.add_argument(
         "--split-role",
         required=True,
         choices=("tuning", "calibration", "release", "full_training", "golden", "adversarial"),
@@ -292,6 +324,14 @@ def build_parser() -> argparse.ArgumentParser:
     calibration.add_argument("--artifact-id", required=True)
     calibration.add_argument("--split-name", required=True)
     calibration.add_argument("--split-manifest", required=True)
+    calibration.add_argument(
+        "--evidence-class",
+        default="public_grouped_robustness_not_unseen",
+        choices=(
+            "public_grouped_robustness_not_unseen",
+            "genuinely_unseen_holdout",
+        ),
+    )
     calibration.add_argument("--tuned-on", action="append", default=[])
     calibration.set_defaults(handler=command_fit_calibration)
 

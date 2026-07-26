@@ -8,6 +8,7 @@ from devtools.evaluation import (
     EvaluationConfigurationError,
     EvaluationHarness,
     HoldoutSplitManager,
+    InstrumentedBenchmarkRunner,
     IsotonicCalibrationFitter,
     PolicyExceptionValidator,
     ReleaseGate,
@@ -16,13 +17,20 @@ from devtools.evaluation import (
     SplitEvidence,
 )
 from mib_pipeline import (
+    BatchRunner,
     GeneralizablePolicyExceptionStore,
+    OutputConfidenceRecalibrationProcessor,
     PinnedIsotonicMap,
+    PredictionRow,
     PolicyArtifactError,
+    RapidOutputRecoveryProcessor,
+    build_production_processor,
 )
+import solution
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TEST_MANIFEST_SHA256 = "1" * 64
 FIELDS = (
     "case_id",
     "applicant_name",
@@ -90,6 +98,21 @@ class HoldoutSplitTests(unittest.TestCase):
                 tuned_on_splits=("release-v1",),
             )
 
+    def test_public_partition_is_separated_but_not_claimed_unseen(self):
+        split = SplitEvidence(
+            name="public-release-v2",
+            role="release",
+            tuned_on_splits=("public-tuning-v2",),
+            split_manifest_sha256=TEST_MANIFEST_SHA256,
+        )
+
+        self.assertTrue(split.is_separated_non_tuning_partition)
+        self.assertFalse(split.is_honest_holdout)
+        self.assertEqual(
+            split.to_dict()["evidence_class"],
+            "public_grouped_robustness_not_unseen",
+        )
+
     def test_previously_inspected_cases_are_forced_into_tuning(self):
         rows = [
             truth_row(f"MIB-{index:06d}", ("APPROVED", "DENIED")[index % 2])
@@ -112,6 +135,70 @@ class HoldoutSplitTests(unittest.TestCase):
                 [truth_row("MIB-000001", "APPROVED")],
                 forced_tuning_case_ids=("MIB-999999",),
             )
+
+
+class ProductionCompositionParityTests(unittest.TestCase):
+    def test_cli_and_instrumented_runner_share_the_production_factory(self):
+        processor = build_production_processor()
+
+        self.assertIs(
+            solution.build_production_processor,
+            build_production_processor,
+        )
+        self.assertIsInstance(processor, OutputConfidenceRecalibrationProcessor)
+        self.assertIsInstance(processor.processor, RapidOutputRecoveryProcessor)
+        self.assertIsNone(InstrumentedBenchmarkRunner()._processor_factory)
+
+    def test_instrumented_wrapper_preserves_final_serialized_output(self):
+        row = PredictionRow.from_mapping(
+            prediction(
+                truth_row("MIB-000001", "APPROVED"),
+                confidence=0.812345,
+            )
+        )
+
+        class FixedProcessor:
+            def process_case(self, _pdf_path):
+                return row
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            (input_dir / "MIB-000001.pdf").write_bytes(b"%PDF-fixture")
+            truth_path = root / "truth.csv"
+            with truth_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=FIELDS)
+                writer.writeheader()
+                writer.writerow(truth_row("MIB-000001", "APPROVED"))
+            direct_path = root / "direct.jsonl"
+            instrumented_path = root / "instrumented.jsonl"
+            samples_path = root / "samples.jsonl"
+            BatchRunner(FixedProcessor(), max_workers=1).run(
+                input_dir,
+                direct_path,
+            )
+            report = InstrumentedBenchmarkRunner(
+                max_workers=1,
+                processor_factory=FixedProcessor,
+            ).run(
+                input_dir=input_dir,
+                truth_path=truth_path,
+                selected_case_ids=("MIB-000001",),
+                split_name="public-fixture",
+                predictions_path=instrumented_path,
+                samples_path=samples_path,
+            )
+            direct_bytes = direct_path.read_bytes()
+            instrumented_bytes = instrumented_path.read_bytes()
+            sample = json.loads(samples_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(direct_bytes, instrumented_bytes)
+        self.assertEqual(sample["emitted_confidence"], row.confidence)
+        self.assertEqual(sample["signal_stage"], "final_emitted_confidence")
+        self.assertNotIn("raw_signal", sample)
+        self.assertFalse(report["samples_fit_inner_calibrator"])
+        self.assertEqual(len(report["runtime_artifact_sha256"]), 3)
 
 
 class EvaluationHarnessTests(unittest.TestCase):
@@ -143,7 +230,10 @@ class EvaluationHarnessTests(unittest.TestCase):
                 truth_path=truth_path,
                 submission_path=submission_path,
                 split=SplitEvidence(
-                    "release-v1", "release", tuned_on_splits=("tuning-v1",)
+                    "release-v1",
+                    "release",
+                    tuned_on_splits=("tuning-v1",),
+                    split_manifest_sha256=TEST_MANIFEST_SHA256,
                 ),
                 run_metrics=RunMetrics(12.5, 256.0, "offline_runtime_measurement"),
                 golden_case_ids=("MIB-000002",),
@@ -191,7 +281,10 @@ def release_report(*, false_approvals=0, honest=True, split_name="release-v1"):
         "split": {
             "name": split_name,
             "role": "release" if honest else "tuning",
-            "is_honest_holdout": honest,
+            "evidence_class": "public_grouped_robustness_not_unseen",
+            "split_manifest_sha256": TEST_MANIFEST_SHA256,
+            "is_separated_non_tuning_partition": honest,
+            "is_honest_holdout": False,
         },
         "summary": {
             "total_score": 100.0,
@@ -255,10 +348,25 @@ class ReleaseGateTests(unittest.TestCase):
             baseline=release_report(), candidate=candidate
         )
 
-        self.assertEqual(decision["decision"], "PASS_WITH_WARNINGS")
-        self.assertTrue(decision["adopt"])
+        self.assertEqual(decision["decision"], "BLOCKED")
+        self.assertFalse(decision["adopt"])
         self.assertEqual(decision["golden_regressions"], ["MIB-000001"])
         self.assertEqual(decision["adversarial_regressions"], ["MIB-000002"])
+
+    def test_blocks_any_missing_or_invalid_output(self):
+        candidate = release_report()
+        candidate["summary"]["missing_rows"] = 1
+        candidate["summary"]["invalid_rows"] = 2
+
+        decision = ReleaseGate().decide(
+            baseline=release_report(),
+            candidate=candidate,
+        )
+
+        self.assertEqual(decision["decision"], "BLOCKED")
+        self.assertFalse(decision["adopt"])
+        self.assertIn("candidate contains missing rows", decision["blocking_reasons"])
+        self.assertIn("candidate contains invalid rows", decision["blocking_reasons"])
 
 
 class ArtifactHygieneTests(unittest.TestCase):
@@ -276,24 +384,30 @@ class ArtifactHygieneTests(unittest.TestCase):
 
     def test_isotonic_fitter_uses_honest_split_and_pools_violations(self):
         split = SplitEvidence(
-            "calibration-v1", "calibration", tuned_on_splits=("tuning-v1",)
+            "calibration-v1",
+            "calibration",
+            tuned_on_splits=("tuning-v1",),
+            split_manifest_sha256=TEST_MANIFEST_SHA256,
         )
         samples = [
             {
                 "case_id": "MIB-000001",
                 "split_name": "calibration-v1",
+                "signal_stage": "pre_policy_calibration",
                 "raw_signal": 0.2,
                 "correct": True,
             },
             {
                 "case_id": "MIB-000002",
                 "split_name": "calibration-v1",
+                "signal_stage": "pre_policy_calibration",
                 "raw_signal": 0.4,
                 "correct": False,
             },
             {
                 "case_id": "MIB-000003",
                 "split_name": "calibration-v1",
+                "signal_stage": "pre_policy_calibration",
                 "raw_signal": 0.8,
                 "correct": True,
             },
@@ -313,12 +427,17 @@ class ArtifactHygieneTests(unittest.TestCase):
 
         self.assertEqual(mapping.probabilities, tuple(sorted(mapping.probabilities)))
         self.assertEqual(artifact["fit_metadata"]["training_case_count"], 3)
+        self.assertEqual(
+            artifact["fit_metadata"]["signal_stage"],
+            "pre_policy_calibration",
+        )
         self.assertFalse(RuntimeArtifactLeakageScanner.findings(artifact))
 
     def test_isotonic_fitter_rejects_tuning_and_mixed_samples(self):
         sample = {
             "case_id": "MIB-000001",
             "split_name": "calibration-v1",
+            "signal_stage": "pre_policy_calibration",
             "raw_signal": 0.5,
             "correct": True,
         }
@@ -330,11 +449,31 @@ class ArtifactHygieneTests(unittest.TestCase):
                 calibration_case_ids={"MIB-000001"},
                 tuning_case_ids={"MIB-000999"},
             )
+        final_output_sample = dict(
+            sample,
+            signal_stage="final_emitted_confidence",
+        )
+        with self.assertRaises(EvaluationConfigurationError):
+            IsotonicCalibrationFitter.fit(
+                [final_output_sample],
+                artifact_id="wrong-stage",
+                split=SplitEvidence(
+                    "calibration-v1",
+                    "calibration",
+                    split_manifest_sha256=TEST_MANIFEST_SHA256,
+                ),
+                calibration_case_ids={"MIB-000001"},
+                tuning_case_ids={"MIB-000999"},
+            )
         with self.assertRaises(EvaluationConfigurationError):
             IsotonicCalibrationFitter.fit(
                 [sample],
                 artifact_id="bad",
-                split=SplitEvidence("other-calibration", "calibration"),
+                split=SplitEvidence(
+                    "other-calibration",
+                    "calibration",
+                    split_manifest_sha256=TEST_MANIFEST_SHA256,
+                ),
                 calibration_case_ids={"MIB-000001"},
                 tuning_case_ids={"MIB-000999"},
             )

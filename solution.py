@@ -9,20 +9,10 @@ from pathlib import Path
 from typing import Sequence
 
 from mib_pipeline import (
-    AdjudicationEngine,
     BatchRunner,
     CalibrationArtifactError,
-    CaseLinker,
-    ConfidenceCalibrator,
-    DocumentRenderer,
-    EvidencePrecedenceResolver,
-    GeneralizablePolicyExceptionStore,
-    OutputConfidenceRecalibrationProcessor,
-    OutputConfidenceRecalibrator,
     PolicyArtifactError,
-    RapidOutputRecoveryProcessor,
-    ReviewDenialRecoveryAdjudicator,
-    VisibleEvidenceExtractor,
+    build_production_processor,
     discover_case_pdfs,
 )
 
@@ -89,23 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         input_dir, output_path = parse_paths(arguments)
         runner = BatchRunner(
-            OutputConfidenceRecalibrationProcessor(
-                processor=RapidOutputRecoveryProcessor(
-                    renderer=DocumentRenderer(),
-                    primary_extractor=VisibleEvidenceExtractor(
-                        packet_page_type_markers=True,
-                    ),
-                    linker=CaseLinker(),
-                    resolver=EvidencePrecedenceResolver(),
-                    adjudicator=ReviewDenialRecoveryAdjudicator(
-                        AdjudicationEngine(
-                            calibrator=ConfidenceCalibrator.from_pinned_artifact(),
-                            exceptions=GeneralizablePolicyExceptionStore.from_pinned_artifact(),
-                        )
-                    ),
-                ),
-                recalibrator=OutputConfidenceRecalibrator.from_pinned_artifact(),
-            ),
+            build_production_processor(),
             max_workers=configured_worker_limit(),
         )
         report = runner.run(input_dir, output_path)

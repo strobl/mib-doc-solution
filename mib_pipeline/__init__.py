@@ -68,6 +68,7 @@ from .output_confidence import (
     OutputConfidenceRecalibrator,
     PinnedOutputConfidenceMap,
 )
+from .production import build_production_processor
 from .pipeline import (
     AdjudicatingCaseProcessor,
     ExtractThenFallbackProcessor,
@@ -135,6 +136,7 @@ __all__ = [
     "VisibleEvidenceExtractor",
     "VisualCueDetector",
     "build_rapid_extractor",
+    "build_production_processor",
     "discover_case_pdfs",
     "group_ocr_lines",
     "OcrLine",
