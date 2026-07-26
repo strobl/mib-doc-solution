@@ -12,7 +12,7 @@ import threading
 from dataclasses import replace
 from typing import Any
 
-from mib_pipeline import Rect, RenderedCase, RenderedPage
+from mib_pipeline import RenderedCase, RenderedPage
 
 
 def _dependencies() -> tuple[Any, Any, Any]:
@@ -29,7 +29,7 @@ def _dependencies() -> tuple[Any, Any, Any]:
 def _page_image(page: RenderedPage) -> Any:
     Image, _ImageOps, _numpy = _dependencies()
     with Image.open(io.BytesIO(page.image_png)) as image:
-        return image.convert("L").copy()
+        return image.copy()
 
 
 def _png_bytes(image: Any) -> bytes:
@@ -43,20 +43,13 @@ def _png_bytes(image: Any) -> bytes:
     return buffer.getvalue()
 
 
-def _translate_box(box: Rect, dx: int, dy: int) -> Rect:
-    return Rect(
-        box.left + dx,
-        box.bottom + dy,
-        box.right + dx,
-        box.top + dy,
-    )
-
-
 class BoundedTemplateRegistrationRenderer:
-    """Translate a robust content frame toward canonical page coordinates."""
+    """Register one ruled template frame to canonical page coordinates."""
 
     _MAX_REGISTERED_PAGES_PER_CASE = 2
     _MAX_SHIFT_FRACTION = 0.03
+    _MIN_FRAME_FRACTION = 0.55
+    _MAX_FRAME_FRACTION = 0.95
 
     def __init__(self, delegate: Any) -> None:
         self._delegate = delegate
@@ -74,9 +67,25 @@ class BoundedTemplateRegistrationRenderer:
             self._activity[name] += count
 
     @classmethod
+    @staticmethod
+    def _projection_clusters(mask: Any) -> tuple[tuple[int, int], ...]:
+        indices = tuple(int(index) for index in mask.nonzero()[0])
+        if not indices:
+            return ()
+        clusters: list[tuple[int, int]] = []
+        start = previous = indices[0]
+        for index in indices[1:]:
+            if index > previous + 1:
+                clusters.append((start, previous))
+                start = index
+            previous = index
+        clusters.append((start, previous))
+        return tuple(clusters)
+
+    @classmethod
     def _registration_shift(cls, image: Any) -> tuple[int, int] | None:
         _Image, _ImageOps, numpy = _dependencies()
-        pixels = numpy.asarray(image)
+        pixels = numpy.asarray(image.convert("L"))
         height, width = pixels.shape[:2]
         if min(width, height) < 100:
             return None
@@ -93,17 +102,49 @@ class BoundedTemplateRegistrationRenderer:
         ys, xs = ink.nonzero()
         if len(xs) < 100:
             return None
-        left, right = (
-            float(numpy.percentile(xs, percentile))
-            for percentile in (5, 95)
-        )
-        top, bottom = (
-            float(numpy.percentile(ys, percentile))
-            for percentile in (5, 95)
-        )
+        left, right = int(xs.min()), int(xs.max())
+        top, bottom = int(ys.min()), int(ys.max())
         frame_width = right - left
         frame_height = bottom - top
-        if frame_width < width * 0.35 or frame_height < height * 0.35:
+        width_fraction = frame_width / width
+        height_fraction = frame_height / height
+        if not (
+            cls._MIN_FRAME_FRACTION
+            <= width_fraction
+            <= cls._MAX_FRAME_FRACTION
+            and cls._MIN_FRAME_FRACTION
+            <= height_fraction
+            <= cls._MAX_FRAME_FRACTION
+        ):
+            return None
+        frame = ink[top : bottom + 1, left : right + 1]
+        horizontal_rules = cls._projection_clusters(
+            frame.mean(axis=1) >= 0.45
+        )
+        vertical_rules = cls._projection_clusters(
+            frame.mean(axis=0) >= 0.45
+        )
+        if len(horizontal_rules) < 3 or len(vertical_rules) < 3:
+            return None
+
+        def has_outer_and_inner_rules(
+            rules: tuple[tuple[int, int], ...],
+            extent: int,
+        ) -> bool:
+            centers = tuple((start + end) / 2.0 for start, end in rules)
+            return bool(
+                centers[0] <= extent * 0.08
+                and centers[-1] >= extent * 0.92
+                and any(
+                    extent * 0.15 <= center <= extent * 0.85
+                    for center in centers[1:-1]
+                )
+            )
+
+        if not (
+            has_outer_and_inner_rules(horizontal_rules, frame.shape[0] - 1)
+            and has_outer_and_inner_rules(vertical_rules, frame.shape[1] - 1)
+        ):
             return None
         content_center_x = (left + right) / 2.0
         content_center_y = (top + bottom) / 2.0
@@ -121,7 +162,12 @@ class BoundedTemplateRegistrationRenderer:
     def _translate_image(image: Any, dx: int, dy: int) -> Any:
         Image, _ImageOps, _numpy = _dependencies()
         width, height = image.size
-        translated = Image.new("L", image.size, color=255)
+        fill = (
+            255
+            if image.mode == "L"
+            else tuple(255 for _band in image.getbands())
+        )
+        translated = Image.new(image.mode, image.size, color=fill)
         source_left = max(0, -dx)
         source_top = max(0, -dy)
         source_right = min(width, width - dx)
@@ -140,7 +186,6 @@ class BoundedTemplateRegistrationRenderer:
     def render(self, pdf_path: Any) -> RenderedCase:
         rendered_case = self._delegate.render(pdf_path)
         registered_count = 0
-        shifts: dict[int, tuple[int, int]] = {}
         pages: list[RenderedPage] = []
         for page in rendered_case.pages:
             self._increment("pages_scanned")
@@ -161,38 +206,15 @@ class BoundedTemplateRegistrationRenderer:
                 pages.append(page)
                 continue
             translated = self._translate_image(image, dx, dy)
-            translated_spans = tuple(
-                replace(span, box=_translate_box(span.box, dx, dy))
-                for span in page.text_spans
-            )
             pages.append(
                 replace(
                     page,
                     image_png=_png_bytes(translated),
-                    text_spans=translated_spans,
                 )
             )
-            shifts[page.index] = (dx, dy)
             registered_count += 1
             self._increment("pages_registered")
-        case_spans = tuple(
-            replace(
-                span,
-                box=_translate_box(
-                    span.box,
-                    shifts[span.page_index][0],
-                    shifts[span.page_index][1],
-                ),
-            )
-            if span.page_index in shifts
-            else span
-            for span in rendered_case.text_layer
-        )
-        return replace(
-            rendered_case,
-            pages=tuple(pages),
-            text_layer=case_spans,
-        )
+        return replace(rendered_case, pages=tuple(pages))
 
     def ablation_activity(self) -> dict[str, int]:
         with self._lock:
@@ -222,7 +244,7 @@ class BoundedContrastRenderer:
     @staticmethod
     def _is_low_contrast(image: Any) -> bool:
         _Image, _ImageOps, numpy = _dependencies()
-        pixels = numpy.asarray(image)
+        pixels = numpy.asarray(image.convert("L"))
         foreground = pixels[pixels < 245]
         foreground_fraction = foreground.size / max(1, pixels.size)
         if not 0.003 <= foreground_fraction <= 0.40:

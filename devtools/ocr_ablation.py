@@ -46,6 +46,31 @@ CHECKBOX_ACTIVITY_COUNTERS = frozenset(
         "ambiguous_groups",
     }
 )
+TEMPLATE_REGISTRATION_ACTIVITY_COUNTERS = frozenset(
+    {
+        "pages_scanned",
+        "eligible_frames",
+        "pages_registered",
+        "pages_unchanged",
+        "pages_abstained",
+    }
+)
+CONTRAST_ACTIVITY_COUNTERS = frozenset(
+    {
+        "pages_scanned",
+        "low_contrast_pages",
+        "pages_enhanced",
+        "pages_unchanged",
+        "pages_abstained",
+    }
+)
+_EXPECTED_ACTIVITY_COUNTERS = {
+    "with_checked_fee_option_recovery": CHECKBOX_ACTIVITY_COUNTERS,
+    "with_bounded_template_registration": (
+        TEMPLATE_REGISTRATION_ACTIVITY_COUNTERS
+    ),
+    "with_bounded_contrast": CONTRAST_ACTIVITY_COUNTERS,
+}
 
 BASELINE_CONFIG: Mapping[str, Mapping[str, bool]] = {
     "primary": {
@@ -804,13 +829,18 @@ def _validate_observation(path: Path, value: Any) -> dict[str, Any]:
             raise AblationConfigurationError(
                 f"{path}: activity counters require names and non-negative integers"
             )
-    if (
-        str(value["variant_id"]) == "with_checked_fee_option_recovery"
-        and set(activity_counts) != set(CHECKBOX_ACTIVITY_COUNTERS)
-    ):
-        raise AblationConfigurationError(
-            f"{path}: checkbox observation requires the fixed activity counters"
-        )
+    expected_activity = _EXPECTED_ACTIVITY_COUNTERS.get(
+        str(value["variant_id"])
+    )
+    if expected_activity is not None:
+        if set(activity_counts) != set(expected_activity):
+            raise AblationConfigurationError(
+                f"{path}: candidate observation requires fixed activity counters"
+            )
+        if activity_counts["pages_scanned"] < 1:
+            raise AblationConfigurationError(
+                f"{path}: candidate route did not scan any rendered pages"
+            )
     return dict(value)
 
 

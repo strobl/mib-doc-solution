@@ -65,11 +65,30 @@ def _content_center(image_png):
     )
 
 
+def _draw_template(image, box, *, fill):
+    left, top, right, bottom = box
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(box, outline=fill, width=6)
+    draw.line(
+        ((left + right) // 2, top, (left + right) // 2, bottom),
+        fill=fill,
+        width=6,
+    )
+    draw.line(
+        (left, (top + bottom) // 2, right, (top + bottom) // 2),
+        fill=fill,
+        width=6,
+    )
+
+
 class TemplateRegistrationRendererTests(unittest.TestCase):
-    def test_bounded_registration_recenters_frame_and_translates_spans(self):
-        image = Image.new("L", (400, 300), color=255)
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((63, 49, 353, 259), outline=0, width=6)
+    def test_bounded_registration_recenters_matched_rgb_template(self):
+        image = Image.new("RGB", (400, 300), color="white")
+        _draw_template(
+            image,
+            (63, 49, 353, 259),
+            fill=(0, 0, 0),
+        )
         rendered_case = _case(image)
         wrapper = BoundedTemplateRegistrationRenderer(
             FixedRenderer(rendered_case)
@@ -91,9 +110,9 @@ class TemplateRegistrationRendererTests(unittest.TestCase):
             abs(after_center[1] - 149.5),
             abs(before_center[1] - 149.5),
         )
-        dx = result.text_layer[0].box.left - rendered_case.text_layer[0].box.left
-        dy = result.text_layer[0].box.bottom - rendered_case.text_layer[0].box.bottom
-        self.assertEqual((dx, dy), (-8, -4))
+        self.assertEqual(result.text_layer, rendered_case.text_layer)
+        with Image.open(io.BytesIO(result.pages[0].image_png)) as translated:
+            self.assertEqual(translated.mode, "RGB")
 
     def test_centered_or_excessively_shifted_frames_do_not_change_pixels(self):
         scenarios = (
@@ -102,8 +121,8 @@ class TemplateRegistrationRendererTests(unittest.TestCase):
         )
         for box in scenarios:
             with self.subTest(box=box):
-                image = Image.new("L", (400, 300), color=255)
-                ImageDraw.Draw(image).rectangle(box, outline=0, width=6)
+                image = Image.new("RGB", (400, 300), color="white")
+                _draw_template(image, box, fill=(0, 0, 0))
                 rendered_case = _case(image)
                 wrapper = BoundedTemplateRegistrationRenderer(
                     FixedRenderer(rendered_case)
@@ -121,11 +140,11 @@ class TemplateRegistrationRendererTests(unittest.TestCase):
                 )
 
     def test_registration_is_byte_deterministic(self):
-        image = Image.new("L", (400, 300), color=255)
-        ImageDraw.Draw(image).rectangle(
+        image = Image.new("RGB", (400, 300), color="white")
+        _draw_template(
+            image,
             (63, 49, 353, 259),
-            outline=0,
-            width=6,
+            fill=(0, 0, 0),
         )
         rendered_case = _case(image)
 
@@ -138,14 +157,47 @@ class TemplateRegistrationRendererTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_dense_text_without_template_rules_abstains(self):
+        image = Image.new("RGB", (400, 300), color="white")
+        draw = ImageDraw.Draw(image)
+        for top in range(45, 260, 20):
+            draw.text(
+                (55 + (top // 20) % 7, top),
+                "MIB APPLICATION VISIBLE TEXT LINE",
+                fill=(0, 0, 0),
+            )
+        rendered_case = _case(image)
+        wrapper = BoundedTemplateRegistrationRenderer(
+            FixedRenderer(rendered_case)
+        )
+
+        result = wrapper.render(Path("/tmp/input.pdf"))
+
+        self.assertEqual(
+            result.pages[0].image_png,
+            rendered_case.pages[0].image_png,
+        )
+        self.assertEqual(
+            wrapper.ablation_activity()["eligible_frames"],
+            0,
+        )
+
 
 class ContrastRendererTests(unittest.TestCase):
     def test_low_contrast_page_is_enhanced_behind_gate(self):
-        image = Image.new("L", (400, 300), color=255)
+        image = Image.new("RGB", (400, 300), color="white")
         draw = ImageDraw.Draw(image)
-        draw.rectangle((55, 45, 345, 255), outline=150, width=6)
+        draw.rectangle(
+            (55, 45, 345, 255),
+            outline=(150, 150, 150),
+            width=6,
+        )
         for top in range(80, 240, 30):
-            draw.line((80, top, 320, top), fill=150, width=4)
+            draw.line(
+                (80, top, 320, top),
+                fill=(150, 150, 150),
+                width=4,
+            )
         rendered_case = _case(image)
         wrapper = BoundedContrastRenderer(FixedRenderer(rendered_case))
 
@@ -159,17 +211,18 @@ class ContrastRendererTests(unittest.TestCase):
         self.assertEqual(activity["low_contrast_pages"], 1)
         self.assertEqual(activity["pages_enhanced"], 1)
         with Image.open(io.BytesIO(result.pages[0].image_png)) as enhanced:
+            self.assertEqual(enhanced.mode, "RGB")
             self.assertEqual(min(enhanced.tobytes()), 0)
 
     def test_high_contrast_or_sparse_page_abstains(self):
-        high_contrast = Image.new("L", (400, 300), color=255)
+        high_contrast = Image.new("RGB", (400, 300), color="white")
         ImageDraw.Draw(high_contrast).rectangle(
             (55, 45, 345, 255),
-            outline=0,
+            outline=(0, 0, 0),
             width=6,
         )
-        sparse = Image.new("L", (400, 300), color=255)
-        ImageDraw.Draw(sparse).point((200, 150), fill=150)
+        sparse = Image.new("RGB", (400, 300), color="white")
+        ImageDraw.Draw(sparse).point((200, 150), fill=(150, 150, 150))
         for image in (high_contrast, sparse):
             with self.subTest(image=image):
                 rendered_case = _case(image)
@@ -189,11 +242,19 @@ class ContrastRendererTests(unittest.TestCase):
                 )
 
     def test_contrast_is_byte_deterministic(self):
-        image = Image.new("L", (400, 300), color=255)
+        image = Image.new("RGB", (400, 300), color="white")
         draw = ImageDraw.Draw(image)
-        draw.rectangle((55, 45, 345, 255), outline=150, width=6)
+        draw.rectangle(
+            (55, 45, 345, 255),
+            outline=(150, 150, 150),
+            width=6,
+        )
         for top in range(80, 240, 30):
-            draw.line((80, top, 320, top), fill=150, width=4)
+            draw.line(
+                (80, top, 320, top),
+                fill=(150, 150, 150),
+                width=4,
+            )
         rendered_case = _case(image)
 
         first = BoundedContrastRenderer(
