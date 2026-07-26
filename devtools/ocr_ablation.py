@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = "mib_ocr_ablation_v1"
-REPORT_VERSION = "mib_ocr_ablation_report_v2"
+REPORT_VERSION = "mib_ocr_ablation_report_v3"
 MINIMUM_DETERMINISM_REPEATS = 2
 PRIORITY_FIELDS = (
     "risk_flags",
@@ -63,7 +63,9 @@ BASELINE_CONFIG: Mapping[str, Mapping[str, bool]] = {
         "rapid_uncertain_fields": True,
     },
     "candidate": {
+        "bounded_contrast": False,
         "checkbox_state_recovery": False,
+        "template_registration": False,
     },
 }
 
@@ -80,6 +82,8 @@ _ALLOWED_VARIABLES = frozenset(
         "primary.visible_cue_interpretation",
         "secondary.rapid_uncertain_fields",
         "candidate.checkbox_state_recovery",
+        "candidate.bounded_contrast",
+        "candidate.template_registration",
     }
 )
 
@@ -360,6 +364,37 @@ def registered_variants() -> tuple[AblationVariant, ...]:
                 "one complete, aligned, uncorrected option group."
             ),
         ),
+        AblationVariant(
+            variant_id="with_bounded_template_registration",
+            family="template_registration",
+            technique=(
+                "Bounded content-frame translation to canonical page "
+                "coordinates"
+            ),
+            changed_variable="candidate.template_registration",
+            config=_variant_config("candidate.template_registration", True),
+            target_fields=PRIORITY_FIELDS,
+            technique_enabled_in="variant",
+            hypothesis=(
+                "A label-blind, translation-only registration should expose "
+                "shifted template fields without rescaling or rotating pages."
+            ),
+        ),
+        AblationVariant(
+            variant_id="with_bounded_contrast",
+            family="bounded_contrast",
+            technique=(
+                "Autocontrast on at most two visibly low-contrast pages per case"
+            ),
+            changed_variable="candidate.bounded_contrast",
+            config=_variant_config("candidate.bounded_contrast", True),
+            target_fields=PRIORITY_FIELDS,
+            technique_enabled_in="variant",
+            hypothesis=(
+                "A visible-pixel contrast gate should recover faint fields "
+                "without changing already high-contrast pages."
+            ),
+        ),
     )
 
 
@@ -451,6 +486,16 @@ def build_ablation_processor(variant_id: str) -> Any:
                 return 0.0
 
         renderer = DeskewDisabledDocumentRenderer()
+    if config["candidate.template_registration"]:
+        from devtools.render_candidates import (
+            BoundedTemplateRegistrationRenderer,
+        )
+
+        renderer = BoundedTemplateRegistrationRenderer(renderer)
+    if config["candidate.bounded_contrast"]:
+        from devtools.render_candidates import BoundedContrastRenderer
+
+        renderer = BoundedContrastRenderer(renderer)
     cue_detector = (
         None
         if config["primary.visible_cue_interpretation"]
@@ -531,7 +576,13 @@ def _collect_ablation_activity(processor: Any) -> dict[str, int]:
                     )
                 normalized[name] = value
             return normalized
-        for attribute in ("processor", "_processor", "_primary_extractor"):
+        for attribute in (
+            "processor",
+            "_processor",
+            "_primary_extractor",
+            "_renderer",
+            "_delegate",
+        ):
             child = getattr(component, attribute, None)
             if child is not None:
                 pending.append(child)

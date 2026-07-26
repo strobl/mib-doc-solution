@@ -16,6 +16,10 @@ from devtools.ocr_ablation import (
     render_markdown,
     run_variant,
 )
+from devtools.render_candidates import (
+    BoundedContrastRenderer,
+    BoundedTemplateRegistrationRenderer,
+)
 from mib_pipeline import (
     DocumentRenderer,
     PredictionRow,
@@ -90,7 +94,7 @@ class AblationPlanTests(unittest.TestCase):
     def test_registry_is_stable_and_every_variant_changes_exactly_one_setting(self):
         variants = registered_variants()
 
-        self.assertEqual(len(variants), 11)
+        self.assertEqual(len(variants), 13)
         self.assertEqual(
             len({variant.variant_id for variant in variants}),
             len(variants),
@@ -112,7 +116,7 @@ class AblationPlanTests(unittest.TestCase):
             self.assertEqual(differences, [variant.changed_variable])
             expected_enabled_side = (
                 "variant"
-                if variant.variant_id == "with_checked_fee_option_recovery"
+                if variant.variant_id.startswith("with_")
                 else "baseline"
             )
             self.assertEqual(
@@ -126,6 +130,8 @@ class AblationPlanTests(unittest.TestCase):
         self.assertIn("without_renderer_deskew", variant_ids)
         self.assertIn("without_visible_cue_interpretation", variant_ids)
         self.assertIn("with_checked_fee_option_recovery", variant_ids)
+        self.assertIn("with_bounded_template_registration", variant_ids)
+        self.assertIn("with_bounded_contrast", variant_ids)
 
         deskew_processor = build_ablation_processor("without_renderer_deskew")
         deskew_renderer = deskew_processor.processor._renderer
@@ -158,6 +164,36 @@ class AblationPlanTests(unittest.TestCase):
         self.assertIs(
             checkbox_extractor._ocr,
             checkbox_extractor._delegate._ocr,
+        )
+
+        registration = build_ablation_processor(
+            "with_bounded_template_registration"
+        )
+        self.assertIsInstance(
+            registration.processor._renderer,
+            BoundedTemplateRegistrationRenderer,
+        )
+        self.assertTrue(
+            all(
+                value == 0
+                for value in registration.processor._renderer
+                .ablation_activity()
+                .values()
+            )
+        )
+
+        contrast = build_ablation_processor("with_bounded_contrast")
+        self.assertIsInstance(
+            contrast.processor._renderer,
+            BoundedContrastRenderer,
+        )
+        self.assertTrue(
+            all(
+                value == 0
+                for value in contrast.processor._renderer
+                .ablation_activity()
+                .values()
+            )
         )
 
     def test_two_variable_or_unregistered_change_is_rejected(self):
