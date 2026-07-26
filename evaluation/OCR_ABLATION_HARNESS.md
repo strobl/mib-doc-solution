@@ -37,6 +37,12 @@ Visible checkbox pixels are intentionally separate from that combined cue
 path. The additive `with_checked_fee_option_recovery` variant measures only a
 complete, aligned three-option fee group with one pixel-confirmed check and
 two pixel-confirmed empty boxes; every incomplete or ambiguous group abstains.
+The additive `with_bounded_template_registration` variant independently
+measures a label-blind, translation-only ruled-template registration gate. The
+additive `with_bounded_contrast` variant independently measures an RGB
+autocontrast gate on at most two visibly low-contrast pages per case. Neither
+candidate changes PDF-point text geometry, render resolution, or another
+ablation setting.
 
 ## Reproducible commands
 
@@ -90,18 +96,23 @@ variants. It intentionally contains no per-case identifiers.
 
 ## Current evidence state
 
-The ten-route V2 bounded public diagnostic is recorded in
-[`OCR_ABLATION_REPORT_BOUNDED_V2.md`](OCR_ABLATION_REPORT_BOUNDED_V2.md) and
-its compact aggregate JSON companion. All ten variants and the baseline have
-two byte-identical, complete repetitions. Targeted RapidOCR is the measured
-first implementation-review choice, bounded renderer deskew is second,
-fee-row consensus is third, and orientation retry is rejected as a winner on
-this cohort. The stamp/correction/watermark/strikethrough cue path is
-independently measured at zero final-output delta on this cohort; it does not
-include checkbox pixels.
+The scope-complete bounded public diagnostic is recorded in
+[`OCR_ABLATION_REPORT_BOUNDED_V4.md`](OCR_ABLATION_REPORT_BOUNDED_V4.md) and
+its compact aggregate JSON companion. V4 combines the frozen ten-route V2
+measurement, the V3 visible-checkbox supplement, and fresh paired
+template-registration and bounded-contrast measurements. Every fresh baseline
+is byte-identical, so score effects are comparable; runtime deltas remain
+paired only within a source revision.
 
-The V1 report remains immutable historical evidence. V2 closes the deskew and
-non-checkbox cue gaps, but visible checkbox pixels remain outstanding until
-the separate additive variant has two deterministic measurements. WO-15 still
-owns group-exclusive robustness, complete recovery provenance, and
+Targeted RapidOCR is the first implementation-review choice, bounded renderer
+deskew is second, and fee-row consensus is third. Orientation retry is
+rejected as a winner. The fail-closed checkbox candidate and template
+registration candidate each scanned 146 rendered pages per repetition but
+found no qualifying evidence, so neither is recommended for production
+promotion. Bounded contrast changed 37 pages per repetition but reduced score
+by 0.448521, so it is also rejected as a winner.
+
+V1 and V2 remain immutable historical evidence; V3 remains an explicitly
+scope-incomplete supplement. WO-15 still owns
+group-exclusive robustness, complete recovery provenance, and
 production-promotion gates.

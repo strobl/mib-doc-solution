@@ -1,0 +1,659 @@
+{
+  "report_schema": "mib_ocr_ablation_committed_aggregate_v4",
+  "ranking_metric": "score_gain_per_cpu_second",
+  "benchmark_context": "public_label_exposed_diagnostic_not_unseen_not_official_leaderboard",
+  "production_integration": false,
+  "scope_complete": true,
+  "unmeasured_routes": [],
+  "source_revisions": {
+    "ten_route_removal_ablation": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+    "visible_checkbox_supplement": "a2c3852a90177319d9ac2eebca70135e0b2bf199",
+    "preprocessing_supplement": "9d0cfe958e611963b12469b17ef80ec10ff93330"
+  },
+  "cohort": {
+    "input_pdf_count": 32,
+    "rendered_page_count": 146,
+    "input_tree_sha256": "baf4a2ec982dcd578a10c8f58182310ab60148aeb308388e468d712b7f042a5f",
+    "truth_sha256": "595c00b5bf1eb2f4e79c4fa5c8e131d8d14f16704f4f5f9771a9ae9e221193db",
+    "selection": "32 smallest SHA-256 digests of PDF bytes; labels were not used for selection"
+  },
+  "baseline_bridge": {
+    "score_comparability_pass": true,
+    "runtime_comparability_across_revisions": false,
+    "runtime_pairing_rule": "Runtime deltas are paired only within one source revision.",
+    "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+    "total_score": 135.56041225662273,
+    "classification_score": 73.75,
+    "extraction_score": 45.763888888888886,
+    "calibration_score": 16.046523367733855,
+    "mean_brier": 0.09883691580665362,
+    "catastrophic_false_approvals": 0,
+    "missing_records": 0,
+    "invalid_records": 0
+  },
+  "measurement": {
+    "run_count": 32,
+    "attempted": 1024,
+    "answered": 1024,
+    "omitted": 0,
+    "deterministic_configuration_pairs": 16,
+    "total_cpu_seconds": 8949.924784,
+    "total_wall_seconds": 2765.754373208926,
+    "peak_memory_mib_max": 2736.71875,
+    "repeat_count_per_configuration": 2
+  },
+  "external_aggregate_reports": {
+    "ten_route_v2_sha256": "acbe1e1c83761d45ed7970c4a6ca2560ffed59c7d51c0e9d853413d86cbf25b2",
+    "visible_checkbox_sha256": "a9afefa3243ede327536be530529ffcb361d23f7cfe1b83dd0bb47bb35e3ac6d",
+    "preprocessing_sha256": "479727441ee9287fd6d7fe8b9a5dd13ff5f84b13c2bad4cdf996e353f2872d7a"
+  },
+  "measurement_definition": {
+    "score_contribution": "Score with the technique enabled minus score with it disabled.",
+    "score_gain_per_cpu_second": "Score contribution divided by the median CPU seconds of the complete technique-enabled run.",
+    "incremental_cpu_seconds": "Enabled median CPU seconds minus disabled median CPU seconds within one source revision.",
+    "incremental_score_gain_per_cpu_second": "Score contribution divided by positive incremental CPU seconds; null when the denominator is non-positive.",
+    "safety_pass": "Both configurations are complete and the technique does not increase catastrophic false approvals."
+  },
+  "scope_inventory": [
+    {
+      "route": "template_registration",
+      "variants": [
+        "with_bounded_template_registration"
+      ],
+      "status": "measured_unobserved"
+    },
+    {
+      "route": "normalized_crops",
+      "variants": [
+        "without_fee_threshold_consensus",
+        "without_sparse_intake_crop_consensus"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "page_segmentation_modes",
+      "variants": [
+        "without_psm6_refinement"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "orientation_retry",
+      "variants": [
+        "without_orientation_retry"
+      ],
+      "status": "measured_negative"
+    },
+    {
+      "route": "active_applicant_scope",
+      "variants": [
+        "without_trusted_scope_repair"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "bounded_deskew",
+      "variants": [
+        "without_renderer_deskew"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "bounded_contrast",
+      "variants": [
+        "with_bounded_contrast"
+      ],
+      "status": "measured_negative"
+    },
+    {
+      "route": "threshold_views",
+      "variants": [
+        "without_fee_threshold_consensus"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "targeted_rapidocr",
+      "variants": [
+        "without_targeted_rapidocr"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "line_cell_geometry",
+      "variants": [
+        "without_risk_geometry_retry"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "visible_checkbox_pixels",
+      "variants": [
+        "with_checked_fee_option_recovery"
+      ],
+      "status": "measured_unobserved"
+    },
+    {
+      "route": "visible_stamp_correction_watermark_strikethrough_cues",
+      "variants": [
+        "without_visible_cue_interpretation"
+      ],
+      "status": "measured"
+    },
+    {
+      "route": "cross_view_consensus",
+      "variants": [
+        "without_cross_view_consensus"
+      ],
+      "status": "measured"
+    }
+  ],
+  "ranked_recommendations": [
+    {
+      "rank": 1,
+      "variant_id": "without_targeted_rapidocr",
+      "technique": "Targeted RapidOCR for unresolved fields",
+      "score_contribution": 2.9672251716944515,
+      "score_gain_per_cpu_second": 0.010020872892840394,
+      "recommendation": "carry_into_wo15_implementation_review"
+    },
+    {
+      "rank": 2,
+      "variant_id": "without_renderer_deskew",
+      "technique": "Bounded render-time deskew",
+      "score_contribution": 2.6242654774590335,
+      "score_gain_per_cpu_second": 0.008862634031804461,
+      "recommendation": "preserve"
+    },
+    {
+      "rank": 3,
+      "variant_id": "without_fee_threshold_consensus",
+      "technique": "Bounded fee-row threshold consensus",
+      "score_contribution": 0.13491007763417429,
+      "score_gain_per_cpu_second": 0.0004556164974710261,
+      "recommendation": "preserve"
+    }
+  ],
+  "variants": [
+    {
+      "variant_id": "without_psm6_refinement",
+      "technique": "Selective PSM 6 refinement",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 288.268129,
+      "incremental_cpu_seconds": 7.836332499999969,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "not_selected_zero_delta"
+    },
+    {
+      "variant_id": "without_cross_view_consensus",
+      "technique": "Independent PSM 3/4 agreement for unresolved fields",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 276.331061,
+      "incremental_cpu_seconds": 19.77340049999998,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "not_selected_zero_delta"
+    },
+    {
+      "variant_id": "without_fee_threshold_consensus",
+      "technique": "Bounded normalized fee-row crop with four threshold views",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "fee_status"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 0.13491007763417429,
+      "target_field_raw_point_deltas": {
+        "fee_status": 4.0
+      },
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 310.4006855,
+      "incremental_cpu_seconds": -14.296224000000052,
+      "score_gain_per_cpu_second": 0.0004556164974710261,
+      "incremental_score_gain_per_cpu_second": null,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "third"
+    },
+    {
+      "variant_id": "without_sparse_intake_crop_consensus",
+      "technique": "Normalized sparse-intake crop with PSM 6/3 agreement",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 287.69727850000004,
+      "incremental_cpu_seconds": 8.407182999999918,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "not_selected_zero_delta"
+    },
+    {
+      "variant_id": "without_orientation_retry",
+      "technique": "Bounded orientation retry on candidate-free pages",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": -0.5530409833040721,
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 284.52725250000003,
+      "incremental_cpu_seconds": 11.577208999999925,
+      "score_gain_per_cpu_second": -0.0018677225614990344,
+      "incremental_score_gain_per_cpu_second": -0.04776980214351108,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "rejected_negative_delta"
+    },
+    {
+      "variant_id": "without_trusted_scope_repair",
+      "technique": "Visible exact-case applicant-scope repair",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 287.26393500000006,
+      "incremental_cpu_seconds": 8.840526499999896,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "not_selected_zero_delta"
+    },
+    {
+      "variant_id": "without_risk_geometry_retry",
+      "technique": "Cropped risk-row line/cell geometry consensus",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "risk_flags"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 287.0181195,
+      "incremental_cpu_seconds": 9.086341999999945,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "not_selected_zero_delta"
+    },
+    {
+      "variant_id": "without_renderer_deskew",
+      "technique": "Bounded render-time deskew",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 2.6242654774590335,
+      "target_field_raw_point_deltas": {
+        "sponsor_id": 5.0
+      },
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 242.63923899999998,
+      "incremental_cpu_seconds": 53.46522249999998,
+      "score_gain_per_cpu_second": 0.008862634031804461,
+      "incremental_score_gain_per_cpu_second": 0.04908359779965443,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "second"
+    },
+    {
+      "variant_id": "without_visible_cue_interpretation",
+      "technique": "Visible stamp, correction, watermark, and strikethrough interpretation",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 286.04141200000004,
+      "incremental_cpu_seconds": 10.06304949999992,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "retain_safety_path_zero_delta"
+    },
+    {
+      "variant_id": "without_targeted_rapidocr",
+      "technique": "RapidOCR routed only to unresolved output fields",
+      "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "baseline",
+      "score_contribution": 2.9672251716944515,
+      "target_field_raw_point_deltas": {
+        "arrival_date": 4.0,
+        "declared_purpose": 3.0,
+        "risk_flags": 8.0,
+        "species_code": 6.0,
+        "sponsor_id": 5.0,
+        "visa_class": 5.0
+      },
+      "enabled_cpu_seconds_median": 296.10446149999996,
+      "disabled_cpu_seconds_median": 153.9104965,
+      "incremental_cpu_seconds": 142.19396499999996,
+      "score_gain_per_cpu_second": 0.010020872892840394,
+      "incremental_score_gain_per_cpu_second": 0.020867448008039248,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "recommendation": "winner"
+    },
+    {
+      "variant_id": "with_checked_fee_option_recovery",
+      "technique": "Exact checked fee-option pixels",
+      "source_revision": "a2c3852a90177319d9ac2eebca70135e0b2bf199",
+      "target_fields": [
+        "fee_status"
+      ],
+      "technique_enabled_in": "variant",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 287.220215,
+      "disabled_cpu_seconds_median": 286.07210999999995,
+      "incremental_cpu_seconds": 1.1481050000000437,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "enabled_activity_counts": {
+        "pages_scanned": 146,
+        "complete_groups": 0,
+        "checked_groups": 0,
+        "candidates_added": 0,
+        "ambiguous_groups": 0
+      },
+      "observation": "route_measured_but_unobserved_in_cohort",
+      "recommendation": "not_selected_zero_delta"
+    },
+    {
+      "variant_id": "with_bounded_template_registration",
+      "technique": "Label-blind bounded translation to canonical ruled-template coordinates",
+      "source_revision": "9d0cfe958e611963b12469b17ef80ec10ff93330",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "variant",
+      "score_contribution": 0.0,
+      "enabled_cpu_seconds_median": 292.90545699999996,
+      "disabled_cpu_seconds_median": 286.579617,
+      "incremental_cpu_seconds": 6.325839999999971,
+      "score_gain_per_cpu_second": 0.0,
+      "incremental_score_gain_per_cpu_second": 0.0,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "enabled_activity_counts": {
+        "pages_scanned": 146,
+        "eligible_frames": 0,
+        "pages_registered": 0,
+        "pages_abstained": 146,
+        "pages_unchanged": 0
+      },
+      "observation": "route_measured_but_unobserved_in_cohort",
+      "recommendation": "not_selected_zero_delta"
+    },
+    {
+      "variant_id": "with_bounded_contrast",
+      "technique": "Autocontrast on at most two visibly low-contrast pages per case",
+      "source_revision": "9d0cfe958e611963b12469b17ef80ec10ff93330",
+      "target_fields": [
+        "risk_flags",
+        "fee_status",
+        "applicant_name",
+        "sponsor_id",
+        "arrival_date",
+        "visa_class",
+        "species_code",
+        "home_world",
+        "declared_purpose"
+      ],
+      "technique_enabled_in": "variant",
+      "score_contribution": -0.4485206811409057,
+      "target_field_raw_point_deltas": {
+        "arrival_date": -4.0
+      },
+      "enabled_cpu_seconds_median": 321.98292299999997,
+      "disabled_cpu_seconds_median": 286.579617,
+      "incremental_cpu_seconds": 35.403305999999986,
+      "score_gain_per_cpu_second": -0.001392995246337663,
+      "incremental_score_gain_per_cpu_second": -0.012668892592711705,
+      "repeat_count": 2,
+      "deterministic": true,
+      "complete": true,
+      "safety_pass": true,
+      "enabled_catastrophic_false_approvals": 0,
+      "disabled_catastrophic_false_approvals": 0,
+      "enabled_missing_records": 0,
+      "disabled_missing_records": 0,
+      "enabled_invalid_records": 0,
+      "disabled_invalid_records": 0,
+      "enabled_activity_counts": {
+        "pages_scanned": 146,
+        "low_contrast_pages": 37,
+        "pages_enhanced": 37,
+        "pages_abstained": 109,
+        "pages_unchanged": 0
+      },
+      "recommendation": "rejected_negative_delta"
+    }
+  ],
+  "recommendation": {
+    "carry_into_wo15_implementation_review": [
+      "targeted_rapidocr"
+    ],
+    "preserve": [
+      "bounded_renderer_deskew",
+      "bounded_fee_row_threshold_consensus"
+    ],
+    "retain_as_safety_not_score_claim": [
+      "visible_stamp_correction_watermark_strikethrough_cues"
+    ],
+    "do_not_promote_unobserved": [
+      "visible_checkbox_pixels",
+      "template_registration"
+    ],
+    "reject_as_winners": [
+      "orientation_retry",
+      "bounded_contrast"
+    ]
+  },
+  "limitations": [
+    "This report measures one fixed public development partition and makes no unseen, private, or official leaderboard claim.",
+    "Removal ablations estimate marginal contribution in the measured configuration; interactions between techniques are not identified.",
+    "Zero score for an unobserved route is not proof that the technique has no value on another corpus.",
+    "No additive candidate measured in the supplements is integrated into the submitted production runtime."
+  ]
+}
