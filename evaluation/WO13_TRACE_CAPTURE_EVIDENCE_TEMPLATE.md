@@ -103,6 +103,13 @@ members are supported within fixed archive and uncompressed-size bounds.
 Both preregistration and capture must use CPython with `-I -B`, the exact
 installed dependency closure, and these Dockerfile values:
 
+The isolated interpreter is `/private/tmp/mib-wo13-venv/bin/python3`. Its
+site-packages contains only the create-once
+`mib_wo11_pinned.pth -> /private/tmp/mib-wo11-py312` binding. The authority
+hashes the resolved interpreter and every installed file declared by each
+direct `requirements.lock` distribution; a missing or different dependency
+fails before capture.
+
 ```bash
 env \
   BLIS_NUM_THREADS=4 \
@@ -119,7 +126,7 @@ env \
   TMPDIR=/tmp \
   TOKENIZERS_PARALLELISM=false \
   VECLIB_MAXIMUM_THREADS=4 \
-  /ABSOLUTE/PINNED/PYTHON3 -I -B \
+  /private/tmp/mib-wo13-venv/bin/python3 -I -B \
   devtools/wo13_trace_capture.py prepare-authority \
   --authority-output /private/tmp/wo13-authority.json \
   --input-dir /ABSOLUTE/EXACT_1000_PDF_DIRECTORY \
@@ -157,7 +164,7 @@ env \
   TMPDIR=/tmp \
   TOKENIZERS_PARALLELISM=false \
   VECLIB_MAXIMUM_THREADS=4 \
-  /ABSOLUTE/PINNED/PYTHON3 -I -B \
+  /private/tmp/mib-wo13-venv/bin/python3 -I -B \
   devtools/wo13_trace_capture.py capture \
   --authority-manifest /private/tmp/wo13-authority.json \
   --predictions-output /private/tmp/wo13-predictions.jsonl \
@@ -183,7 +190,7 @@ Git state and every authority byte, and recomputes the layout groups from the
 bound PDFs:
 
 ```bash
-/ABSOLUTE/PINNED/PYTHON3 -I -B scripts/score_loss_atlas.py \
+/private/tmp/mib-wo13-venv/bin/python3 -I -B scripts/score_loss_atlas.py \
   --truth /ABSOLUTE/EXACT_TRAIN_LABELS_CSV \
   --submission /private/tmp/wo13-predictions.jsonl \
   --evaluation /private/tmp/mib-wo11-full1000-recovered-v2-evaluation.json \
