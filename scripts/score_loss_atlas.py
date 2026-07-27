@@ -16,9 +16,30 @@ import itertools
 import json
 import math
 import re
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+while str(_REPOSITORY_ROOT) in sys.path:
+    sys.path.remove(str(_REPOSITORY_ROOT))
+sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from devtools.wo13_trace_contract import (
+    TRACE_SCHEMA_VERSION as WO13_TRACE_SCHEMA_VERSION,
+    TraceContractError,
+    canonical_json_bytes,
+    validate_trace_capture,
+)
+from devtools.wo13_trace_capture import (
+    TraceCaptureError,
+    _read_stable_regular_file,
+    _verify_layout_and_input,
+    load_capture_authority,
+    load_frozen_baseline_authority,
+    verify_dataset_archive_authority,
+)
 
 
 SCORE_VERSION = "mib_weighted_v1"
@@ -90,6 +111,7 @@ _LAYOUT_CATEGORY_RE = re.compile(
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_FROZEN_BASELINE_SCHEMA = "mib-frozen-baseline/v1"
 TRACE_CATEGORY_ENUMS = {
     "provenance_route": frozenset(
         {
@@ -157,6 +179,19 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_stable_json(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[Any, str]:
+    try:
+        content = _read_stable_regular_file(Path(path), label=label)
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AtlasInputError(f"{label} is not valid UTF-8 JSON") from exc
+    return payload, hashlib.sha256(content).hexdigest()
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1029,7 +1064,13 @@ def _blocked_dimension(reason: str, required_input: str) -> dict[str, Any]:
 
 
 def _layout_evidence(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    payload = _read_json(path)
+    try:
+        payload, file_sha256 = _read_stable_json(
+            path,
+            label="layout manifest",
+        )
+    except TraceCaptureError as exc:
+        raise AtlasInputError(str(exc)) from exc
     if not isinstance(payload, Mapping):
         raise AtlasInputError("layout manifest must be an object")
     if payload.get("schema") != "mib-wo12-layout-groups/v2":
@@ -1064,10 +1105,86 @@ def _layout_evidence(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             )
         rows.append(dict(item))
     return rows, {
-        "file_sha256": _sha256_path(path),
+        "file_sha256": file_sha256,
         "schema": payload["schema"],
         "layout_signature_version": layout_signature["version"],
         "label_blind_construction": True,
+    }
+
+
+def _frozen_baseline_evidence(
+    path: Path,
+    *,
+    source_sha256: Mapping[str, str],
+) -> dict[str, Any]:
+    try:
+        payload, file_sha256 = _read_stable_json(
+            path,
+            label="frozen baseline manifest",
+        )
+    except TraceCaptureError as exc:
+        raise AtlasInputError(str(exc)) from exc
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"schema", "metadata", "artifacts"}
+        or payload.get("schema") != _FROZEN_BASELINE_SCHEMA
+    ):
+        raise AtlasInputError("frozen baseline manifest schema is unsupported")
+    metadata = payload["metadata"]
+    artifacts = payload["artifacts"]
+    if not isinstance(metadata, Mapping) or not isinstance(artifacts, list):
+        raise AtlasInputError("frozen baseline manifest has invalid sections")
+    revision = str(metadata.get("baseline_commit_sha", "")).casefold()
+    if not _REVISION_RE.fullmatch(revision):
+        raise AtlasInputError("frozen baseline commit SHA is invalid")
+    if (
+        isinstance(metadata.get("count"), bool)
+        or not isinstance(metadata.get("count"), int)
+        or metadata["count"] < 1
+    ):
+        raise AtlasInputError("frozen baseline count must be positive")
+
+    by_path: dict[str, str] = {}
+    for artifact in artifacts:
+        if (
+            not isinstance(artifact, Mapping)
+            or set(artifact) != {"path", "sha256", "size_bytes"}
+        ):
+            raise AtlasInputError(
+                "frozen baseline artifacts must use the exact schema"
+            )
+        artifact_path = artifact["path"]
+        digest = str(artifact["sha256"]).casefold()
+        size = artifact["size_bytes"]
+        if (
+            not isinstance(artifact_path, str)
+            or not artifact_path
+            or artifact_path in by_path
+            or not _SHA256_RE.fullmatch(digest)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            raise AtlasInputError("frozen baseline artifact entry is invalid")
+        by_path[artifact_path] = digest
+
+    required_paths = {
+        "truth": "data/train_labels.csv",
+        "submission": "external/full1000_predictions.jsonl",
+        "evaluation": "external/full1000_evaluation.json",
+        "case_scores": "external/full1000_case_scores.jsonl",
+    }
+    for source_name, artifact_path in required_paths.items():
+        if by_path.get(artifact_path) != source_sha256[source_name]:
+            raise AtlasInputError(
+                f"frozen baseline {source_name} hash does not match atlas source"
+            )
+    return {
+        "file_sha256": file_sha256,
+        "schema": _FROZEN_BASELINE_SCHEMA,
+        "baseline_commit_sha": revision,
+        "case_count": metadata["count"],
+        "source_artifacts_verified": True,
     }
 
 
@@ -1075,8 +1192,303 @@ def _trace_evidence(
     path: Path,
     *,
     source_sha256: Mapping[str, str],
+    frozen_baseline: Mapping[str, Any] | None = None,
+    frozen_baseline_manifest_path: Path | None = None,
+    layout_manifest_sha256: str | None = None,
+    runtime_contract_path: Path | None = None,
+    dataset_archive_path: Path | None = None,
+    baseline_predictions_path: Path | None = None,
+    authority_manifest_path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    payload = _read_json(path)
+    try:
+        payload, trace_file_sha256 = _read_stable_json(
+            path,
+            label="WO13 trace",
+        )
+    except TraceCaptureError as exc:
+        raise AtlasInputError(str(exc)) from exc
+    if (
+        isinstance(payload, Mapping)
+        and payload.get("schema_version") == WO13_TRACE_SCHEMA_VERSION
+    ):
+        try:
+            capture = validate_trace_capture(payload)
+        except TraceContractError as exc:
+            raise AtlasInputError(str(exc)) from exc
+        if (
+            capture["capture_mode"] == "authoritative_production"
+            and hashlib.sha256(canonical_json_bytes(capture)).hexdigest()
+            != trace_file_sha256
+        ):
+            raise AtlasInputError(
+                "authoritative WO13 trace bytes are not canonical output"
+            )
+        if capture["predictions_sha256"] != source_sha256["submission"]:
+            raise AtlasInputError(
+                "WO13 trace prediction hash does not match the atlas source"
+            )
+        source_verified = bool(
+            frozen_baseline is not None
+            and capture["source_revision_sha"]
+            == frozen_baseline["baseline_commit_sha"]
+            and capture["case_count"] == frozen_baseline["case_count"]
+        )
+        if frozen_baseline is not None and not source_verified:
+            raise AtlasInputError(
+                "WO13 trace source revision/count does not match frozen baseline"
+            )
+        authority_verified = False
+        if (
+            capture["capture_mode"] == "authoritative_production"
+            and authority_manifest_path is not None
+        ):
+            try:
+                authority = load_capture_authority(
+                    Path(authority_manifest_path)
+                )
+                baseline = load_frozen_baseline_authority(
+                    authority.approved_paths[
+                        "frozen_baseline_manifest"
+                    ],
+                    authority.approved_paths["baseline_predictions"],
+                )
+                _verify_layout_and_input(
+                    input_dir=authority.approved_paths["input_dir"],
+                    layout_manifest_path=authority.approved_paths[
+                        "layout_manifest"
+                    ],
+                    expected_layout_manifest_sha256=(
+                        authority.expected_hashes[
+                            "layout_manifest_sha256"
+                        ]
+                    ),
+                    expected_input_tree_sha256=authority.expected_hashes[
+                        "input_tree_sha256"
+                    ],
+                )
+                archive_binding = verify_dataset_archive_authority(
+                    authority.approved_paths["dataset_archive"],
+                    expected_record_count=(
+                        authority.expected_record_count
+                    ),
+                    expected_input_tree_sha256=(
+                        authority.expected_hashes[
+                            "input_tree_sha256"
+                        ]
+                    ),
+                )
+                if (
+                    archive_binding["archive_sha256"]
+                    != authority.expected_hashes[
+                        "dataset_archive_sha256"
+                    ]
+                ):
+                    raise TraceCaptureError(
+                        "dataset archive differs from authority"
+                    )
+            except (OSError, TraceCaptureError) as exc:
+                raise AtlasInputError(
+                    f"WO13 authority verification failed: {exc}"
+                ) from exc
+
+            supplied_paths = {
+                "frozen_baseline_manifest": (
+                    frozen_baseline_manifest_path
+                ),
+                "runtime_contract": runtime_contract_path,
+                "dataset_archive": dataset_archive_path,
+                "baseline_predictions": baseline_predictions_path,
+            }
+            for label, supplied in supplied_paths.items():
+                if (
+                    supplied is not None
+                    and Path(supplied).resolve()
+                    != authority.approved_paths[label]
+                ):
+                    raise AtlasInputError(
+                        f"WO13 {label} path differs from authority manifest"
+                    )
+            if (
+                layout_manifest_sha256
+                != authority.expected_hashes["layout_manifest_sha256"]
+            ):
+                raise AtlasInputError(
+                    "WO13 layout manifest differs from authority manifest"
+                )
+            expected_bindings = {
+                "source_revision_sha": baseline["source_revision_sha"],
+                "checkout_revision_sha": (
+                    authority.capture_source_revision_sha
+                ),
+                "capture_source_revision_sha": (
+                    authority.capture_source_revision_sha
+                ),
+                "input_tree_sha256": authority.expected_hashes[
+                    "input_tree_sha256"
+                ],
+                "processing_snapshot_input_tree_sha256": (
+                    authority.expected_hashes["input_tree_sha256"]
+                ),
+                "layout_manifest_sha256": authority.expected_hashes[
+                    "layout_manifest_sha256"
+                ],
+                "dataset_archive_sha256": authority.expected_hashes[
+                    "dataset_archive_sha256"
+                ],
+                "runtime_contract_sha256": authority.expected_hashes[
+                    "runtime_contract_sha256"
+                ],
+                "frozen_baseline_manifest_sha256": baseline[
+                    "manifest_sha256"
+                ],
+                "baseline_predictions_sha256": baseline[
+                    "predictions_sha256"
+                ],
+                "runtime_graph_sha256": authority.expected_hashes[
+                    "runtime_graph_sha256"
+                ],
+                "trace_tool_sha256": authority.expected_hashes[
+                    "trace_tool_sha256"
+                ],
+                "container_graph_sha256": authority.expected_hashes[
+                    "container_graph_sha256"
+                ],
+                "source_snapshot_sha256": authority.expected_hashes[
+                    "source_snapshot_sha256"
+                ],
+                "authority_manifest_sha256": (
+                    authority.manifest_sha256
+                ),
+                "runtime_identity_sha256": authority.runtime_identity[
+                    "runtime_identity_sha256"
+                ],
+                "dependency_identity_sha256": authority.runtime_identity[
+                    "dependency_identity_sha256"
+                ],
+                "python_executable_sha256": authority.runtime_identity[
+                    "python_executable_sha256"
+                ],
+                "production_tree_verified": True,
+                "runtime_contract_verified": True,
+                "runtime_environment_verified": True,
+                "runtime_interface_verified": True,
+                "container_limits_verified": True,
+                "processing_snapshot_verified": True,
+            }
+            for label, expected in expected_bindings.items():
+                if capture[label] != expected:
+                    raise AtlasInputError(
+                        f"WO13 trace {label} does not match recomputed authority"
+                    )
+            if (
+                authority.expected_record_count
+                != baseline["expected_record_count"]
+                or capture["case_count"]
+                != authority.expected_record_count
+                or capture["max_workers"] != authority.max_workers
+                or capture["retry_missing_attempts"]
+                != authority.retry_missing_attempts
+            ):
+                raise AtlasInputError(
+                    "WO13 trace case count disagrees with authority files"
+                )
+            if (
+                frozen_baseline is None
+                or frozen_baseline["file_sha256"]
+                != baseline["manifest_sha256"]
+            ):
+                raise AtlasInputError(
+                    "WO13 frozen baseline evidence is not the verified file"
+                )
+            authority_verified = True
+
+        authoritative = bool(
+            capture["capture_mode"] == "authoritative_production"
+            and source_verified
+            and authority_verified
+            and capture["production_tree_verified"]
+            and all(capture["stability_checks"].values())
+        )
+        return capture["rows"], {
+            "file_sha256": trace_file_sha256,
+            "schema_version": capture["schema_version"],
+            "capture_mode": capture["capture_mode"],
+            "source_revision_sha": capture["source_revision_sha"],
+            "checkout_revision_sha": capture["checkout_revision_sha"],
+            "capture_source_revision_sha": capture[
+                "capture_source_revision_sha"
+            ],
+            "input_tree_sha256": capture["input_tree_sha256"],
+            "processing_snapshot_input_tree_sha256": capture[
+                "processing_snapshot_input_tree_sha256"
+            ],
+            "layout_manifest_sha256": capture["layout_manifest_sha256"],
+            "dataset_archive_sha256": capture["dataset_archive_sha256"],
+            "runtime_contract_sha256": capture[
+                "runtime_contract_sha256"
+            ],
+            "frozen_baseline_manifest_sha256": capture[
+                "frozen_baseline_manifest_sha256"
+            ],
+            "baseline_predictions_sha256": capture[
+                "baseline_predictions_sha256"
+            ],
+            "runtime_graph_sha256": capture["runtime_graph_sha256"],
+            "trace_tool_sha256": capture["trace_tool_sha256"],
+            "container_graph_sha256": capture[
+                "container_graph_sha256"
+            ],
+            "source_snapshot_sha256": capture[
+                "source_snapshot_sha256"
+            ],
+            "authority_manifest_sha256": capture[
+                "authority_manifest_sha256"
+            ],
+            "runtime_identity_sha256": capture[
+                "runtime_identity_sha256"
+            ],
+            "dependency_identity_sha256": capture[
+                "dependency_identity_sha256"
+            ],
+            "python_executable_sha256": capture[
+                "python_executable_sha256"
+            ],
+            "submission_sha256": capture["predictions_sha256"],
+            "prediction_byte_parity_verified": True,
+            "source_revision_verified_against_authority": source_verified,
+            "authority_files_recomputed_and_verified": authority_verified,
+            "input_tree_verified_against_authority": authority_verified,
+            "dataset_archive_verified_against_authority": authority_verified,
+            "runtime_graph_verified_against_authority": authority_verified,
+            "trace_tool_verified_against_authority": authority_verified,
+            "layout_manifest_verified": authority_verified,
+            "production_tree_verified": capture[
+                "production_tree_verified"
+            ],
+            "runtime_contract_verified": capture[
+                "runtime_contract_verified"
+            ],
+            "runtime_environment_verified": capture[
+                "runtime_environment_verified"
+            ],
+            "runtime_interface_verified": capture[
+                "runtime_interface_verified"
+            ],
+            "container_limits_verified": capture[
+                "container_limits_verified"
+            ],
+            "processing_snapshot_verified": capture[
+                "processing_snapshot_verified"
+            ],
+            "stability_checks": capture["stability_checks"],
+            "exact_case_set_declared": True,
+            "authoritative_current_source": authoritative,
+            "batch_wall_seconds": capture["batch_wall_seconds"],
+            "max_workers": capture["max_workers"],
+            "retry_missing_attempts": capture["retry_missing_attempts"],
+            "retry_passes_used": capture["retry_passes_used"],
+        }
+
     expected_keys = {
         "schema_version",
         "source_revision_sha",
@@ -1117,12 +1529,13 @@ def _trace_evidence(
     if any(not isinstance(row, Mapping) for row in rows):
         raise AtlasInputError("trace rows must be objects")
     return [dict(row) for row in rows], {
-        "file_sha256": _sha256_path(path),
+        "file_sha256": trace_file_sha256,
         "schema_version": payload["schema_version"],
         "source_revision_sha": source_revision,
         "input_tree_sha256": input_tree_sha256,
         "truth_sha256": truth_sha256,
         "submission_sha256": submission_sha256,
+        "authoritative_current_source": False,
     }
 
 
@@ -1135,9 +1548,53 @@ def _build_dimension_atlas(
     source_sha256: Mapping[str, str],
     layout_manifest_path: Path | None,
     trace_dimensions_path: Path | None,
+    frozen_baseline_manifest_path: Path | None,
+    runtime_contract_path: Path | None,
+    dataset_archive_path: Path | None,
+    baseline_predictions_path: Path | None,
+    authority_manifest_path: Path | None,
 ) -> tuple[dict[str, Any], list[dict[str, str]], dict[str, str]]:
     case_ids = set(scored)
     evidence_hashes: dict[str, str] = {}
+    frozen_baseline: dict[str, Any] | None = None
+    if frozen_baseline_manifest_path is not None:
+        frozen_baseline = _frozen_baseline_evidence(
+            frozen_baseline_manifest_path,
+            source_sha256=source_sha256,
+        )
+        evidence_hashes["frozen_baseline_manifest"] = frozen_baseline[
+            "file_sha256"
+        ]
+
+    layout_rows: list[dict[str, Any]] | None = None
+    layout_binding: dict[str, Any] | None = None
+    if layout_manifest_path is not None:
+        layout_rows, layout_binding = _layout_evidence(layout_manifest_path)
+        evidence_hashes["layout_manifest"] = layout_binding["file_sha256"]
+
+    trace_rows: list[dict[str, Any]] | None = None
+    trace_binding: dict[str, Any] | None = None
+    if trace_dimensions_path is not None:
+        trace_rows, trace_binding = _trace_evidence(
+            trace_dimensions_path,
+            source_sha256=source_sha256,
+            frozen_baseline=frozen_baseline,
+            frozen_baseline_manifest_path=frozen_baseline_manifest_path,
+            layout_manifest_sha256=(
+                layout_binding["file_sha256"]
+                if layout_binding is not None
+                else None
+            ),
+            runtime_contract_path=runtime_contract_path,
+            dataset_archive_path=dataset_archive_path,
+            baseline_predictions_path=baseline_predictions_path,
+            authority_manifest_path=authority_manifest_path,
+        )
+        evidence_hashes["trace_dimensions"] = trace_binding["file_sha256"]
+    current_source = bool(
+        trace_binding is not None
+        and trace_binding.get("authoritative_current_source") is True
+    )
 
     confidence_labels = {
         case_id: _confidence_bucket(
@@ -1160,14 +1617,12 @@ def _build_dimension_atlas(
         }
     }
 
-    if layout_manifest_path is None:
+    if layout_rows is None or layout_binding is None:
         dimensions["page_template_family"] = _blocked_dimension(
             "No label-blind layout manifest was supplied.",
             "--layout-manifest",
         )
     else:
-        layout_rows, layout_binding = _layout_evidence(layout_manifest_path)
-        evidence_hashes["layout_manifest"] = layout_binding["file_sha256"]
         layout_labels = _dimension_labels(
             layout_rows,
             case_ids=case_ids,
@@ -1182,29 +1637,33 @@ def _build_dimension_atlas(
                 per_case=per_case,
                 components=components,
             ),
-            "status": "auxiliary_historical",
+            "status": (
+                "current_source" if current_source else "auxiliary_historical"
+            ),
             "source": "label_blind_layout_manifest",
             "binding": {
                 **layout_binding,
                 "exact_case_set_verified": True,
-                "exact_source_revision_verified": False,
-                "input_tree_sha256_verified": False,
+                "exact_source_revision_verified": current_source,
+                "input_tree_sha256_verified": current_source,
+                "trace_capture_layout_hash_verified": current_source,
             },
-            "qualification": (
-                "Auxiliary only: the manifest has exact case coverage but does "
-                "not bind the frozen baseline source revision and input tree."
+            **(
+                {}
+                if current_source
+                else {
+                    "qualification": (
+                        "Auxiliary only: the manifest has exact case coverage "
+                        "but does not bind the frozen baseline source revision "
+                        "and input tree."
+                    )
+                }
             ),
         }
 
     trace_by_case: dict[str, Mapping[str, Any]] | None = None
     expected_trace_keys = {"case_id", *TRACE_DIMENSIONS, "runtime_seconds"}
-    trace_binding: dict[str, Any] | None = None
-    if trace_dimensions_path is not None:
-        trace_rows, trace_binding = _trace_evidence(
-            trace_dimensions_path,
-            source_sha256=source_sha256,
-        )
-        evidence_hashes["trace_dimensions"] = trace_binding["file_sha256"]
+    if trace_rows is not None:
         trace_by_case = {}
         for row in trace_rows:
             if set(row) != expected_trace_keys:
@@ -1261,17 +1720,21 @@ def _build_dimension_atlas(
                 per_case=per_case,
                 components=components,
             ),
-            "status": "auxiliary_historical",
-            "source": "development_only_trace",
-            "binding": {
-                **dict(trace_binding or {}),
-                "source_revision_verified_against_authority": False,
-                "input_tree_verified_against_authority": False,
-            },
-            "qualification": (
-                "Auxiliary only: the file, schema, truth, and evaluated output "
-                "are bound. Source revision and input tree are self-declared "
-                "metadata without an authoritative frozen-baseline comparison."
+            "status": (
+                "current_source" if current_source else "auxiliary_historical"
+            ),
+            "source": "truth_blind_development_trace",
+            "binding": dict(trace_binding or {}),
+            **(
+                {}
+                if current_source
+                else {
+                    "qualification": (
+                        "Auxiliary only: the trace is prediction-bound, but "
+                        "one or more authoritative source/input/layout/archive "
+                        "bindings are absent."
+                    )
+                }
             ),
         }
 
@@ -1280,7 +1743,7 @@ def _build_dimension_atlas(
             case_id: _runtime_bucket(float(row["runtime_seconds"]))
             for case_id, row in trace_by_case.items()
         }
-        total_runtime = sum(
+        sum_case_latency = sum(
             float(row["runtime_seconds"]) for row in trace_by_case.values()
         )
         dimensions["runtime_cost"] = {
@@ -1290,16 +1753,24 @@ def _build_dimension_atlas(
                 per_case=per_case,
                 components=components,
             ),
-            "status": "auxiliary_historical",
-            "source": "development_only_trace",
-            "binding": {
-                **dict(trace_binding or {}),
-                "source_revision_verified_against_authority": False,
-                "input_tree_verified_against_authority": False,
-            },
-            "total_runtime_seconds": total_runtime,
+            "status": (
+                "current_source" if current_source else "auxiliary_historical"
+            ),
+            "source": "truth_blind_development_trace",
+            "binding": dict(trace_binding or {}),
+            "sum_case_latency_seconds": sum_case_latency,
             "mean_runtime_seconds_per_case": (
-                total_runtime / len(trace_by_case) if trace_by_case else 0.0
+                sum_case_latency / len(trace_by_case) if trace_by_case else 0.0
+            ),
+            **(
+                {
+                    "batch_wall_seconds": trace_binding[
+                        "batch_wall_seconds"
+                    ]
+                }
+                if trace_binding is not None
+                and "batch_wall_seconds" in trace_binding
+                else {}
             ),
             "bucket_definition": (
                 "under_1s,1s_to_under_2s,2s_to_under_4s,"
@@ -1361,6 +1832,11 @@ def build_atlas(
     source_sha256: Mapping[str, str] | None = None,
     layout_manifest_path: Path | None = None,
     trace_dimensions_path: Path | None = None,
+    frozen_baseline_manifest_path: Path | None = None,
+    runtime_contract_path: Path | None = None,
+    dataset_archive_path: Path | None = None,
+    baseline_predictions_path: Path | None = None,
+    authority_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Return aggregate score losses after cross-artifact validation."""
 
@@ -1529,6 +2005,11 @@ def build_atlas(
             source_sha256=hashes,
             layout_manifest_path=layout_manifest_path,
             trace_dimensions_path=trace_dimensions_path,
+            frozen_baseline_manifest_path=frozen_baseline_manifest_path,
+            runtime_contract_path=runtime_contract_path,
+            dataset_archive_path=dataset_archive_path,
+            baseline_predictions_path=baseline_predictions_path,
+            authority_manifest_path=authority_manifest_path,
         )
     )
     dimension_coverage = {
@@ -1632,8 +2113,8 @@ def build_atlas(
             "Field corrections can change adjudication and confidence, so component effects are not causally independent.",
             "Public labels may omit private difficulty, damage-profile, trap, and unrecoverable-field metadata.",
             "Exact confidence values and low-support or sensitive modal outputs are suppressed.",
-            "Trace dimensions remain blocked unless an exact-case current-source development capture is supplied.",
-            "Whole-run runtime cannot allocate loss by cost bucket without per-case timings.",
+            "Trace dimensions are authoritative only when exact output, source, input, layout, archive, runtime, and tool bindings all pass.",
+            "Summed per-case latency is not batch wall time; batch wall time is reported separately when the trace contract supplies it.",
             "The report contains aggregates only and must never be converted into runtime per-case rules.",
         ],
     }
@@ -1875,8 +2356,40 @@ def main() -> int:
     parser.add_argument(
         "--trace-dimensions",
         help=(
-            "versioned development-only JSON trace evidence with exact-case "
+            "external versioned truth-blind trace capture with exact-case "
             "allowlisted categories and per-case runtime"
+        ),
+    )
+    parser.add_argument(
+        "--frozen-baseline-manifest",
+        help=(
+            "authoritative mib-frozen-baseline/v1 manifest binding the "
+            "source revision and evaluator artifacts"
+        ),
+    )
+    parser.add_argument(
+        "--runtime-contract",
+        help=(
+            "actual runtime-contract JSON used to recompute input, layout, "
+            "and record-count authority"
+        ),
+    )
+    parser.add_argument(
+        "--dataset-archive",
+        help="actual immutable dataset archive used to recompute its SHA-256",
+    )
+    parser.add_argument(
+        "--baseline-predictions",
+        help=(
+            "actual frozen d6e236 prediction file used to verify "
+            "prediction-byte authority"
+        ),
+    )
+    parser.add_argument(
+        "--authority-manifest",
+        help=(
+            "canonical preregistered WO13 authority manifest; required for "
+            "current_source status"
         ),
     )
     args = parser.parse_args()
@@ -1887,6 +2400,27 @@ def main() -> int:
     case_scores_path = Path(args.case_scores)
     layout_path = Path(args.layout_manifest) if args.layout_manifest else None
     trace_path = Path(args.trace_dimensions) if args.trace_dimensions else None
+    frozen_baseline_path = (
+        Path(args.frozen_baseline_manifest)
+        if args.frozen_baseline_manifest
+        else None
+    )
+    runtime_contract_path = (
+        Path(args.runtime_contract) if args.runtime_contract else None
+    )
+    dataset_archive_path = (
+        Path(args.dataset_archive) if args.dataset_archive else None
+    )
+    baseline_predictions_path = (
+        Path(args.baseline_predictions)
+        if args.baseline_predictions
+        else None
+    )
+    authority_manifest_path = (
+        Path(args.authority_manifest)
+        if args.authority_manifest
+        else None
+    )
     atlas = build_atlas(
         truth_rows=_read_csv(truth_path),
         prediction_rows=_prediction_rows(submission_path),
@@ -1901,6 +2435,11 @@ def main() -> int:
         },
         layout_manifest_path=layout_path,
         trace_dimensions_path=trace_path,
+        frozen_baseline_manifest_path=frozen_baseline_path,
+        runtime_contract_path=runtime_contract_path,
+        dataset_archive_path=dataset_archive_path,
+        baseline_predictions_path=baseline_predictions_path,
+        authority_manifest_path=authority_manifest_path,
     )
     _write_json(Path(args.output_json), atlas)
     markdown_path = Path(args.output_markdown)

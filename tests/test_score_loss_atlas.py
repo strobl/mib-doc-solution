@@ -1,11 +1,18 @@
 import copy
+import hashlib
 import json
 import re
 import tempfile
 import unittest
+import zipfile
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts import evaluate
+from devtools.wo13_trace_capture import TraceCaptureError
+from devtools.wo13_trace_contract import canonical_json_bytes
 from scripts.score_loss_atlas import (
     AtlasInputError,
     FIELD_NAMES,
@@ -247,6 +254,304 @@ def write_dimension_evidence(directory, truth_rows, *, truth_hash, submission_ha
     }
     trace_path.write_text(json.dumps(trace_payload), encoding="utf-8")
     return layout_path, trace_path
+
+
+def write_current_source_dimension_evidence(
+    directory,
+    truth_rows,
+    *,
+    source_hashes,
+    source_revision="a" * 40,
+    input_tree_sha256="f" * 64,
+):
+    layout_path, _legacy_trace = write_dimension_evidence(
+        directory,
+        truth_rows,
+        truth_hash=source_hashes["truth"],
+        submission_hash=source_hashes["submission"],
+    )
+    layout_sha256 = hashlib.sha256(layout_path.read_bytes()).hexdigest()
+    rows = trace_rows_for(truth_rows)
+    runtime_path = Path(directory) / "runtime-contract.json"
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "mib-wo17-runtime-contract/v1",
+                "evaluation": {
+                    "input_tree_sha256": input_tree_sha256,
+                    "layout_manifest_sha256": layout_sha256,
+                    "expected_record_count": len(rows),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+    dataset_archive_path = Path(directory) / "dataset.zip"
+    with zipfile.ZipFile(
+        dataset_archive_path,
+        mode="w",
+        compression=zipfile.ZIP_STORED,
+    ) as archive:
+        for row in truth_rows:
+            archive.writestr(
+                f"{row['case_id']}.pdf",
+                f"%PDF-fixture-{row['case_id']}".encode("ascii"),
+            )
+    dataset_archive_sha256 = hashlib.sha256(
+        dataset_archive_path.read_bytes()
+    ).hexdigest()
+    authority_manifest_path = Path(directory) / "authority.json"
+    authority_manifest_path.write_text(
+        '{"fixture":"authority"}\n',
+        encoding="utf-8",
+    )
+    authority_manifest_sha256 = hashlib.sha256(
+        authority_manifest_path.read_bytes()
+    ).hexdigest()
+    baseline_predictions_path = Path(directory) / "baseline.jsonl"
+    baseline_predictions_path.write_bytes(b"synthetic baseline fixture\n")
+    trace_path = Path(directory) / "wo13-trace.json"
+    artifact_paths = {
+        "truth": "data/train_labels.csv",
+        "submission": "external/full1000_predictions.jsonl",
+        "evaluation": "external/full1000_evaluation.json",
+        "case_scores": "external/full1000_case_scores.jsonl",
+    }
+    frozen_path = Path(directory) / "frozen-baseline.json"
+    frozen_path.write_text(
+        json.dumps(
+            {
+                "schema": "mib-frozen-baseline/v1",
+                "metadata": {
+                    "baseline_commit_sha": source_revision,
+                    "count": len(rows),
+                },
+                "artifacts": [
+                    {
+                        "path": artifact_paths[name],
+                        "sha256": source_hashes[name],
+                        "size_bytes": 1,
+                    }
+                    for name in (
+                        "truth",
+                        "submission",
+                        "evaluation",
+                        "case_scores",
+                    )
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    frozen_sha256 = hashlib.sha256(frozen_path.read_bytes()).hexdigest()
+    trace_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "schema_version": "mib-wo13-truth-blind-trace/v1",
+                "capture_mode": "authoritative_production",
+                "source_revision_sha": source_revision,
+                "checkout_revision_sha": "2" * 40,
+                "capture_source_revision_sha": "2" * 40,
+                "input_tree_sha256": input_tree_sha256,
+                "processing_snapshot_input_tree_sha256": (
+                    input_tree_sha256
+                ),
+                "layout_manifest_sha256": layout_sha256,
+                "dataset_archive_sha256": dataset_archive_sha256,
+                "runtime_contract_sha256": runtime_sha256,
+                "frozen_baseline_manifest_sha256": frozen_sha256,
+                "baseline_predictions_sha256": source_hashes[
+                    "submission"
+                ],
+                "runtime_graph_sha256": "7" * 64,
+                "trace_tool_sha256": "8" * 64,
+                "container_graph_sha256": "9" * 64,
+                "source_snapshot_sha256": "0" * 64,
+                "authority_manifest_sha256": (
+                    authority_manifest_sha256
+                ),
+                "runtime_identity_sha256": "1" * 64,
+                "dependency_identity_sha256": "2" * 64,
+                "python_executable_sha256": "3" * 64,
+                "predictions_sha256": source_hashes["submission"],
+                "production_tree_verified": True,
+                "runtime_contract_verified": True,
+                "runtime_environment_verified": True,
+                "runtime_interface_verified": True,
+                "container_limits_verified": True,
+                "processing_snapshot_verified": True,
+                "stability_checks": {
+                    "input_tree_unchanged": True,
+                    "layout_manifest_unchanged": True,
+                    "dataset_archive_unchanged": True,
+                    "runtime_contract_unchanged": True,
+                    "frozen_baseline_manifest_unchanged": True,
+                    "baseline_predictions_unchanged": True,
+                    "runtime_graph_unchanged": True,
+                    "trace_tool_unchanged": True,
+                    "container_graph_unchanged": True,
+                    "source_snapshot_unchanged": True,
+                    "authority_manifest_unchanged": True,
+                    "runtime_identity_unchanged": True,
+                    "checkout_revision_unchanged": True,
+                    "capture_source_revision_unchanged": True,
+                    "production_tree_unchanged": True,
+                },
+                "case_count": len(rows),
+                "attempted": len(rows),
+                "answered": len(rows),
+                "omitted": 0,
+                "max_workers": 4,
+                "retry_missing_attempts": 1,
+                "retry_passes_used": 0,
+                "batch_wall_seconds": 23.5,
+                "rows": rows,
+            }
+        )
+    )
+    return (
+        layout_path,
+        trace_path,
+        frozen_path,
+        runtime_path,
+        dataset_archive_path,
+        baseline_predictions_path,
+        {
+            "source_revision_sha": source_revision,
+            "checkout_revision_sha": "2" * 40,
+            "input_tree_sha256": input_tree_sha256,
+            "layout_manifest_sha256": layout_sha256,
+            "dataset_archive_sha256": dataset_archive_sha256,
+            "runtime_contract_sha256": runtime_sha256,
+            "frozen_baseline_manifest_sha256": frozen_sha256,
+            "baseline_predictions_sha256": source_hashes["submission"],
+            "runtime_graph_sha256": "7" * 64,
+            "trace_tool_sha256": "8" * 64,
+            "container_graph_sha256": "9" * 64,
+            "source_snapshot_sha256": "0" * 64,
+            "authority_manifest_sha256": authority_manifest_sha256,
+            "runtime_identity_sha256": "1" * 64,
+            "dependency_identity_sha256": "2" * 64,
+            "python_executable_sha256": "3" * 64,
+            "case_count": len(rows),
+            "max_workers": 4,
+            "retry_missing_attempts": 1,
+            "authority_manifest_path": authority_manifest_path,
+            "approved_paths": {
+                "input_dir": Path(directory),
+                "layout_manifest": layout_path.resolve(),
+                "dataset_archive": dataset_archive_path.resolve(),
+                "runtime_contract": runtime_path.resolve(),
+                "frozen_baseline_manifest": frozen_path.resolve(),
+                "baseline_predictions": baseline_predictions_path.resolve(),
+            },
+        },
+    )
+
+
+def enter_current_source_authority_patches(stack, authority):
+    stack.enter_context(
+        patch(
+            "scripts.score_loss_atlas.load_capture_authority",
+            return_value=SimpleNamespace(
+                approved_paths=authority["approved_paths"],
+                expected_hashes={
+                    "input_tree_sha256": authority[
+                        "input_tree_sha256"
+                    ],
+                    "layout_manifest_sha256": authority[
+                        "layout_manifest_sha256"
+                    ],
+                    "dataset_archive_sha256": authority[
+                        "dataset_archive_sha256"
+                    ],
+                    "runtime_contract_sha256": authority[
+                        "runtime_contract_sha256"
+                    ],
+                    "frozen_baseline_manifest_sha256": authority[
+                        "frozen_baseline_manifest_sha256"
+                    ],
+                    "baseline_predictions_sha256": authority[
+                        "baseline_predictions_sha256"
+                    ],
+                    "runtime_graph_sha256": authority[
+                        "runtime_graph_sha256"
+                    ],
+                    "trace_tool_sha256": authority[
+                        "trace_tool_sha256"
+                    ],
+                    "container_graph_sha256": authority[
+                        "container_graph_sha256"
+                    ],
+                    "source_snapshot_sha256": authority[
+                        "source_snapshot_sha256"
+                    ],
+                },
+                runtime_identity={
+                    "runtime_identity_sha256": authority[
+                        "runtime_identity_sha256"
+                    ],
+                    "dependency_identity_sha256": authority[
+                        "dependency_identity_sha256"
+                    ],
+                    "python_executable_sha256": authority[
+                        "python_executable_sha256"
+                    ],
+                },
+                capture_source_revision_sha=authority[
+                    "checkout_revision_sha"
+                ],
+                manifest_sha256=authority[
+                    "authority_manifest_sha256"
+                ],
+                expected_record_count=authority["case_count"],
+                max_workers=authority["max_workers"],
+                retry_missing_attempts=authority[
+                    "retry_missing_attempts"
+                ],
+            ),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "scripts.score_loss_atlas.load_frozen_baseline_authority",
+            return_value={
+                "manifest_sha256": authority[
+                    "frozen_baseline_manifest_sha256"
+                ],
+                "predictions_sha256": authority[
+                    "baseline_predictions_sha256"
+                ],
+                "source_revision_sha": authority[
+                    "source_revision_sha"
+                ],
+                "expected_record_count": authority["case_count"],
+            },
+        )
+    )
+    stack.enter_context(
+        patch(
+            "scripts.score_loss_atlas._verify_layout_and_input",
+            return_value=authority["input_tree_sha256"],
+        )
+    )
+    stack.enter_context(
+        patch(
+            "scripts.score_loss_atlas."
+            "verify_dataset_archive_authority",
+            return_value={
+                "archive_sha256": authority[
+                    "dataset_archive_sha256"
+                ],
+                "input_tree_sha256": authority[
+                    "input_tree_sha256"
+                ],
+                "record_count": authority["case_count"],
+                "uncompressed_bytes": 1,
+            },
+        )
+    )
 
 
 class ScoreLossAtlasTests(unittest.TestCase):
@@ -733,6 +1038,211 @@ class ScoreLossAtlasTests(unittest.TestCase):
             {"page_template_family", *TRACE_DIMENSIONS, "runtime_cost"},
         )
 
+    def test_truth_blind_capture_becomes_current_only_with_complete_binding(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                layout_path,
+                trace_path,
+                frozen_path,
+                runtime_path,
+                dataset_archive_path,
+                baseline_predictions_path,
+                authority,
+            ) = write_current_source_dimension_evidence(
+                directory,
+                truth,
+                source_hashes=explicit_hashes,
+            )
+            with ExitStack() as stack:
+                enter_current_source_authority_patches(stack, authority)
+                atlas = build_atlas(
+                    truth_rows=truth,
+                    prediction_rows=predictions,
+                    evaluation=evaluation,
+                    case_scores=case_scores,
+                    source_sha256=explicit_hashes,
+                    layout_manifest_path=layout_path,
+                    trace_dimensions_path=trace_path,
+                    frozen_baseline_manifest_path=frozen_path,
+                    runtime_contract_path=runtime_path,
+                    dataset_archive_path=dataset_archive_path,
+                    baseline_predictions_path=baseline_predictions_path,
+                    authority_manifest_path=authority[
+                        "authority_manifest_path"
+                    ],
+                )
+
+        for dimension in (
+            "page_template_family",
+            *TRACE_DIMENSIONS,
+            "runtime_cost",
+        ):
+            self.assertEqual(
+                atlas["dimension_atlas"][dimension]["status"],
+                "current_source",
+            )
+        runtime = atlas["dimension_atlas"]["runtime_cost"]
+        self.assertEqual(runtime["batch_wall_seconds"], 23.5)
+        self.assertIn("sum_case_latency_seconds", runtime)
+        self.assertNotIn("total_runtime_seconds", runtime)
+        self.assertEqual(atlas["dimension_measurement_blockers"], [])
+        self.assertEqual(
+            set(atlas["dimension_source_sha256"]),
+            {
+                "frozen_baseline_manifest",
+                "layout_manifest",
+                "trace_dimensions",
+            },
+        )
+        aggregate_output = json.dumps(atlas, sort_keys=True) + render_markdown(
+            atlas
+        )
+        self.assertIsNone(re.search(r"\bMIB-[0-9]{6}\b", aggregate_output))
+        self.assertNotIn('"rows"', aggregate_output)
+
+    def test_injected_test_capture_never_becomes_current_source(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                layout_path,
+                trace_path,
+                frozen_path,
+                runtime_path,
+                dataset_archive_path,
+                baseline_predictions_path,
+                authority,
+            ) = write_current_source_dimension_evidence(
+                directory,
+                truth,
+                source_hashes=explicit_hashes,
+            )
+            payload = json.loads(trace_path.read_text(encoding="utf-8"))
+            payload["capture_mode"] = "test"
+            for key in (
+                "production_tree_verified",
+                "runtime_contract_verified",
+                "runtime_environment_verified",
+                "runtime_interface_verified",
+                "container_limits_verified",
+                "processing_snapshot_verified",
+            ):
+                payload[key] = False
+            payload["stability_checks"] = {
+                key: False for key in payload["stability_checks"]
+            }
+            trace_path.write_text(json.dumps(payload), encoding="utf-8")
+            with ExitStack() as stack:
+                enter_current_source_authority_patches(stack, authority)
+                atlas = build_atlas(
+                    truth_rows=truth,
+                    prediction_rows=predictions,
+                    evaluation=evaluation,
+                    case_scores=case_scores,
+                    source_sha256=explicit_hashes,
+                    layout_manifest_path=layout_path,
+                    trace_dimensions_path=trace_path,
+                    frozen_baseline_manifest_path=frozen_path,
+                    runtime_contract_path=runtime_path,
+                    dataset_archive_path=dataset_archive_path,
+                    baseline_predictions_path=baseline_predictions_path,
+                    authority_manifest_path=authority[
+                        "authority_manifest_path"
+                    ],
+                )
+        for dimension in (
+            "page_template_family",
+            *TRACE_DIMENSIONS,
+            "runtime_cost",
+        ):
+            self.assertEqual(
+                atlas["dimension_atlas"][dimension]["status"],
+                "auxiliary_historical",
+            )
+
+    def test_truth_blind_capture_fails_closed_on_source_or_input_mismatch(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                layout_path,
+                trace_path,
+                frozen_path,
+                runtime_path,
+                dataset_archive_path,
+                baseline_predictions_path,
+                authority,
+            ) = write_current_source_dimension_evidence(
+                directory,
+                truth,
+                source_hashes=explicit_hashes,
+            )
+            payload = json.loads(trace_path.read_text(encoding="utf-8"))
+            payload["source_revision_sha"] = "1" * 40
+            mutated_trace = Path(directory) / "bad-source-trace.json"
+            mutated_trace.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            with self.assertRaises(AtlasInputError):
+                build_atlas(
+                    truth_rows=truth,
+                    prediction_rows=predictions,
+                    evaluation=evaluation,
+                    case_scores=case_scores,
+                    source_sha256=explicit_hashes,
+                    layout_manifest_path=layout_path,
+                    trace_dimensions_path=mutated_trace,
+                    frozen_baseline_manifest_path=frozen_path,
+                    runtime_contract_path=runtime_path,
+                    dataset_archive_path=dataset_archive_path,
+                    baseline_predictions_path=baseline_predictions_path,
+                )
+
+            mismatched_authority = dict(authority)
+            mismatched_authority["input_tree_sha256"] = "0" * 64
+            with ExitStack() as stack:
+                enter_current_source_authority_patches(
+                    stack,
+                    mismatched_authority,
+                )
+                with self.assertRaises(AtlasInputError):
+                    build_atlas(
+                        truth_rows=truth,
+                        prediction_rows=predictions,
+                        evaluation=evaluation,
+                        case_scores=case_scores,
+                        source_sha256=explicit_hashes,
+                        layout_manifest_path=layout_path,
+                        trace_dimensions_path=trace_path,
+                        frozen_baseline_manifest_path=frozen_path,
+                        runtime_contract_path=runtime_path,
+                        dataset_archive_path=dataset_archive_path,
+                        baseline_predictions_path=(
+                            baseline_predictions_path
+                        ),
+                        authority_manifest_path=authority[
+                            "authority_manifest_path"
+                        ],
+                    )
+
     def test_low_support_trace_labels_and_case_ids_are_not_emitted(self):
         truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
         explicit_hashes = {
@@ -854,6 +1364,137 @@ class ScoreLossAtlasTests(unittest.TestCase):
                     case_scores=case_scores,
                     layout_manifest_path=layout_path,
                 )
+
+    def test_current_source_recomputes_and_rejects_engineered_layout_groups(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                layout_path,
+                trace_path,
+                frozen_path,
+                runtime_path,
+                dataset_archive_path,
+                baseline_predictions_path,
+                authority,
+            ) = write_current_source_dimension_evidence(
+                directory,
+                truth,
+                source_hashes=explicit_hashes,
+            )
+            payload = json.loads(layout_path.read_text(encoding="utf-8"))
+            for index, row in enumerate(payload["cases"]):
+                row["layout_group"] = (
+                    "page-count-99__ink-bucket-99"
+                    if index < 10
+                    else "page-count-98__ink-bucket-98"
+                )
+            layout_path.write_text(json.dumps(payload), encoding="utf-8")
+            engineered_hash = hashlib.sha256(
+                layout_path.read_bytes()
+            ).hexdigest()
+            authority["layout_manifest_sha256"] = engineered_hash
+            trace_payload = json.loads(
+                trace_path.read_text(encoding="utf-8")
+            )
+            trace_payload["layout_manifest_sha256"] = engineered_hash
+            trace_path.write_bytes(
+                canonical_json_bytes(trace_payload)
+            )
+            with ExitStack() as stack:
+                enter_current_source_authority_patches(stack, authority)
+                stack.enter_context(
+                    patch(
+                        "scripts.score_loss_atlas."
+                        "_verify_layout_and_input",
+                        side_effect=TraceCaptureError(
+                            "layout manifest does not match recomputed PDFs"
+                        ),
+                    )
+                )
+                with self.assertRaisesRegex(
+                    AtlasInputError,
+                    "recomputed PDFs",
+                ):
+                    build_atlas(
+                        truth_rows=truth,
+                        prediction_rows=predictions,
+                        evaluation=evaluation,
+                        case_scores=case_scores,
+                        source_sha256=explicit_hashes,
+                        layout_manifest_path=layout_path,
+                        trace_dimensions_path=trace_path,
+                        frozen_baseline_manifest_path=frozen_path,
+                        runtime_contract_path=runtime_path,
+                        dataset_archive_path=dataset_archive_path,
+                        baseline_predictions_path=(
+                            baseline_predictions_path
+                        ),
+                        authority_manifest_path=authority[
+                            "authority_manifest_path"
+                        ],
+                    )
+
+    def test_current_source_atlas_rejects_engineered_dataset_archive(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                layout_path,
+                trace_path,
+                frozen_path,
+                runtime_path,
+                dataset_archive_path,
+                baseline_predictions_path,
+                authority,
+            ) = write_current_source_dimension_evidence(
+                directory,
+                truth,
+                source_hashes=explicit_hashes,
+            )
+            with ExitStack() as stack:
+                enter_current_source_authority_patches(stack, authority)
+                stack.enter_context(
+                    patch(
+                        "scripts.score_loss_atlas."
+                        "verify_dataset_archive_authority",
+                        side_effect=TraceCaptureError(
+                            "dataset archive PDF tree differs from input authority"
+                        ),
+                    )
+                )
+                with self.assertRaisesRegex(
+                    AtlasInputError,
+                    "archive PDF tree differs",
+                ):
+                    build_atlas(
+                        truth_rows=truth,
+                        prediction_rows=predictions,
+                        evaluation=evaluation,
+                        case_scores=case_scores,
+                        source_sha256=explicit_hashes,
+                        layout_manifest_path=layout_path,
+                        trace_dimensions_path=trace_path,
+                        frozen_baseline_manifest_path=frozen_path,
+                        runtime_contract_path=runtime_path,
+                        dataset_archive_path=dataset_archive_path,
+                        baseline_predictions_path=(
+                            baseline_predictions_path
+                        ),
+                        authority_manifest_path=authority[
+                            "authority_manifest_path"
+                        ],
+                    )
 
     def test_every_expected_field_is_still_present(self):
         atlas = self.build()
