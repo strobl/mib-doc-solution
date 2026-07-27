@@ -33,6 +33,9 @@ from devtools.fusion_audit_run import (  # noqa: E402
     case_id_set_sha256,
     cohort_tree_sha256,
 )
+from devtools.grouped_fusion_evidence import (  # noqa: E402
+    verify_clean_candidate_checkout,
+)
 from devtools.policy_revalidation_audit_contract import (  # noqa: E402
     CONTRACT_AUDIT_COUNTS,
     COHORT_AUDIT_COUNTS,
@@ -258,10 +261,14 @@ def run_policy_revalidation_audit(
     processor_factory: Callable[[], Any] | None = None,
     contract_probe: Callable[[], Mapping[str, int]] | None = None,
     fixture_digest_provider: Callable[[], str] | None = None,
+    checkout_verifier: Callable[[Path, str], None] | None = None,
 ) -> dict[str, object]:
     """Run production and probes, returning a candidate-byte-bound audit."""
 
     source_digest = _validate_source_revision(source_revision)
+    (checkout_verifier or verify_clean_candidate_checkout)(
+        REPO_ROOT, source_digest
+    )
     if isinstance(repeat_index, bool) or repeat_index not in {1, 2}:
         raise PolicyRevalidationAuditRunError(
             "repeat_index must be 1 or 2"

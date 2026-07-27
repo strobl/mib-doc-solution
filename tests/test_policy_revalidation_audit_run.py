@@ -147,6 +147,7 @@ class PolicyRevalidationAuditRunTests(unittest.TestCase):
             "processor_factory": lambda: _Production(),
             "contract_probe": _contract_counts,
             "fixture_digest_provider": lambda: FIXTURE_SHA,
+            "checkout_verifier": lambda _root, _revision: None,
         }
         values.update(overrides)
         return run_policy_revalidation_audit(**values)  # type: ignore[arg-type]
@@ -263,6 +264,24 @@ class PolicyRevalidationAuditRunTests(unittest.TestCase):
                 )
             )
 
+    def test_audit_requires_a_clean_checkout_at_the_declared_revision(self):
+        calls: list[tuple[Path, str]] = []
+
+        def verifier(root: Path, revision: str) -> None:
+            calls.append((root, revision))
+
+        self._run(checkout_verifier=verifier)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], SOURCE_SHA)
+
+        def reject(_root: Path, _revision: str) -> None:
+            raise PolicyRevalidationAuditRunError("dirty checkout")
+
+        with self.assertRaisesRegex(
+            PolicyRevalidationAuditRunError, "dirty checkout"
+        ):
+            self._run(checkout_verifier=reject)
+
     def test_incomplete_contract_probe_or_bad_fixture_digest_fails_closed(self):
         incomplete = _contract_counts()
         del incomplete["signed_late_authority_recovery_count"]
@@ -293,6 +312,11 @@ class PolicyRevalidationAuditRunTests(unittest.TestCase):
                 "devtools.policy_revalidation_audit_run."
                 "contract_fixture_sha256",
                 lambda: FIXTURE_SHA,
+            ),
+            patch(
+                "devtools.policy_revalidation_audit_run."
+                "verify_clean_candidate_checkout",
+                lambda _root, _revision: None,
             ),
         ):
             exit_code = main(
