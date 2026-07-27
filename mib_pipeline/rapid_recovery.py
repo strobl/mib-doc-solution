@@ -286,6 +286,18 @@ class RapidOutputRecoveryProcessor:
             self._local.rapid_extractor = extractor
         return extractor
 
+    def _fusion_enabled(self) -> bool:
+        """Return whether the resolver owns coherent candidate fusion.
+
+        Older/custom resolvers predate the explicit mode flag, so a missing
+        attribute selects the isolated legacy resolver/output-repair branch.
+        The frozen full pre-WO16 control is evaluated from its own revision;
+        this compatibility branch is not a claim that the current end-to-end
+        pipeline is identical to that historical revision.
+        """
+
+        return bool(getattr(self._resolver, "fusion_enabled", False))
+
     @staticmethod
     def _unknown_output_fields(resolved: ResolvedCase) -> frozenset[str]:
         return frozenset(
@@ -715,6 +727,7 @@ class RapidOutputRecoveryProcessor:
         primary_resolved: ResolvedCase,
         recovered_audits: dict[str, RecoveryFieldAudit] | None = None,
         linked_recovery_scope: str | None = None,
+        final_fusion_audit_counts: Mapping[str, int] | None = None,
     ) -> VisibleRecoveryResult:
         """Pair the row with a complete immutable field-state audit overlay."""
 
@@ -740,6 +753,11 @@ class RapidOutputRecoveryProcessor:
             audit=RecoveryAuditOverlay.from_fields(
                 case_id=row.case_id,
                 fields=audits,
+            ),
+            fusion_audit_counts=(
+                primary_resolved.fusion_audit_counts
+                if final_fusion_audit_counts is None
+                else final_fusion_audit_counts
             ),
         )
 
@@ -1652,6 +1670,266 @@ class RapidOutputRecoveryProcessor:
             ),
         )
 
+    @classmethod
+    def _fused_recovery_audit(
+        cls,
+        *,
+        field_name: str,
+        rendered: RenderedCase,
+        primary_row: PredictionRow,
+        fused_row: PredictionRow,
+        primary_resolved: ResolvedCase,
+        fused_resolved: ResolvedCase,
+    ) -> RecoveryFieldAudit | None:
+        """Audit one fused visible change against its physical observation."""
+
+        fused_field = fused_resolved.fields.get(field_name)
+        if (
+            fused_field is None
+            or fused_field.state is not FieldState.RESOLVED
+            or fused_field.value is None
+            or fused_field.winning_evidence is None
+            or getattr(fused_row, field_name) != fused_field.value
+        ):
+            return None
+        candidate = fused_field.winning_evidence
+        if candidate.case_id_hint != rendered.case_id:
+            return None
+
+        observed_scopes = observed_applicant_scopes(candidate)
+        linked_scope = fused_resolved.active_applicant
+        if observed_scopes:
+            if linked_scope is None or any(
+                cls._scope_key(scope) != cls._scope_key(linked_scope)
+                for scope in observed_scopes
+            ):
+                return None
+            expected_scope = linked_scope
+        else:
+            expected_scope = None
+
+        route_ids = tuple(
+            sorted(
+                {
+                    provenance.route_id
+                    for provenance in candidate.ocr_provenance
+                    if (
+                        provenance.view_box == candidate.box
+                        or provenance.observation.box == candidate.box
+                    )
+                }
+            )
+        )
+        if not route_ids:
+            return None
+        recovery_source = (
+            RAPID_RECOVERY_ROUTE_ID
+            if RAPID_RECOVERY_ROUTE_ID in route_ids
+            else route_ids[0]
+        )
+        audit_builder = (
+            recovered_field_audit
+            if cls._audit_primary_field(primary_resolved, field_name).state
+            is FieldState.UNKNOWN
+            else visible_repair_field_audit
+        )
+        audit, _validation = audit_builder(
+            primary=cls._audit_primary_field(primary_resolved, field_name),
+            serialization_before=getattr(primary_row, field_name),
+            serialization_after=getattr(fused_row, field_name),
+            candidate=candidate,
+            recovery_source=recovery_source,
+            linked_recovery_scope=linked_scope,
+            validation_policy=CandidateValidationPolicy(
+                expected_field_name=field_name,
+                expected_source_sha256=rendered.source_sha256,
+                expected_page_index=candidate.page_index,
+                expected_applicant_scope=expected_scope,
+                minimum_confidence=0.0,
+            ),
+        )
+        return audit
+
+    @staticmethod
+    def _fusion_rapid_candidates(
+        candidates: Iterable[CandidateEvidence],
+        *,
+        recover_risk: bool,
+    ) -> tuple[CandidateEvidence, ...]:
+        """Keep Rapid evidence inside the audited output-field boundary.
+
+        A Rapid decision or policy-only marker could otherwise influence the
+        adjudicator without a corresponding field in ``RecoveryAuditOverlay``.
+        Those candidates therefore remain diagnostic-only in fusion mode.
+        """
+
+        allowed_fields = set(RAPID_OUTPUT_FIELDS)
+        if recover_risk:
+            allowed_fields.add(RAPID_RISK_FIELD)
+        return tuple(
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, CandidateEvidence)
+            and candidate.field_name in allowed_fields
+        )
+
+    @staticmethod
+    def _fused_field_changed(
+        primary_field: ResolvedField | None,
+        fused_field: ResolvedField | None,
+    ) -> bool:
+        """Return whether fusion changed evidence that policy can consume."""
+
+        if primary_field is None or fused_field is None:
+            return primary_field is not fused_field
+        return (
+            primary_field.state is not fused_field.state
+            or primary_field.value != fused_field.value
+            or primary_field.winning_evidence
+            != fused_field.winning_evidence
+        )
+
+    def _recover_with_fusion(
+        self,
+        *,
+        rendered: RenderedCase,
+        primary_candidates: tuple[CandidateEvidence, ...],
+        primary_resolved: ResolvedCase,
+        primary_outcome: AdjudicationOutcome,
+        unknown_fields: frozenset[str],
+        recover_risk: bool,
+    ) -> VisibleRecoveryResult:
+        """Link and resolve primary plus Rapid evidence as one coherent case."""
+
+        primary_row = primary_outcome.row
+        if not unknown_fields and not recover_risk:
+            final_row = self._apply_review_approval_heads(
+                final_row=primary_row,
+                source_sha256=rendered.source_sha256,
+                primary_candidates=primary_candidates,
+                primary_outcome=primary_outcome,
+                primary_resolved=primary_resolved,
+            )
+            return self._visible_recovery_result(
+                row=final_row,
+                primary_resolved=primary_resolved,
+                linked_recovery_scope=primary_resolved.active_applicant,
+            )
+
+        try:
+            rapid_candidates = self._fusion_rapid_candidates(
+                self._rapid_extractor().extract(rendered),
+                recover_risk=recover_risk,
+            )
+            fused_linked = self._linker.link(
+                rendered.case_id,
+                (*primary_candidates, *rapid_candidates),
+            )
+            fused_resolved = self._resolver.resolve(fused_linked)
+            fused_outcome = self._adjudicator.adjudicate_case(fused_resolved)
+            fused_row = fused_outcome.row
+
+            recovered_audits: dict[str, RecoveryFieldAudit] = {}
+            for field_name in _COMPLETE_REVIEW_OUTPUT_FIELDS:
+                evidence_changed = self._fused_field_changed(
+                    primary_resolved.fields.get(field_name),
+                    fused_resolved.fields.get(field_name),
+                )
+                serialization_changed = getattr(
+                    fused_row,
+                    field_name,
+                ) != getattr(primary_row, field_name)
+                if not evidence_changed and not serialization_changed:
+                    continue
+                if not evidence_changed:
+                    raise ValueError(
+                        "fused serialization changed without visible "
+                        f"evidence: {field_name}"
+                    )
+                audit = self._fused_recovery_audit(
+                    field_name=field_name,
+                    rendered=rendered,
+                    primary_row=primary_row,
+                    fused_row=fused_row,
+                    primary_resolved=primary_resolved,
+                    fused_resolved=fused_resolved,
+                )
+                if audit is None:
+                    # A field-level change without a complete exact-source,
+                    # exact-applicant physical observation is not recoverable.
+                    raise ValueError(
+                        f"unauditable fused recovery: {field_name}"
+                    )
+                recovered_audits[field_name] = audit
+
+            # Policy-only facts and authoritative decisions have no slot in
+            # the recovery audit.  They must therefore remain exactly primary
+            # in WO16; a later policy work order may add a dedicated contract.
+            output_fields = set(_COMPLETE_REVIEW_OUTPUT_FIELDS)
+            for field_name in set(primary_resolved.fields) | set(
+                fused_resolved.fields
+            ):
+                if field_name in output_fields or field_name == "case_id":
+                    continue
+                if self._fused_field_changed(
+                    primary_resolved.fields.get(field_name),
+                    fused_resolved.fields.get(field_name),
+                ):
+                    raise ValueError(
+                        f"unaudited fused policy change: {field_name}"
+                    )
+
+            if (
+                fused_resolved.case_id != primary_resolved.case_id
+                or fused_resolved.rescinded_decision
+                != primary_resolved.rescinded_decision
+            ):
+                raise ValueError("fusion changed unaudited case policy state")
+            linkage_changed = (
+                fused_resolved.active_applicant
+                != primary_resolved.active_applicant
+                or fused_resolved.unresolved_linkage
+                != primary_resolved.unresolved_linkage
+                or fused_resolved.unresolved_reasons
+                != primary_resolved.unresolved_reasons
+            )
+            if linkage_changed and "applicant_name" not in recovered_audits:
+                raise ValueError("fusion changed unaudited applicant linkage")
+            if (
+                fused_outcome.trace != primary_outcome.trace
+                or fused_row.adjudication != primary_row.adjudication
+                or fused_row.confidence != primary_row.confidence
+            ) and not recovered_audits:
+                raise ValueError(
+                    "fusion changed policy without an audited visible field"
+                )
+
+            return self._visible_recovery_result(
+                row=fused_row,
+                primary_resolved=primary_resolved,
+                recovered_audits=recovered_audits,
+                linked_recovery_scope=fused_resolved.active_applicant,
+                final_fusion_audit_counts=(
+                    fused_resolved.fusion_audit_counts
+                ),
+            )
+        except Exception:
+            # Fusion and RapidOCR are optional recovery.  A malformed,
+            # ambiguous, or unauditable fused result cannot replace the
+            # coherent primary adjudication.
+            final_row = self._apply_review_approval_heads(
+                final_row=primary_row,
+                source_sha256=rendered.source_sha256,
+                primary_candidates=primary_candidates,
+                primary_outcome=primary_outcome,
+                primary_resolved=primary_resolved,
+            )
+            return self._visible_recovery_result(
+                row=final_row,
+                primary_resolved=primary_resolved,
+                linked_recovery_scope=primary_resolved.active_applicant,
+            )
+
     def process_case_with_audit(self, pdf_path: Path) -> VisibleRecoveryResult:
         """Process one case and retain explicit evidence/default distinctions."""
 
@@ -1660,6 +1938,19 @@ class RapidOutputRecoveryProcessor:
         primary_linked = self._linker.link(rendered.case_id, primary_candidates)
         primary_resolved = self._resolver.resolve(primary_linked)
         primary_outcome = self._adjudicator.adjudicate_case(primary_resolved)
+
+        if self._fusion_enabled():
+            return self._recover_with_fusion(
+                rendered=rendered,
+                primary_candidates=primary_candidates,
+                primary_resolved=primary_resolved,
+                primary_outcome=primary_outcome,
+                unknown_fields=self._unknown_output_fields(primary_resolved),
+                recover_risk=self._recover_non_none_risk(
+                    primary_resolved,
+                    self._unknown_output_fields(primary_resolved),
+                ),
+            )
 
         base_primary_row = primary_outcome.row
         primary_row, repaired_applicant = self._repair_biometric_applicant(
@@ -1771,4 +2062,10 @@ class RapidOutputRecoveryProcessor:
     def process_case(self, pdf_path: Path) -> PredictionRow:
         """Return the schema row while keeping the audit API opt-in."""
 
-        return self.process_case_with_audit(pdf_path).row
+        result = self.process_case_with_audit(pdf_path)
+        observer = getattr(self, "_fusion_audit_observer", None)
+        if observer is not None:
+            if not callable(observer):
+                raise TypeError("fusion audit observer must be callable")
+            observer(result.fusion_audit_counts)
+        return result.row

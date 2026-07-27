@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import difflib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Iterable, Mapping
 
 from .extraction import CandidateEvidence, EvidenceType
+from .fusion import (
+    EvidenceFuser,
+    FusionTrace,
+    candidate_has_complete_provenance,
+    candidates_share_physical_observation,
+)
 from .models import CASE_ID_PATTERN, FIELD_NAMES
 
 
@@ -26,24 +33,6 @@ POLICY_ONLY_FIELDS = (
     "page_type_present_sponsor_attestation",
 )
 
-# These values describe the case packet rather than establishing identity.
-# In a visibly multi-applicant packet, a mildly different OCR name can scope a
-# lower-precedence page away even though that page contains the *only* visible
-# value for one of these fields.  Such a value is safe to retain only when the
-# whole expected-case evidence set agrees on it.  Identity, risk, decisions,
-# and policy-only facts deliberately remain subject to ordinary applicant
-# scoping because a wrong association would change the safety outcome.
-UNIQUE_CASE_FIELD_FALLBACKS = frozenset(
-    {
-        "species_code",
-        "home_world",
-        "visa_class",
-        "sponsor_id",
-        "arrival_date",
-        "declared_purpose",
-        "fee_status",
-    }
-)
 RESOLVABLE_FIELDS = (
     tuple(field for field in FIELD_NAMES if field != "confidence")
     + POLICY_ONLY_FIELDS
@@ -63,6 +52,8 @@ class LinkedCase:
     evidence: tuple[CandidateEvidence, ...]
     unresolved: bool
     unresolved_reasons: tuple[str, ...] = ()
+    active_applicant_aliases: tuple[str, ...] = ()
+    cross_applicant_candidates_excluded: int = 0
 
 
 @dataclass(frozen=True)
@@ -73,6 +64,7 @@ class ResolvedField:
     winning_evidence: CandidateEvidence | None
     considered: tuple[CandidateEvidence, ...]
     reason: str
+    fusion_trace: FusionTrace | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +75,9 @@ class ResolvedCase:
     unresolved_linkage: bool
     unresolved_reasons: tuple[str, ...]
     rescinded_decision: bool = False
+    fusion_audit_counts: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     def value(self, field_name: str) -> str | None:
         field = self.fields[field_name]
@@ -126,6 +121,7 @@ class EvidencePrecedenceHierarchy:
 class CaseLinker:
     """Scope evidence to the case filename and its reliably-linked applicant."""
 
+    _NAME_CLUSTER_SIMILARITY = 0.80
     _SPONSOR_CORROBORATION_SIMILARITY = 0.65
     _SPONSOR_MINIMUM_CONFIDENCE = 0.90
     _SUPPORT_MINIMUM_CONFIDENCE = 0.75
@@ -133,41 +129,193 @@ class CaseLinker:
     _CONFLICTING_NAME_SIMILARITY = 0.90
 
     @staticmethod
-    def _unique_case_field_evidence(
-        candidates: Iterable[CandidateEvidence],
-    ) -> set[int]:
-        """Return identities of unambiguous case-level structured evidence.
-
-        This is intentionally an inclusion fallback, not a precedence rule:
-        the resolver still applies the published evidence hierarchy after the
-        candidates are retained.  Any visible disagreement, supersession, or
-        strike keeps the field fully applicant-scoped.
-        """
-
-        candidates = tuple(candidates)
-        retained: set[int] = set()
-        for field_name in UNIQUE_CASE_FIELD_FALLBACKS:
-            eligible = tuple(
-                candidate
-                for candidate in candidates
-                if candidate.field_name == field_name
-                and candidate.legible
-                and candidate.value is not None
-                and not candidate.superseded
-                and "strikethrough" not in candidate.visual_cues
-                and "sample_denial_watermark" not in candidate.visual_cues
+    def _is_clean_visible_candidate(candidate: CandidateEvidence) -> bool:
+        cues = {
+            re.sub(r"[\s-]+", "_", cue.strip().casefold())
+            for cue in candidate.visual_cues
+        }
+        return (
+            candidate.source == "visible_ocr"
+            and candidate.evidence_type is not EvidenceType.TEXT_LAYER
+            and candidate.legible
+            and candidate.value is not None
+            and not candidate.superseded
+            and not cues.intersection(
+                {
+                    "crossed_out",
+                    "strike",
+                    "strikethrough",
+                    "struck",
+                    "struck_out",
+                    "struck_through",
+                }
             )
-            if len({candidate.value for candidate in eligible}) == 1:
-                retained.update(id(candidate) for candidate in eligible)
-        return retained
+            and not any("watermark" in cue for cue in cues)
+        )
 
     @staticmethod
-    def _name_similarity(left: str, right: str) -> float:
-        left_key = re.sub(r"[^a-z0-9]+", "", left.casefold())
-        right_key = re.sub(r"[^a-z0-9]+", "", right.casefold())
+    def _normalized_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    @classmethod
+    def _name_similarity(cls, left: str, right: str) -> float:
+        left_key = cls._normalized_name(left)
+        right_key = cls._normalized_name(right)
         if not left_key or not right_key:
             return 0.0
         return difflib.SequenceMatcher(None, left_key, right_key).ratio()
+
+    @classmethod
+    def _candidate_sort_key(
+        cls,
+        candidate: CandidateEvidence,
+    ) -> tuple[object, ...]:
+        """Provide a content-only tie-break independent of extraction order."""
+
+        return (
+            cls._normalized_name(candidate.value or ""),
+            candidate.value or "",
+            EvidencePrecedenceHierarchy.rank(candidate.evidence_type),
+            candidate.evidence_type.value,
+            candidate.page_index,
+            candidate.box.left,
+            candidate.box.bottom,
+            candidate.box.right,
+            candidate.box.top,
+            -candidate.ocr_confidence,
+            candidate.case_id_hint or "",
+            candidate.applicant_hint or "",
+            candidate.source,
+            candidate.visual_cues,
+            tuple(item.fingerprint for item in candidate.ocr_provenance),
+        )
+
+    @classmethod
+    def _cluster_sort_key(
+        cls,
+        cluster: Iterable[CandidateEvidence],
+    ) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            cls._candidate_sort_key(candidate)
+            for candidate in sorted(cluster, key=cls._candidate_sort_key)
+        )
+
+    @classmethod
+    def _independent_observation_groups(
+        cls,
+        candidates: Iterable[CandidateEvidence],
+    ) -> tuple[tuple[CandidateEvidence, ...], ...]:
+        """Collapse correlated OCR routes before measuring identity support."""
+
+        ordered = tuple(sorted(candidates, key=cls._candidate_sort_key))
+        groups = [(candidate,) for candidate in ordered]
+        while True:
+            mergeable: list[
+                tuple[
+                    tuple[tuple[object, ...], ...],
+                    int,
+                    int,
+                ]
+            ] = []
+            for left_index, left in enumerate(groups):
+                for right_index in range(left_index + 1, len(groups)):
+                    right = groups[right_index]
+                    if all(
+                        candidates_share_physical_observation(
+                            left_candidate,
+                            right_candidate,
+                        )
+                        for left_candidate in left
+                        for right_candidate in right
+                    ):
+                        mergeable.append(
+                            (
+                                cls._cluster_sort_key((*left, *right)),
+                                left_index,
+                                right_index,
+                            )
+                        )
+            if not mergeable:
+                break
+            _, left_index, right_index = min(mergeable)
+            groups[left_index] = tuple(
+                sorted(
+                    (*groups[left_index], *groups[right_index]),
+                    key=cls._candidate_sort_key,
+                )
+            )
+            del groups[right_index]
+            groups.sort(key=cls._cluster_sort_key)
+        return tuple(groups)
+
+    @classmethod
+    def _cluster_applicants(
+        cls,
+        applicant_evidence: Iterable[CandidateEvidence],
+    ) -> list[list[CandidateEvidence]]:
+        """Build deterministic complete-link name clusters.
+
+        Every two names in one cluster must independently meet the similarity
+        threshold.  This prevents a fuzzy A~B~C chain from merging A and C
+        when those endpoints are not compatible.  At each agglomerative step,
+        the strongest complete-link pair wins with a content-only tie-break,
+        so input order cannot change the partition.
+        """
+
+        clusters = [
+            [candidate]
+            for candidate in sorted(
+                applicant_evidence,
+                key=cls._candidate_sort_key,
+            )
+        ]
+        while True:
+            eligible_pairs: list[
+                tuple[
+                    float,
+                    tuple[tuple[object, ...], ...],
+                    int,
+                    int,
+                ]
+            ] = []
+            for left_index, left in enumerate(clusters):
+                for right_index in range(left_index + 1, len(clusters)):
+                    right = clusters[right_index]
+                    complete_link_similarity = min(
+                        cls._name_similarity(
+                            left_candidate.value or "",
+                            right_candidate.value or "",
+                        )
+                        for left_candidate in left
+                        for right_candidate in right
+                    )
+                    if (
+                        complete_link_similarity
+                        < cls._NAME_CLUSTER_SIMILARITY
+                    ):
+                        continue
+                    merged_key = cls._cluster_sort_key((*left, *right))
+                    eligible_pairs.append(
+                        (
+                            complete_link_similarity,
+                            merged_key,
+                            left_index,
+                            right_index,
+                        )
+                    )
+            if not eligible_pairs:
+                break
+            _, _, left_index, right_index = min(
+                eligible_pairs,
+                key=lambda pair: (-pair[0], pair[1]),
+            )
+            clusters[left_index] = sorted(
+                (*clusters[left_index], *clusters[right_index]),
+                key=cls._candidate_sort_key,
+            )
+            del clusters[right_index]
+            clusters.sort(key=cls._cluster_sort_key)
+        return clusters
 
     @classmethod
     def _corroborated_sponsor_applicant(
@@ -189,6 +337,7 @@ class CaseLinker:
             candidate
             for candidate in applicant_evidence
             if candidate.evidence_type is EvidenceType.SPONSOR_ATTESTATION
+            and cls._is_clean_visible_candidate(candidate)
             and "structured_sponsor_narrative" in candidate.visual_cues
             and candidate.value is not None
             and candidate.ocr_confidence >= cls._SPONSOR_MINIMUM_CONFIDENCE
@@ -204,10 +353,18 @@ class CaseLinker:
             for candidate in applicant_evidence
             if candidate.evidence_type
             in {EvidenceType.BIOMETRIC_SLIP, EvidenceType.REGISTRY_EXTRACT}
+            and cls._is_clean_visible_candidate(candidate)
             and candidate.value is not None
             and candidate.ocr_confidence >= cls._SUPPORT_MINIMUM_CONFIDENCE
             and cls._name_similarity(sponsor_value, candidate.value)
             >= cls._SPONSOR_CORROBORATION_SIMILARITY
+            and not any(
+                candidates_share_physical_observation(
+                    candidate,
+                    sponsor,
+                )
+                for sponsor in structured_sponsors
+            )
         )
         if not supporting:
             return None
@@ -215,6 +372,7 @@ class CaseLinker:
             candidate
             for candidate in applicant_evidence
             if candidate.evidence_type is EvidenceType.INTAKE_FORM
+            and cls._is_clean_visible_candidate(candidate)
             and candidate.value is not None
             and cls._name_similarity(sponsor_value, candidate.value)
             < cls._CONFLICTING_NAME_SIMILARITY
@@ -239,11 +397,7 @@ class CaseLinker:
             candidate
             for candidate in evidence
             if candidate.field_name == field_name
-            and candidate.legible
-            and candidate.value is not None
-            and not candidate.superseded
-            and "strikethrough" not in candidate.visual_cues
-            and "sample_denial_watermark" not in candidate.visual_cues
+            and CaseLinker._is_clean_visible_candidate(candidate)
         )
 
     @staticmethod
@@ -310,16 +464,15 @@ class CaseLinker:
         qualifying = [
             candidates
             for candidates in by_value.values()
-            if len(candidates) >= 2
+            if len(
+                CaseLinker._independent_observation_groups(candidates)
+            )
+            >= 2
             and len({candidate.page_index for candidate in candidates}) >= 2
             and len({candidate.evidence_type for candidate in candidates}) >= 2
             and all(
                 candidate.case_id_hint == case_id
-                and candidate.legible
-                and candidate.value is not None
-                and not candidate.superseded
-                and "strikethrough" not in candidate.visual_cues
-                and "sample_denial_watermark" not in candidate.visual_cues
+                and CaseLinker._is_clean_visible_candidate(candidate)
                 for candidate in candidates
             )
         ]
@@ -344,14 +497,15 @@ class CaseLinker:
             candidate.value
             for candidate in candidates
             if candidate.field_name == "case_id"
-            and candidate.legible
-            and candidate.value is not None
+            and self._is_clean_visible_candidate(candidate)
             and CASE_ID_PATTERN.fullmatch(candidate.value)
         }
         reasons: list[str] = []
+        conflicting_visible_case_ids: set[str] = set()
         if expected is not None:
             case_id = expected
-            if visible_case_ids and expected not in visible_case_ids:
+            conflicting_visible_case_ids = visible_case_ids - {expected}
+            if conflicting_visible_case_ids:
                 reasons.append("visible case_id conflicts with source filename")
         elif len(visible_case_ids) == 1:
             case_id = next(iter(visible_case_ids))
@@ -359,55 +513,60 @@ class CaseLinker:
             case_id = ""
             reasons.append("active case_id cannot be determined")
 
-        case_scoped = tuple(
-            candidate
-            for candidate in candidates
-            if not candidate.case_id_hint
-            or not case_id
-            or candidate.case_id_hint == case_id
-        )
+        if case_id and conflicting_visible_case_ids:
+            # The filename keeps the active case association, but an unhinted
+            # fact could belong to either visibly-present case.  Retain only
+            # diagnostic case identities and facts explicitly anchored to the
+            # expected case.
+            case_scoped = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.field_name == "case_id"
+                or candidate.case_id_hint == case_id
+            )
+        elif case_id:
+            case_scoped = tuple(
+                candidate
+                for candidate in candidates
+                if not candidate.case_id_hint
+                or candidate.case_id_hint == case_id
+            )
+        else:
+            case_scoped = tuple(
+                candidate
+                for candidate in candidates
+                if candidate.field_name in {"case_id", "applicant_name"}
+                or not candidate.case_id_hint
+            )
         applicant_evidence = tuple(
             candidate
             for candidate in case_scoped
             if candidate.field_name == "applicant_name"
-            and candidate.legible
-            and candidate.value
-            and not candidate.superseded
-            and "strikethrough" not in candidate.visual_cues
+            and self._is_clean_visible_candidate(candidate)
         )
-        clusters: list[list[CandidateEvidence]] = []
-        for candidate in applicant_evidence:
-            matching_cluster = next(
-                (
-                    cluster
-                    for cluster in clusters
-                    if any(
-                        self._name_similarity(candidate.value or "", item.value or "")
-                        >= 0.80
-                        for item in cluster
-                    )
-                ),
-                None,
-            )
-            if matching_cluster is None:
-                clusters.append([candidate])
-            else:
-                matching_cluster.append(candidate)
+        clusters = self._cluster_applicants(applicant_evidence)
 
         def cluster_strength(cluster: list[CandidateEvidence]) -> tuple[int, int, int, float]:
-            ranks = [
-                EvidencePrecedenceHierarchy.rank(candidate.evidence_type)
-                for candidate in cluster
-            ]
-            best_rank = min(ranks)
+            independent = self._independent_observation_groups(cluster)
+            group_ranks = tuple(
+                min(
+                    EvidencePrecedenceHierarchy.rank(
+                        candidate.evidence_type
+                    )
+                    for candidate in group
+                )
+                for group in independent
+            )
+            best_rank = min(group_ranks)
             return (
                 -best_rank,
-                ranks.count(best_rank),
-                len(cluster),
+                group_ranks.count(best_rank),
+                len(independent),
                 max(candidate.ocr_confidence for candidate in cluster),
             )
 
-        ranked_clusters = sorted(clusters, key=cluster_strength, reverse=True)
+        ranked_clusters = sorted(clusters, key=self._cluster_sort_key)
+        ranked_clusters.sort(key=cluster_strength, reverse=True)
         active_aliases: set[str] = set()
         corroborated_sponsor = self._corroborated_sponsor_applicant(
             applicant_evidence
@@ -424,11 +583,14 @@ class CaseLinker:
                 active_applicant = None
                 reasons.append("multiple applicants cannot be reliably separated")
             else:
-                representative = max(
+                representative = min(
                     winning_cluster,
                     key=lambda candidate: (
-                        candidate.ocr_confidence,
-                        -EvidencePrecedenceHierarchy.rank(candidate.evidence_type),
+                        EvidencePrecedenceHierarchy.rank(
+                            candidate.evidence_type
+                        ),
+                        -candidate.ocr_confidence,
+                        self._candidate_sort_key(candidate),
                     ),
                 )
                 active_applicant = representative.value
@@ -452,8 +614,7 @@ class CaseLinker:
                 if candidate.field_name == "applicant_name"
                 and candidate.value in selected_aliases
                 and "correction" in candidate.visual_cues
-                and candidate.legible
-                and not candidate.superseded
+                and self._is_clean_visible_candidate(candidate)
             }
             corrected_page_aliases = {
                 (candidate.page_index, candidate.value)
@@ -467,19 +628,13 @@ class CaseLinker:
                     or "strikethrough" in candidate.visual_cues
                 )
             }
-            if selected_applicant is None and len(clusters) > 1:
+            if selected_applicant is None:
                 return tuple(
                     candidate
                     for candidate in case_scoped
                     if candidate.field_name in {"case_id", "applicant_name"}
+                    or not candidate.applicant_hint
                 )
-            unique_case_evidence = (
-                self._unique_case_field_evidence(case_scoped)
-                if selected_applicant is not None
-                and len(clusters) > 1
-                and not reasons
-                else set()
-            )
             return tuple(
                 candidate
                 for candidate in case_scoped
@@ -488,7 +643,6 @@ class CaseLinker:
                 or candidate.applicant_hint in selected_aliases
                 or (candidate.page_index, candidate.applicant_hint)
                 in corrected_page_aliases
-                or id(candidate) in unique_case_evidence
             )
 
         applicant_scoped = scope_evidence(active_applicant, active_aliases)
@@ -526,12 +680,46 @@ class CaseLinker:
                     active_aliases = alternative_aliases
                     applicant_scoped = alternative_scoped
 
+        # A struck same-page spelling that is visibly replaced by the selected
+        # applicant remains a local alias for the already-scoped fields on that
+        # page.  The linker has excluded that spelling everywhere else, so
+        # forwarding it cannot reopen foreign-applicant evidence.
+        if active_applicant is not None:
+            selected_correction_pages = {
+                candidate.page_index
+                for candidate in applicant_scoped
+                if candidate.field_name == "applicant_name"
+                and candidate.value in active_aliases
+                and "correction" in candidate.visual_cues
+                and self._is_clean_visible_candidate(candidate)
+            }
+            active_aliases.update(
+                candidate.value
+                for candidate in applicant_scoped
+                if candidate.field_name == "applicant_name"
+                and candidate.page_index in selected_correction_pages
+                and candidate.value
+                and (
+                    candidate.superseded
+                    or "strikethrough" in candidate.visual_cues
+                )
+            )
+
         return LinkedCase(
             case_id=case_id,
             active_applicant=active_applicant,
             evidence=applicant_scoped,
             unresolved=bool(reasons),
             unresolved_reasons=tuple(reasons),
+            active_applicant_aliases=tuple(
+                sorted(
+                    active_aliases,
+                    key=lambda value: (self._normalized_name(value), value),
+                )
+            ),
+            cross_applicant_candidates_excluded=(
+                len(case_scoped) - len(applicant_scoped)
+            ),
         )
 
 
@@ -545,8 +733,13 @@ class RescindedDecisionHandler:
     def filter(
         self,
         candidates: Iterable[CandidateEvidence],
+        *,
+        expected_case_id: str | None = None,
+        active_applicant: str | None = None,
+        active_applicant_aliases: Iterable[str] = (),
     ) -> tuple[tuple[CandidateEvidence, ...], bool]:
         candidates = tuple(candidates)
+        active_applicant_aliases = tuple(active_applicant_aliases)
         eligible = [
             candidate
             for candidate in candidates
@@ -557,12 +750,66 @@ class RescindedDecisionHandler:
             for candidate in eligible
             if candidate.field_name == "adjudication" and candidate.value
         ]
+        valid_applicant_keys = {
+            CaseLinker._normalized_name(value)
+            for value in (
+                active_applicant,
+                *active_applicant_aliases,
+            )
+            if value
+        }
+
+        def coherent_scope(candidate: CandidateEvidence) -> bool:
+            if (
+                expected_case_id
+                and candidate.case_id_hint
+                and candidate.case_id_hint != expected_case_id
+            ):
+                return False
+            if valid_applicant_keys:
+                if (
+                    candidate.applicant_hint is not None
+                    and CaseLinker._normalized_name(
+                        candidate.applicant_hint
+                    )
+                    not in valid_applicant_keys
+                ):
+                    return False
+                if any(
+                    item.observation.applicant_scope is not None
+                    and CaseLinker._normalized_name(
+                        item.observation.applicant_scope
+                    )
+                    not in valid_applicant_keys
+                    for item in candidate.ocr_provenance
+                ):
+                    return False
+            elif (
+                candidate.applicant_hint is not None
+                or any(
+                    item.observation.applicant_scope is not None
+                    for item in candidate.ocr_provenance
+                )
+            ):
+                return False
+            return (
+                not candidate.ocr_provenance
+                or candidate_has_complete_provenance(
+                    candidate,
+                    expected_case_id=expected_case_id,
+                    active_applicant=active_applicant,
+                    active_applicant_aliases=active_applicant_aliases,
+                )
+            )
+
         later_signed_approvals = [
             candidate
             for candidate in decisions
             if candidate.value == "APPROVED"
             and candidate.evidence_type is EvidenceType.SIGNED_MANUAL_NOTE
             and "correction" in candidate.visual_cues
+            and CaseLinker._is_clean_visible_candidate(candidate)
+            and coherent_scope(candidate)
         ]
         rescinded = False
         if later_signed_approvals:
@@ -597,9 +844,19 @@ class EvidencePrecedenceResolver:
         *,
         hierarchy: type[EvidencePrecedenceHierarchy] = EvidencePrecedenceHierarchy,
         rescinded_handler: RescindedDecisionHandler | None = None,
+        fusion_enabled: bool = True,
     ) -> None:
+        if not isinstance(fusion_enabled, bool):
+            raise TypeError("fusion_enabled must be a boolean")
         self._hierarchy = hierarchy
         self._rescinded = rescinded_handler or RescindedDecisionHandler()
+        self._fusion_enabled = fusion_enabled
+
+    @property
+    def fusion_enabled(self) -> bool:
+        """Whether applicant-aware provenance fusion is the active resolver."""
+
+        return self._fusion_enabled
 
     def _resolve_field(
         self,
@@ -669,6 +926,30 @@ class EvidencePrecedenceResolver:
             winning_evidence=winning_evidence,
             considered=considered,
             reason=f"resolved at precedence rank {winning_rank}",
+        )
+
+    def _resolve_field_with_fusion(
+        self,
+        field_name: str,
+        candidates: Iterable[CandidateEvidence],
+        linked_case: LinkedCase,
+    ) -> ResolvedField:
+        decision = EvidenceFuser.resolve(
+            field_name,
+            candidates,
+            ranker=self._hierarchy,
+            expected_case_id=linked_case.case_id or None,
+            active_applicant=linked_case.active_applicant,
+            active_applicant_aliases=linked_case.active_applicant_aliases,
+        )
+        return ResolvedField(
+            field_name=decision.field_name,
+            state=FieldState(decision.state),
+            value=decision.value,
+            winning_evidence=decision.winning_evidence,
+            considered=decision.considered,
+            reason=decision.reason,
+            fusion_trace=decision.trace,
         )
 
     @classmethod
@@ -762,49 +1043,298 @@ class EvidencePrecedenceResolver:
             reason="structured exact-case sponsor narrative OCR repair",
         )
 
-    def resolve(self, linked_case: LinkedCase) -> ResolvedCase:
-        evidence, rescinded = self._rescinded.filter(linked_case.evidence)
-        fields = {}
-        for field_name in RESOLVABLE_FIELDS:
-            fields[field_name] = (
-                self._structured_sponsor_conflict_repair(
-                    field_name,
-                    linked_case.case_id,
-                    evidence,
-                )
-                or self._resolve_field(field_name, evidence)
-            )
+    def _with_case_and_applicant_associations(
+        self,
+        linked_case: LinkedCase,
+        evidence: tuple[CandidateEvidence, ...],
+        fields: dict[str, ResolvedField],
+    ) -> None:
+        """Make the linker identity authoritative without losing diagnostics."""
+
         if linked_case.case_id:
             case_candidates = tuple(
                 candidate
                 for candidate in evidence
                 if candidate.field_name == "case_id"
+                and CaseLinker._is_clean_visible_candidate(candidate)
+                and candidate.value == linked_case.case_id
+            )
+            current_case_winner = fields.get("case_id")
+            case_winner = (
+                current_case_winner.winning_evidence
+                if current_case_winner is not None
+                and current_case_winner.value == linked_case.case_id
+                and current_case_winner.winning_evidence in case_candidates
+                else (
+                    min(
+                        case_candidates,
+                        key=lambda candidate: (
+                            self._hierarchy.rank(candidate.evidence_type),
+                            -candidate.ocr_confidence,
+                            CaseLinker._candidate_sort_key(candidate),
+                        ),
+                    )
+                    if case_candidates
+                    else None
+                )
             )
             fields["case_id"] = ResolvedField(
                 field_name="case_id",
                 state=FieldState.RESOLVED,
                 value=linked_case.case_id,
-                winning_evidence=(case_candidates[0] if case_candidates else None),
+                winning_evidence=case_winner,
                 considered=case_candidates,
                 reason="active case association",
+                fusion_trace=(
+                    fields["case_id"].fusion_trace
+                    if "case_id" in fields
+                    else None
+                ),
             )
         if linked_case.active_applicant:
             applicant_candidates = tuple(
                 candidate
                 for candidate in evidence
                 if candidate.field_name == "applicant_name"
-                and candidate.value == linked_case.active_applicant
+                and CaseLinker._is_clean_visible_candidate(candidate)
+                and candidate.value in {
+                    linked_case.active_applicant,
+                    *linked_case.active_applicant_aliases,
+                }
             )
+            exact_candidates = tuple(
+                candidate
+                for candidate in applicant_candidates
+                if candidate.value == linked_case.active_applicant
+            )
+            existing = fields.get("applicant_name")
+            existing_winner = (
+                existing.winning_evidence if existing is not None else None
+            )
+            if (
+                existing is not None
+                and existing.value == linked_case.active_applicant
+                and existing_winner in exact_candidates
+            ):
+                winning_applicant = existing_winner
+            elif exact_candidates:
+                winning_applicant = min(
+                    exact_candidates,
+                    key=lambda candidate: (
+                        self._hierarchy.rank(candidate.evidence_type),
+                        not candidate_has_complete_provenance(
+                            candidate,
+                            expected_case_id=linked_case.case_id or None,
+                            active_applicant=linked_case.active_applicant,
+                            active_applicant_aliases=(
+                                linked_case.active_applicant_aliases
+                            ),
+                        ),
+                        -candidate.ocr_confidence,
+                        CaseLinker._candidate_sort_key(candidate),
+                    ),
+                )
+            else:
+                winning_applicant = None
             fields["applicant_name"] = ResolvedField(
                 field_name="applicant_name",
-                state=FieldState.RESOLVED,
-                value=linked_case.active_applicant,
-                winning_evidence=(
-                    applicant_candidates[0] if applicant_candidates else None
+                state=(
+                    FieldState.RESOLVED
+                    if winning_applicant is not None
+                    else FieldState.UNKNOWN
                 ),
+                value=(
+                    linked_case.active_applicant
+                    if winning_applicant is not None
+                    else None
+                ),
+                winning_evidence=winning_applicant,
                 considered=applicant_candidates,
-                reason="active applicant association",
+                reason=(
+                    "active applicant association"
+                    if winning_applicant is not None
+                    else "active applicant has no surviving exact evidence"
+                ),
+                fusion_trace=(
+                    fields["applicant_name"].fusion_trace
+                    if "applicant_name" in fields
+                    else None
+                ),
             )
+
+    @staticmethod
+    def _winner_has_complete_provenance(
+        field: ResolvedField,
+        linked_case: LinkedCase,
+    ) -> bool:
+        winner = field.winning_evidence
+        return winner is not None and candidate_has_complete_provenance(
+            winner,
+            expected_case_id=linked_case.case_id or None,
+            active_applicant=linked_case.active_applicant,
+            active_applicant_aliases=linked_case.active_applicant_aliases,
+        )
+
+    @staticmethod
+    def _is_clean_legacy_winner(field: ResolvedField) -> bool:
+        winner = field.winning_evidence
+        if winner is None:
+            return False
+        cues = {
+            re.sub(r"[\s-]+", "_", cue.strip().casefold())
+            for cue in winner.visual_cues
+        }
+        return (
+            winner.legible
+            and winner.value is not None
+            and not winner.superseded
+            and winner.source == "visible_ocr"
+            and "strikethrough" not in cues
+            and not any("watermark" in cue for cue in cues)
+            and winner.evidence_type is not EvidenceType.TEXT_LAYER
+        )
+
+    def _fusion_audit_counts(
+        self,
+        linked_case: LinkedCase,
+        fusion_fields: Mapping[str, ResolvedField],
+        legacy_fields: Mapping[str, ResolvedField],
+    ) -> Mapping[str, int]:
+        counts = {
+            "changed_field_count": 0,
+            "changed_field_complete_provenance_count": 0,
+            "clean_higher_authority_override_count": 0,
+            "binding_authority_override_count": 0,
+            "text_layer_winner_count": 0,
+            "serialization_default_used_as_evidence_count": 0,
+            "correlated_views_collapsed": 0,
+            "independent_agreement_resolutions": 0,
+            "same_rank_contested_count": 0,
+            "cross_applicant_candidates_excluded": (
+                linked_case.cross_applicant_candidates_excluded
+            ),
+        }
+        for field_name in RESOLVABLE_FIELDS:
+            fusion = fusion_fields[field_name]
+            legacy = legacy_fields[field_name]
+            trace = fusion.fusion_trace
+            if trace is not None:
+                counts["correlated_views_collapsed"] += (
+                    trace.correlated_candidate_count
+                )
+                counts["serialization_default_used_as_evidence_count"] += (
+                    trace.safety_count(
+                        "serialization_default_used_as_evidence_count"
+                    )
+                )
+                counts["independent_agreement_resolutions"] += int(
+                    fusion.state is FieldState.RESOLVED
+                    and trace.independent_agreement_count >= 2
+                )
+                counts["same_rank_contested_count"] += int(
+                    fusion.state is FieldState.CONTESTED
+                )
+
+            changed = (
+                fusion.state is not legacy.state
+                or fusion.value != legacy.value
+            )
+            if not changed:
+                continue
+            counts["changed_field_count"] += 1
+            counts["changed_field_complete_provenance_count"] += int(
+                self._winner_has_complete_provenance(fusion, linked_case)
+            )
+            counts["text_layer_winner_count"] += int(
+                fusion.winning_evidence is not None
+                and fusion.winning_evidence.evidence_type
+                is EvidenceType.TEXT_LAYER
+            )
+
+            if (
+                legacy.winning_evidence is not None
+                and self._is_clean_legacy_winner(legacy)
+            ):
+                legacy_rank = self._hierarchy.rank(
+                    legacy.winning_evidence.evidence_type
+                )
+                if fusion.winning_evidence is None:
+                    continue
+                fusion_rank = self._hierarchy.rank(
+                    fusion.winning_evidence.evidence_type
+                )
+                counts["binding_authority_override_count"] += int(
+                    legacy_rank == 1
+                    and (
+                        fusion_rank != 1
+                        or fusion.value != legacy.value
+                    )
+                )
+                counts["clean_higher_authority_override_count"] += int(
+                    fusion_rank > legacy_rank
+                )
+        return MappingProxyType(dict(sorted(counts.items())))
+
+    def resolve(self, linked_case: LinkedCase) -> ResolvedCase:
+        evidence, rescinded = self._rescinded.filter(
+            linked_case.evidence,
+            expected_case_id=linked_case.case_id or None,
+            active_applicant=linked_case.active_applicant,
+            active_applicant_aliases=linked_case.active_applicant_aliases,
+        )
+        legacy_fields: dict[str, ResolvedField] = {}
+        if self._fusion_enabled:
+            fields = {
+                field_name: self._resolve_field_with_fusion(
+                    field_name,
+                    evidence,
+                    linked_case,
+                )
+                for field_name in RESOLVABLE_FIELDS
+            }
+            legacy_fields = {
+                field_name: (
+                    self._structured_sponsor_conflict_repair(
+                        field_name,
+                        linked_case.case_id,
+                        evidence,
+                    )
+                    or self._resolve_field(field_name, evidence)
+                )
+                for field_name in RESOLVABLE_FIELDS
+            }
+        else:
+            fields = {
+                field_name: (
+                    self._structured_sponsor_conflict_repair(
+                        field_name,
+                        linked_case.case_id,
+                        evidence,
+                    )
+                    or self._resolve_field(field_name, evidence)
+                )
+                for field_name in RESOLVABLE_FIELDS
+            }
+
+        self._with_case_and_applicant_associations(
+            linked_case,
+            evidence,
+            fields,
+        )
+        if self._fusion_enabled:
+            self._with_case_and_applicant_associations(
+                linked_case,
+                evidence,
+                legacy_fields,
+            )
+            audit_counts = self._fusion_audit_counts(
+                linked_case,
+                fields,
+                legacy_fields,
+            )
+        else:
+            audit_counts = MappingProxyType({})
+
         return ResolvedCase(
             case_id=linked_case.case_id,
             active_applicant=linked_case.active_applicant,
@@ -812,4 +1342,5 @@ class EvidencePrecedenceResolver:
             unresolved_linkage=linked_case.unresolved,
             unresolved_reasons=linked_case.unresolved_reasons,
             rescinded_decision=rescinded,
+            fusion_audit_counts=audit_counts,
         )

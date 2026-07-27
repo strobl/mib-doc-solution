@@ -60,6 +60,7 @@ from .confidence import (
     DecisionSignalModel,
     PinnedIsotonicMap,
 )
+from .fusion import EvidenceFuser, FusionDecision, FusionTrace
 from .decision_recovery import (
     REVIEW_APPROVAL_CONFIDENCE,
     REVIEW_DENIAL_CONFIDENCE,
@@ -121,6 +122,9 @@ __all__ = [
     "DecisionSignalModel",
     "DocumentRenderer",
     "EvidenceType",
+    "EvidenceFuser",
+    "FusionDecision",
+    "FusionTrace",
     "EvidencePrecedenceHierarchy",
     "EvidencePrecedenceResolver",
     "ExtractThenFallbackProcessor",

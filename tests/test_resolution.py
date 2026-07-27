@@ -1,3 +1,4 @@
+import itertools
 import unittest
 
 from mib_pipeline import (
@@ -7,6 +8,7 @@ from mib_pipeline import (
     EvidencePrecedenceResolver,
     EvidenceType,
     FieldState,
+    LinkedCase,
     Rect,
 )
 
@@ -24,6 +26,7 @@ def candidate(
     case_hint="MIB-000001",
     applicant_hint="Zed Zarnax",
     confidence=0.9,
+    source="visible_ocr",
 ):
     return CandidateEvidence(
         field_name=field_name,
@@ -35,6 +38,7 @@ def candidate(
         superseded=superseded,
         ocr_confidence=confidence,
         visual_cues=tuple(cues),
+        source=source,
         case_id_hint=case_hint,
         applicant_hint=applicant_hint,
     )
@@ -42,6 +46,19 @@ def candidate(
 
 def linked(*candidates, expected="MIB-000001"):
     return CaseLinker().link(expected, candidates)
+
+
+def resolver_linked(*candidates, expected="MIB-000001"):
+    """Give resolver-only tests one explicit visible active applicant."""
+
+    has_applicant = any(
+        item.field_name == "applicant_name" for item in candidates
+    )
+    evidence = candidates if has_applicant else (
+        candidate("applicant_name", "Zed Zarnax"),
+        *candidates,
+    )
+    return CaseLinker().link(expected, evidence)
 
 
 class CaseLinkerTests(unittest.TestCase):
@@ -84,7 +101,29 @@ class CaseLinkerTests(unittest.TestCase):
         self.assertTrue(result.unresolved)
         self.assertIsNone(result.active_applicant)
         self.assertIn("multiple applicants", result.unresolved_reasons[0])
-        self.assertFalse(any(item.field_name == "home_world" for item in result.evidence))
+        self.assertTrue(any(item.field_name == "home_world" for item in result.evidence))
+
+    def test_orphan_applicant_scoped_field_is_excluded_without_active_applicant(self):
+        result = linked(
+            candidate(
+                "fee_status",
+                "unpaid",
+                applicant_hint="Unlinked Person",
+            ),
+            candidate(
+                "page_type_present_fee_receipt",
+                "true",
+                applicant_hint=None,
+            ),
+        )
+        resolved = EvidencePrecedenceResolver().resolve(result)
+
+        self.assertIsNone(result.active_applicant)
+        self.assertIsNone(resolved.value("fee_status"))
+        self.assertEqual(
+            resolved.value("page_type_present_fee_receipt"),
+            "true",
+        )
 
     def test_higher_precedence_applicant_scopes_lower_conflicting_evidence(self):
         evidence = [
@@ -105,7 +144,7 @@ class CaseLinkerTests(unittest.TestCase):
         self.assertFalse(result.unresolved)
         self.assertNotIn("Other Person", {item.value for item in result.evidence})
 
-    def test_unique_case_field_survives_multi_applicant_name_scoping(self):
+    def test_foreign_applicant_unique_field_is_excluded(self):
         evidence = [
             candidate("applicant_name", "Zed Zarnax", EvidenceType.INTAKE_FORM),
             candidate(
@@ -128,9 +167,34 @@ class CaseLinkerTests(unittest.TestCase):
         resolved = EvidencePrecedenceResolver().resolve(linked_case)
 
         self.assertEqual(linked_case.active_applicant, "Zed Zarnax")
+        self.assertIsNone(resolved.value("home_world"))
+
+    def test_packet_scoped_unique_field_is_allowed(self):
+        evidence = [
+            candidate("applicant_name", "Zed Zarnax", EvidenceType.INTAKE_FORM),
+            candidate(
+                "applicant_name",
+                "Other Person",
+                EvidenceType.REGISTRY_EXTRACT,
+                applicant_hint="Other Person",
+                page=1,
+            ),
+            candidate(
+                "home_world",
+                "Kepler-186f",
+                EvidenceType.REGISTRY_EXTRACT,
+                applicant_hint=None,
+                page=1,
+            ),
+        ]
+
+        linked_case = linked(*evidence)
+        resolved = EvidencePrecedenceResolver().resolve(linked_case)
+
+        self.assertEqual(linked_case.active_applicant, "Zed Zarnax")
         self.assertEqual(resolved.value("home_world"), "Kepler-186f")
 
-    def test_case_field_fallback_rejects_conflict_and_foreign_case(self):
+    def test_foreign_applicant_conflict_and_foreign_case_are_excluded(self):
         evidence = [
             candidate("applicant_name", "Zed Zarnax", EvidenceType.INTAKE_FORM),
             candidate(
@@ -170,7 +234,7 @@ class CaseLinkerTests(unittest.TestCase):
         self.assertIsNone(resolved.value("home_world"))
         self.assertIsNone(resolved.value("arrival_date"))
 
-    def test_near_identical_ocr_names_are_clustered_and_best_reading_wins(self):
+    def test_near_identical_ocr_names_are_clustered_and_authority_wins(self):
         evidence = [
             candidate(
                 "applicant_name",
@@ -197,9 +261,242 @@ class CaseLinkerTests(unittest.TestCase):
 
         result = linked(*evidence)
 
-        self.assertEqual(result.active_applicant, "Xannax Oriix")
+        self.assertEqual(result.active_applicant, "Xannax Onitx")
         self.assertFalse(result.unresolved)
         self.assertIn("Eris Relay", {item.value for item in result.evidence})
+
+    def test_fuzzy_name_chain_does_not_merge_incompatible_endpoints(self):
+        first = "Xannax Onitx"
+        bridge = "Xannax Oriix"
+        other = "Xannax Orxxx"
+        self.assertGreaterEqual(CaseLinker._name_similarity(first, bridge), 0.80)
+        self.assertGreaterEqual(CaseLinker._name_similarity(bridge, other), 0.80)
+        self.assertLess(CaseLinker._name_similarity(first, other), 0.80)
+
+        result = linked(
+            candidate(
+                "applicant_name",
+                first,
+                applicant_hint=first,
+                confidence=0.91,
+            ),
+            candidate(
+                "applicant_name",
+                bridge,
+                EvidenceType.BIOMETRIC_SLIP,
+                applicant_hint=bridge,
+                confidence=0.95,
+                page=1,
+            ),
+            candidate(
+                "applicant_name",
+                other,
+                EvidenceType.REGISTRY_EXTRACT,
+                applicant_hint=other,
+                confidence=0.92,
+                page=2,
+            ),
+            candidate(
+                "home_world",
+                "Endpoint A",
+                applicant_hint=first,
+                page=0,
+            ),
+            candidate(
+                "home_world",
+                "Endpoint C",
+                EvidenceType.REGISTRY_EXTRACT,
+                applicant_hint=other,
+                page=2,
+            ),
+        )
+
+        self.assertEqual(result.active_applicant, first)
+        self.assertIn("Endpoint A", {item.value for item in result.evidence})
+        self.assertNotIn("Endpoint C", {item.value for item in result.evidence})
+
+    def test_applicant_linking_is_invariant_to_candidate_order(self):
+        first = "Xannax Onitx"
+        bridge = "Xannax Oriix"
+        other = "Xannax Orxxx"
+        evidence = (
+            candidate(
+                "applicant_name",
+                first,
+                applicant_hint=first,
+                confidence=0.91,
+            ),
+            candidate(
+                "applicant_name",
+                bridge,
+                EvidenceType.BIOMETRIC_SLIP,
+                applicant_hint=bridge,
+                confidence=0.95,
+                page=1,
+            ),
+            candidate(
+                "applicant_name",
+                other,
+                EvidenceType.REGISTRY_EXTRACT,
+                applicant_hint=other,
+                confidence=0.92,
+                page=2,
+            ),
+        )
+
+        outcomes = set()
+        for permutation in itertools.permutations(evidence):
+            result = linked(*permutation)
+            outcomes.add(
+                (
+                    result.active_applicant,
+                    result.unresolved,
+                    result.unresolved_reasons,
+                    frozenset(
+                        (
+                            item.field_name,
+                            item.value,
+                            item.page_index,
+                            item.applicant_hint,
+                        )
+                        for item in result.evidence
+                    ),
+                )
+            )
+
+        self.assertEqual(len(outcomes), 1)
+
+    def test_duplicate_or_jittered_identity_read_cannot_flip_winner(self):
+        alice = "Alice Aster"
+        boris = "Boris Boreal"
+        base = (
+            candidate(
+                "applicant_name",
+                alice,
+                page=0,
+                applicant_hint=alice,
+                confidence=0.80,
+            ),
+            candidate(
+                "applicant_name",
+                alice,
+                page=1,
+                applicant_hint=alice,
+                confidence=0.80,
+            ),
+            candidate(
+                "applicant_name",
+                boris,
+                page=2,
+                applicant_hint=boris,
+                confidence=0.95,
+            ),
+        )
+        duplicate = candidate(
+            "applicant_name",
+            boris,
+            page=2,
+            applicant_hint=boris,
+            confidence=0.95,
+        )
+        jittered = candidate(
+            "applicant_name",
+            boris,
+            page=2,
+            top=21,
+            applicant_hint=boris,
+            confidence=0.95,
+        )
+        variant = candidate(
+            "applicant_name",
+            "Boris Beto",
+            page=2,
+            applicant_hint="Boris Beto",
+            confidence=0.95,
+        )
+        jittered_variant = candidate(
+            "applicant_name",
+            "Boris Beto",
+            page=2,
+            top=21,
+            applicant_hint="Boris Beto",
+            confidence=0.95,
+        )
+
+        for evidence in (
+            base,
+            (*base, duplicate),
+            (*base, jittered),
+            (*base, variant),
+            (*base, jittered_variant),
+        ):
+            with self.subTest(candidate_count=len(evidence)):
+                result = linked(*evidence)
+                self.assertEqual(result.active_applicant, alice)
+                self.assertFalse(result.unresolved)
+
+    def test_same_physical_record_cannot_self_corroborate_sponsor_name(self):
+        intake_name = "Other Person"
+        claimed_name = "Zed Zarnax"
+        result = linked(
+            candidate(
+                "applicant_name",
+                intake_name,
+                applicant_hint=intake_name,
+                confidence=0.60,
+            ),
+            candidate(
+                "applicant_name",
+                claimed_name,
+                EvidenceType.SPONSOR_ATTESTATION,
+                page=1,
+                applicant_hint=claimed_name,
+                confidence=0.96,
+                cues=("structured_sponsor_narrative",),
+            ),
+            candidate(
+                "applicant_name",
+                claimed_name,
+                EvidenceType.REGISTRY_EXTRACT,
+                page=1,
+                applicant_hint=claimed_name,
+                confidence=0.95,
+            ),
+        )
+
+        self.assertEqual(result.active_applicant, intake_name)
+
+    def test_local_record_name_variants_cannot_multiply_identity_votes(self):
+        alice = "Alice Aster"
+        result = linked(
+            candidate(
+                "applicant_name",
+                alice,
+                applicant_hint=alice,
+                confidence=0.99,
+                cues=("record_id:a",),
+            ),
+            candidate(
+                "applicant_name",
+                "Boris Beta",
+                applicant_hint="Boris Beta",
+                confidence=0.95,
+                page=1,
+                cues=("record_id:b",),
+            ),
+            candidate(
+                "applicant_name",
+                "Boris Beto",
+                applicant_hint="Boris Beto",
+                confidence=0.95,
+                page=1,
+                top=100,
+                cues=("record_id:b",),
+            ),
+        )
+
+        self.assertEqual(result.active_applicant, alice)
+        self.assertFalse(result.unresolved)
 
     def test_corroborated_sponsor_name_replaces_unrelated_low_confidence_intake(self):
         sponsor_name = "Aridane Tekrix"
@@ -706,6 +1003,156 @@ class CaseLinkerTests(unittest.TestCase):
         self.assertEqual(result.case_id, "MIB-000001")
         self.assertTrue(result.unresolved)
 
+    def test_expected_and_foreign_visible_ids_quarantine_unhinted_facts(self):
+        result = linked(
+            candidate(
+                "case_id",
+                "MIB-000001",
+                case_hint="MIB-000001",
+                applicant_hint=None,
+            ),
+            candidate(
+                "case_id",
+                "MIB-000002",
+                case_hint="MIB-000002",
+                applicant_hint=None,
+                page=1,
+            ),
+            candidate(
+                "fee_status",
+                "paid",
+                case_hint=None,
+                applicant_hint=None,
+                page=2,
+            ),
+        )
+        resolved = EvidencePrecedenceResolver().resolve(result)
+
+        self.assertEqual(result.case_id, "MIB-000001")
+        self.assertTrue(result.unresolved)
+        self.assertTrue(resolved.unresolved_linkage)
+        self.assertFalse(
+            any(
+                item.field_name == "fee_status"
+                for item in result.evidence
+            )
+        )
+        self.assertEqual(
+            resolved.fields["fee_status"].state,
+            FieldState.UNKNOWN,
+        )
+
+    def test_watermarked_or_non_ocr_sponsor_cannot_select_applicant(self):
+        for cues, source in (
+            (("structured_sponsor_narrative", "sample_watermark"), "visible_ocr"),
+            (("structured_sponsor_narrative",), "output_default"),
+        ):
+            with self.subTest(cues=cues, source=source):
+                clean_name = "Aridane Tekris"
+                result = linked(
+                    candidate(
+                        "applicant_name",
+                        clean_name,
+                        confidence=0.60,
+                        applicant_hint=clean_name,
+                    ),
+                    candidate(
+                        "applicant_name",
+                        clean_name,
+                        EvidenceType.REGISTRY_EXTRACT,
+                        page=1,
+                        confidence=0.90,
+                        applicant_hint=clean_name,
+                    ),
+                    candidate(
+                        "applicant_name",
+                        "Aridane Tekrix",
+                        EvidenceType.SPONSOR_ATTESTATION,
+                        page=2,
+                        confidence=0.96,
+                        applicant_hint="Aridane Tekrix",
+                        cues=cues,
+                        source=source,
+                    ),
+                )
+                resolved = EvidencePrecedenceResolver().resolve(result)
+
+                self.assertEqual(result.active_applicant, clean_name)
+                self.assertEqual(resolved.value("applicant_name"), clean_name)
+                self.assertEqual(
+                    resolved.fields["applicant_name"].winning_evidence.value,
+                    clean_name,
+                )
+
+    def test_ambiguous_case_ids_exclude_case_hinted_facts(self):
+        evidence = (
+            candidate(
+                "case_id",
+                "MIB-000001",
+                applicant_hint=None,
+                case_hint="MIB-000001",
+            ),
+            candidate(
+                "fee_status",
+                "paid",
+                applicant_hint=None,
+                case_hint="MIB-000001",
+            ),
+            candidate(
+                "case_id",
+                "MIB-000002",
+                applicant_hint=None,
+                case_hint="MIB-000002",
+                page=1,
+            ),
+            candidate(
+                "fee_status",
+                "unpaid",
+                applicant_hint=None,
+                case_hint="MIB-000002",
+                page=1,
+            ),
+        )
+
+        linked_case = CaseLinker().link(None, evidence)
+        resolved = EvidencePrecedenceResolver().resolve(linked_case)
+
+        self.assertEqual(linked_case.case_id, "")
+        self.assertTrue(linked_case.unresolved)
+        self.assertFalse(
+            any(
+                item.field_name == "fee_status"
+                for item in linked_case.evidence
+            )
+        )
+        self.assertEqual(
+            resolved.fields["fee_status"].state,
+            FieldState.UNKNOWN,
+        )
+
+    def test_text_layer_cannot_establish_case_or_applicant_linkage(self):
+        result = CaseLinker().link(
+            None,
+            (
+                candidate(
+                    "case_id",
+                    "MIB-000001",
+                    EvidenceType.TEXT_LAYER,
+                    applicant_hint=None,
+                ),
+                candidate(
+                    "applicant_name",
+                    "Text Layer Person",
+                    EvidenceType.TEXT_LAYER,
+                    applicant_hint="Text Layer Person",
+                ),
+            ),
+        )
+
+        self.assertEqual(result.case_id, "")
+        self.assertIsNone(result.active_applicant)
+        self.assertTrue(result.unresolved)
+
 
 class PrecedenceResolverTests(unittest.TestCase):
     def test_precedence_ranks_match_field_manual(self):
@@ -725,7 +1172,7 @@ class PrecedenceResolverTests(unittest.TestCase):
         )
 
     def test_higher_rank_wins_and_lower_rank_cannot_override(self):
-        case = linked(
+        case = resolver_linked(
             candidate("fee_status", "paid", EvidenceType.INTAKE_FORM),
             candidate("fee_status", "unpaid", EvidenceType.REGISTRY_EXTRACT),
         )
@@ -744,7 +1191,7 @@ class PrecedenceResolverTests(unittest.TestCase):
         )
         for field_name, intake_value, sponsor_value in examples:
             with self.subTest(field_name=field_name):
-                case = linked(
+                case = resolver_linked(
                     candidate("applicant_name", "Zed Zarnax"),
                     candidate(field_name, intake_value),
                     candidate(
@@ -757,9 +1204,9 @@ class PrecedenceResolverTests(unittest.TestCase):
                     ),
                 )
 
-                field = EvidencePrecedenceResolver().resolve(case).fields[
-                    field_name
-                ]
+                field = EvidencePrecedenceResolver(
+                    fusion_enabled=False
+                ).resolve(case).fields[field_name]
 
                 self.assertEqual(field.value, sponsor_value)
                 self.assertEqual(
@@ -807,9 +1254,9 @@ class PrecedenceResolverTests(unittest.TestCase):
                         cues=("structured_sponsor_narrative",),
                     )
                 )
-            return EvidencePrecedenceResolver().resolve(
-                linked(*evidence)
-            ).fields[field_name].value
+            return EvidencePrecedenceResolver(
+                fusion_enabled=False
+            ).resolve(resolver_linked(*evidence)).fields[field_name].value
 
         variants = (
             {"sponsor_cues": ()},
@@ -829,7 +1276,7 @@ class PrecedenceResolverTests(unittest.TestCase):
                 self.assertEqual(resolved_value(**variant), "XW-2")
 
     def test_same_rank_conflict_is_contested(self):
-        case = linked(
+        case = resolver_linked(
             candidate("home_world", "Mars", EvidenceType.INTAKE_FORM),
             candidate("home_world", "Europa", EvidenceType.INTAKE_FORM, page=1),
         )
@@ -840,7 +1287,7 @@ class PrecedenceResolverTests(unittest.TestCase):
         self.assertIsNone(field.value)
 
     def test_struck_through_value_is_dropped(self):
-        case = linked(
+        case = resolver_linked(
             candidate(
                 "fee_status",
                 "unpaid",
@@ -856,7 +1303,7 @@ class PrecedenceResolverTests(unittest.TestCase):
         self.assertEqual(field.value, "paid")
 
     def test_visible_correction_wins_within_same_rank(self):
-        case = linked(
+        case = resolver_linked(
             candidate("sponsor_id", "SPN-0007", EvidenceType.INTAKE_FORM),
             candidate(
                 "sponsor_id",
@@ -867,20 +1314,31 @@ class PrecedenceResolverTests(unittest.TestCase):
             ),
         )
 
-        field = EvidencePrecedenceResolver().resolve(case).fields["sponsor_id"]
+        field = EvidencePrecedenceResolver(
+            fusion_enabled=False
+        ).resolve(case).fields["sponsor_id"]
 
         self.assertEqual(field.value, "SPN-1234")
 
-    def test_text_layer_is_used_only_when_no_visible_source_exists(self):
-        text_only = linked(
+    def test_text_layer_is_diagnostic_in_fusion_and_legacy_fallback_remains(self):
+        text_only = resolver_linked(
             candidate("visa_class", "XW-1", EvidenceType.TEXT_LAYER)
         )
         self.assertEqual(
-            EvidencePrecedenceResolver().resolve(text_only).fields["visa_class"].value,
+            EvidencePrecedenceResolver().resolve(text_only).fields[
+                "visa_class"
+            ].state,
+            FieldState.UNKNOWN,
+        )
+        self.assertEqual(
+            EvidencePrecedenceResolver(fusion_enabled=False)
+            .resolve(text_only)
+            .fields["visa_class"]
+            .value,
             "XW-1",
         )
 
-        with_visible = linked(
+        with_visible = resolver_linked(
             candidate("visa_class", "XW-1", EvidenceType.TEXT_LAYER),
             candidate("visa_class", "XW-2", EvidenceType.INTAKE_FORM),
         )
@@ -890,7 +1348,7 @@ class PrecedenceResolverTests(unittest.TestCase):
         )
 
     def test_missing_and_illegible_fields_are_unknown(self):
-        case = linked(
+        case = resolver_linked(
             candidate("species_code", None, legible=False),
         )
 
@@ -900,7 +1358,7 @@ class PrecedenceResolverTests(unittest.TestCase):
         self.assertEqual(resolved.fields["home_world"].state, FieldState.UNKNOWN)
 
     def test_later_signed_approval_rescinds_denial_stamp(self):
-        case = linked(
+        case = resolver_linked(
             candidate(
                 "adjudication",
                 "DENIED",
@@ -921,8 +1379,79 @@ class PrecedenceResolverTests(unittest.TestCase):
         self.assertTrue(resolved.rescinded_decision)
         self.assertEqual(resolved.fields["adjudication"].value, "APPROVED")
 
+    def test_invalid_signed_approval_cannot_rescind_binding_denial(self):
+        applicant = candidate("applicant_name", "Zed Zarnax")
+        denial = candidate(
+            "adjudication",
+            "DENIED",
+            EvidenceType.ADJUDICATOR_STAMP,
+            page=0,
+        )
+        variants = (
+            candidate(
+                "adjudication",
+                "APPROVED",
+                EvidenceType.SIGNED_MANUAL_NOTE,
+                page=1,
+                cues=("correction",),
+                source="output_default",
+            ),
+            candidate(
+                "adjudication",
+                "APPROVED",
+                EvidenceType.SIGNED_MANUAL_NOTE,
+                page=1,
+                cues=("correction",),
+                legible=False,
+            ),
+            candidate(
+                "adjudication",
+                "APPROVED",
+                EvidenceType.SIGNED_MANUAL_NOTE,
+                page=1,
+                cues=("correction", "official_watermark"),
+            ),
+            candidate(
+                "adjudication",
+                "APPROVED",
+                EvidenceType.SIGNED_MANUAL_NOTE,
+                page=1,
+                cues=("correction",),
+                case_hint="MIB-000999",
+            ),
+            candidate(
+                "adjudication",
+                "APPROVED",
+                EvidenceType.SIGNED_MANUAL_NOTE,
+                page=1,
+                cues=("correction",),
+                applicant_hint="Other Person",
+            ),
+        )
+        for approval in variants:
+            with self.subTest(
+                source=approval.source,
+                cues=approval.visual_cues,
+                case_hint=approval.case_id_hint,
+                applicant_hint=approval.applicant_hint,
+            ):
+                linked_case = LinkedCase(
+                    case_id="MIB-000001",
+                    active_applicant="Zed Zarnax",
+                    evidence=(applicant, denial, approval),
+                    unresolved=False,
+                    active_applicant_aliases=("Zed Zarnax",),
+                )
+                resolved = EvidencePrecedenceResolver().resolve(linked_case)
+
+                self.assertFalse(resolved.rescinded_decision)
+                self.assertEqual(
+                    resolved.fields["adjudication"].value,
+                    "DENIED",
+                )
+
     def test_sample_denial_watermark_never_becomes_live_decision(self):
-        case = linked(
+        case = resolver_linked(
             candidate(
                 "adjudication",
                 "DENIED",

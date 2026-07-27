@@ -669,7 +669,7 @@ class AdjudicationPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.row.adjudication, "NEEDS_REVIEW")
-        self.assertIn("arrival_date_not_visible", outcome.trace.review_reasons)
+        self.assertIn("arrival_date_unknown", outcome.trace.review_reasons)
 
     def test_untrusted_disqualifying_facts_route_to_review_not_denial(self):
         risk = self.decision(

@@ -165,8 +165,10 @@ _AGGREGATE_SEQUENCE_KEYS = frozenset(
 )
 _AGGREGATE_STRING_KEYS = frozenset(
     {
+        "comparison_scope",
         "evidence_label",
         "evaluation_mode",
+        "invocation_scope",
         "release_tier",
         "status",
     }
@@ -178,7 +180,9 @@ _AGGREGATE_STRING_VALUES = frozenset(
         "blocked",
         "candidate",
         "failed",
+        "fusion_vs_legacy_resolver_after_current_case_linking",
         "local",
+        "accepted_final_fusion_result_per_case",
         "passed",
         "protected",
         "public_grouped_robustness_not_unseen",

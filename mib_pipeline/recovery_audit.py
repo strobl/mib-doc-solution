@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Iterable, Mapping, Union
@@ -752,8 +752,28 @@ class VisibleRecoveryResult:
 
     row: PredictionRow
     audit: RecoveryAuditOverlay
+    fusion_audit_counts: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     def __post_init__(self) -> None:
+        fusion_counts = dict(self.fusion_audit_counts)
+        if any(
+            not isinstance(name, str)
+            or not name
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for name, count in fusion_counts.items()
+        ):
+            raise ValueError(
+                "fusion audit counts require names and non-negative integers"
+            )
+        object.__setattr__(
+            self,
+            "fusion_audit_counts",
+            MappingProxyType(dict(sorted(fusion_counts.items()))),
+        )
         if self.row.case_id != self.audit.case_id:
             raise ValueError("row and recovery audit case IDs must match")
         for field_name, field_audit in self.audit.fields.items():
@@ -774,6 +794,7 @@ class VisibleRecoveryResult:
         return {
             "row": self.row.to_dict(),
             "audit": self.audit.to_dict(),
+            "fusion_audit_counts": dict(self.fusion_audit_counts),
         }
 
 
