@@ -1,0 +1,231 @@
+{
+  "benchmark_context": "public_label_exposed_diagnostic_not_unseen_not_official_leaderboard",
+  "benchmark_id": "public-bounded-32-ocr-ablation-v2",
+  "cohort": {
+    "adjudication_counts": {
+      "approved": 8,
+      "denied": 12,
+      "needs_review": 12
+    },
+    "input_pdf_count": 32,
+    "input_tree_sha256": "baf4a2ec982dcd578a10c8f58182310ab60148aeb308388e468d712b7f042a5f",
+    "selection": "32 smallest SHA-256 digests of PDF bytes; labels were not used for selection",
+    "truth_sha256": "595c00b5bf1eb2f4e79c4fa5c8e131d8d14f16704f4f5f9771a9ae9e221193db"
+  },
+  "environment": {
+    "max_workers": 4,
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "python": "3.12.13",
+    "tesseract": "tesseract 5.5.0"
+  },
+  "external_aggregate_report_sha256": "acbe1e1c83761d45ed7970c4a6ca2560ffed59c7d51c0e9d853413d86cbf25b2",
+  "measurement": {
+    "answered": 704,
+    "attempted": 704,
+    "deterministic_configuration_pairs": 11,
+    "omitted": 0,
+    "run_count": 22,
+    "total_cpu_seconds": 6000.40414,
+    "total_wall_seconds": 1864.045367
+  },
+  "production_baseline": {
+    "calibration_score": 16.046523367733855,
+    "catastrophic_false_approvals": 0,
+    "classification_score": 73.75,
+    "complete": true,
+    "cpu_seconds_median": 296.10446149999996,
+    "deterministic": true,
+    "extraction_score": 45.763888888888886,
+    "invalid_records": 0,
+    "mean_brier": 0.09883691580665362,
+    "missing_records": 0,
+    "peak_memory_mib_max": 2143.65625,
+    "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+    "repeat_count": 2,
+    "total_score": 135.56041225662273,
+    "wall_seconds_median": 95.42927968749427
+  },
+  "report_schema": "mib_ocr_ablation_committed_aggregate_v2",
+  "safety_definition": "complete output and no catastrophic-false-approval increase",
+  "scope_complete": false,
+  "source_revision": "c062c46d87112367de9a6dc7f8112ae63ab4dc4e",
+  "unmeasured_routes": [
+    "visible_checkbox_pixels"
+  ],
+  "variants": [
+    {
+      "config_sha256": "c848dcbbc401a664316b1f71e52cc78bcc7e33aac3c21ac1daea0009badd6f24",
+      "deterministic": true,
+      "incremental_cpu_seconds": 7.836332499999969,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 288.268129,
+      "variant_id": "without_psm6_refinement",
+      "variant_peak_memory_mib_max": 2736.71875,
+      "variant_wall_seconds_median": 91.14289100002497
+    },
+    {
+      "config_sha256": "42bbe256f824da699785a37aa7366b2ceeee7fed6fd465d1ed9ec2b8cdc3f3eb",
+      "deterministic": true,
+      "incremental_cpu_seconds": 19.77340049999998,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 276.331061,
+      "variant_id": "without_cross_view_consensus",
+      "variant_peak_memory_mib_max": 2340.078125,
+      "variant_wall_seconds_median": 84.85717014601687
+    },
+    {
+      "component_contribution": {
+        "calibration": -0.003978811254690129,
+        "classification": 0.0,
+        "extraction": 0.13888888888888573
+      },
+      "config_sha256": "becee2aaec5d903285b95eb96956ca2c2f97e122710b9a4d77134f8333af8f78",
+      "deterministic": true,
+      "incremental_cpu_seconds": -14.296224000000052,
+      "predictions_sha256": "4116699be6639e5b3f0039d4a59c753d9ed6a4a177981ab5eb8749c96810ee3a",
+      "recommendation": "third",
+      "safety_pass": true,
+      "score_contribution": 0.13491007763417429,
+      "score_gain_per_cpu_second": 0.0004556164974710261,
+      "target_field_raw_point_deltas": {
+        "fee_status": 4.0
+      },
+      "variant_cpu_seconds_median": 310.4006855,
+      "variant_id": "without_fee_threshold_consensus",
+      "variant_peak_memory_mib_max": 2531.0,
+      "variant_wall_seconds_median": 94.90865383297205
+    },
+    {
+      "config_sha256": "77f414f8a9656dfd8e27d1e5bcef14b4f1d8491c298e389a790619803e530746",
+      "deterministic": true,
+      "incremental_cpu_seconds": 8.407182999999918,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 287.69727850000004,
+      "variant_id": "without_sparse_intake_crop_consensus",
+      "variant_peak_memory_mib_max": 2504.15625,
+      "variant_wall_seconds_median": 89.23528206298943
+    },
+    {
+      "component_contribution": {
+        "calibration": -0.5530409833040473,
+        "classification": 0.0,
+        "extraction": 0.0
+      },
+      "config_sha256": "0d07bfbdb8e3db40f770e2d801e56a133802e3e9f39c00902947ae930163b28c",
+      "deterministic": true,
+      "incremental_cpu_seconds": 11.577208999999925,
+      "predictions_sha256": "8597d6da04ed83805af2f84613a740f946447ec612d7ff8482aac987139a3a66",
+      "recommendation": "rejected_negative_delta",
+      "safety_pass": true,
+      "score_contribution": -0.5530409833040721,
+      "score_gain_per_cpu_second": -0.0018677225614990344,
+      "variant_cpu_seconds_median": 284.52725250000003,
+      "variant_id": "without_orientation_retry",
+      "variant_peak_memory_mib_max": 2350.921875,
+      "variant_wall_seconds_median": 87.00975343797472
+    },
+    {
+      "config_sha256": "4319d4ea5e629c41d75d1a674ff9a824f85312f98aa3340e9e60d1e8e7fd36b2",
+      "deterministic": true,
+      "incremental_cpu_seconds": 8.840526499999896,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 287.26393500000006,
+      "variant_id": "without_trusted_scope_repair",
+      "variant_peak_memory_mib_max": 2503.625,
+      "variant_wall_seconds_median": 88.9289229165006
+    },
+    {
+      "config_sha256": "f785d44c977058863a90f253a406a5cb8d8722650e0efbbe451fd028fa21db63",
+      "deterministic": true,
+      "incremental_cpu_seconds": 9.086341999999945,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 287.0181195,
+      "variant_id": "without_risk_geometry_retry",
+      "variant_peak_memory_mib_max": 2381.53125,
+      "variant_wall_seconds_median": 88.68372731201816
+    },
+    {
+      "component_contribution": {
+        "calibration": 0.26315436634792455,
+        "classification": 2.1875,
+        "extraction": 0.17361111111110716
+      },
+      "config_sha256": "517f035b862b5d861d95d6554274c5cb234cb4c64d02d1a95aea047fc49bea14",
+      "deterministic": true,
+      "incremental_cpu_seconds": 53.46522249999998,
+      "predictions_sha256": "b1817e18001733705ca6c3b62aaff467fa326ee77456982300b4ab30dd3516b2",
+      "recommendation": "second",
+      "safety_pass": true,
+      "score_contribution": 2.6242654774590335,
+      "score_gain_per_cpu_second": 0.008862634031804461,
+      "target_field_raw_point_deltas": {
+        "sponsor_id": 5.0
+      },
+      "variant_cpu_seconds_median": 242.63923899999998,
+      "variant_id": "without_renderer_deskew",
+      "variant_peak_memory_mib_max": 2315.8125,
+      "variant_wall_seconds_median": 72.40648331251577
+    },
+    {
+      "config_sha256": "5d236388d2b84b0013b45c53d71acdc472c1d108bddb6908cd419d689bdde43d",
+      "deterministic": true,
+      "incremental_cpu_seconds": 10.06304949999992,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 286.04141200000004,
+      "variant_id": "without_visible_cue_interpretation",
+      "variant_peak_memory_mib_max": 2485.375,
+      "variant_wall_seconds_median": 88.62169504148187
+    },
+    {
+      "component_contribution": {
+        "calibration": 0.01583628280557292,
+        "classification": 1.875,
+        "extraction": 1.0763888888888857
+      },
+      "config_sha256": "1360de8a116932e1cfcfbff191533850e1e457a4e735a11504f9b36b0ea1edfb",
+      "deterministic": true,
+      "incremental_cpu_seconds": 142.19396499999996,
+      "predictions_sha256": "04a27e56c3e572fb9c01661f2e139adc4e7b8a30ed4d989ba39e481860c6ba19",
+      "recommendation": "winner",
+      "safety_pass": true,
+      "score_contribution": 2.9672251716944515,
+      "score_gain_per_cpu_second": 0.010020872892840394,
+      "target_field_raw_point_deltas": {
+        "arrival_date": 4.0,
+        "declared_purpose": 3.0,
+        "risk_flags": 8.0,
+        "species_code": 6.0,
+        "sponsor_id": 5.0,
+        "visa_class": 5.0
+      },
+      "variant_cpu_seconds_median": 153.9104965,
+      "variant_id": "without_targeted_rapidocr",
+      "variant_peak_memory_mib_max": 393.5,
+      "variant_wall_seconds_median": 50.79882479150547
+    }
+  ]
+}

@@ -1,11 +1,20 @@
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from mib_pipeline.adjudication import AdjudicationOutcome, DecisionTrace
+from mib_pipeline.adjudication import (
+    AdjudicationEngine,
+    AdjudicationOutcome,
+    DecisionTrace,
+)
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
+from mib_pipeline.fusion import FusionTrace
 from mib_pipeline.ingestion import Rect
 from mib_pipeline.models import PredictionRow
+from mib_pipeline.decision_recovery import ReviewDenialRecoveryAdjudicator
+from mib_pipeline.provenance import CoordinateTransform, make_ocr_provenance
+from mib_pipeline.recovery_audit import SerializationOrigin
 from mib_pipeline.rapid_recovery import (
     RapidOcrEngine,
     RapidOutputRecoveryProcessor,
@@ -14,6 +23,8 @@ from mib_pipeline.rapid_recovery import (
     XW1_MULTISOURCE_REVIEW_APPROVAL_CONFIDENCE,
 )
 from mib_pipeline.resolution import (
+    CaseLinker,
+    EvidencePrecedenceResolver,
     FieldState,
     ResolvedCase,
     ResolvedField,
@@ -22,6 +33,7 @@ from mib_pipeline.resolution import (
 
 CASE_ID = "MIB-000001"
 APPLICANT = "Zed Zarnax"
+SOURCE_SHA256 = "a" * 64
 BASE_VALUES = {
     "applicant_name": APPLICANT,
     "species_code": "ORION_GRAYS",
@@ -48,13 +60,30 @@ def evidence(
     legible=True,
     source="visible_ocr",
     page=0,
+    provenance=True,
+    source_sha256=SOURCE_SHA256,
+    route_id="targeted_rapidocr",
 ):
+    box = Rect(1, 2, 3, 4)
+    ocr_provenance = ()
+    if source == "visible_ocr" and provenance:
+        ocr_provenance = (
+            make_ocr_provenance(
+                source_sha256=source_sha256,
+                page_index=page,
+                view_box=box,
+                applicant_scope=applicant,
+                route_id=route_id,
+                engine_id="test:ocr",
+                view_id="rendered_page",
+            ),
+        )
     return CandidateEvidence(
         field_name=field_name,
         value=value,
         evidence_type=evidence_type,
         page_index=page,
-        box=Rect(1, 2, 3, 4),
+        box=box,
         legible=legible,
         superseded=superseded,
         ocr_confidence=confidence,
@@ -62,10 +91,48 @@ def evidence(
         source=source,
         case_id_hint=case_id,
         applicant_hint=applicant,
+        ocr_provenance=ocr_provenance,
     )
 
 
-def field(name, value, *, state=FieldState.RESOLVED, considered=()):
+def fusion_trace(
+    *,
+    disagreement_ratio=0.0,
+    entropy_bits=0.0,
+    independent_evidence_count=2,
+):
+    return FusionTrace(
+        winning_rank=2,
+        candidate_count=2,
+        eligible_candidate_count=2,
+        winning_rank_candidate_count=2,
+        observation_count=2,
+        independent_evidence_count=independent_evidence_count,
+        independent_agreement_count=(
+            1 if disagreement_ratio > 0.0 else 2
+        ),
+        correlated_candidate_count=0,
+        independent_evidence_type_count=1,
+        independent_page_count=2,
+        disagreement_count=int(disagreement_ratio > 0.0),
+        entropy_bits=entropy_bits,
+        disagreement_ratio=disagreement_ratio,
+        provenance_complete_count=2,
+        provenance_completeness=1.0,
+        value_counts=(("accepted", 1), ("other", 1)),
+        veto_reasons=(),
+        safety_counters=(),
+    )
+
+
+def field(
+    name,
+    value,
+    *,
+    state=FieldState.RESOLVED,
+    considered=(),
+    fusion_trace=None,
+):
     winner = next(
         (candidate for candidate in considered if candidate.value == value),
         None,
@@ -77,6 +144,7 @@ def field(name, value, *, state=FieldState.RESOLVED, considered=()):
         winning_evidence=winner,
         considered=tuple(considered),
         reason="test field",
+        fusion_trace=fusion_trace,
     )
 
 
@@ -85,18 +153,21 @@ def resolved_case(
     values=None,
     unknown=(),
     considered=None,
+    fusion_traces=None,
     active=APPLICANT,
     unresolved_linkage=False,
     unresolved_reasons=(),
 ):
     values = {**BASE_VALUES, **(values or {})}
     considered = considered or {}
+    fusion_traces = fusion_traces or {}
     fields = {
         name: field(
             name,
             None if name in unknown else value,
             state=FieldState.UNKNOWN if name in unknown else FieldState.RESOLVED,
             considered=considered.get(name, ()),
+            fusion_trace=fusion_traces.get(name),
         )
         for name, value in values.items()
     }
@@ -106,6 +177,28 @@ def resolved_case(
         fields=fields,
         unresolved_linkage=unresolved_linkage,
         unresolved_reasons=tuple(unresolved_reasons),
+    )
+
+
+def with_resolved_fields(
+    resolved,
+    **candidates,
+):
+    fields = dict(resolved.fields)
+    for field_name, candidate in candidates.items():
+        fields[field_name] = field(
+            field_name,
+            candidate.value,
+            considered=(candidate,),
+        )
+    return ResolvedCase(
+        case_id=resolved.case_id,
+        active_applicant=resolved.active_applicant,
+        fields=fields,
+        unresolved_linkage=resolved.unresolved_linkage,
+        unresolved_reasons=resolved.unresolved_reasons,
+        rescinded_decision=resolved.rescinded_decision,
+        fusion_audit_counts=resolved.fusion_audit_counts,
     )
 
 
@@ -188,7 +281,10 @@ class FakeRenderer:
 
     def render(self, path):
         self.calls += 1
-        return types.SimpleNamespace(case_id=path.stem)
+        return types.SimpleNamespace(
+            case_id=path.stem,
+            source_sha256=SOURCE_SHA256,
+        )
 
 
 class FakeExtractor:
@@ -224,6 +320,7 @@ class FakeLinker:
         *,
         primary_active=APPLICANT,
         rapid_active=APPLICANT,
+        fused_active=APPLICANT,
         primary_candidates=("primary",),
     ):
         self.primary = types.SimpleNamespace(
@@ -231,37 +328,76 @@ class FakeLinker:
             active_applicant=primary_active,
         )
         self.rapid = types.SimpleNamespace(kind="rapid", active_applicant=rapid_active)
+        self.fused = types.SimpleNamespace(kind="fused", active_applicant=fused_active)
         self.primary_candidates = tuple(primary_candidates)
         self.calls = 0
+        self.inputs = []
 
     def link(self, case_id, candidates):
         self.calls += 1
-        return (
-            self.primary
-            if tuple(candidates) == self.primary_candidates
-            else self.rapid
-        )
+        candidates = tuple(candidates)
+        self.inputs.append(candidates)
+        if candidates == self.primary_candidates:
+            return self.primary
+        if (
+            self.primary_candidates
+            and len(candidates) > len(self.primary_candidates)
+            and candidates[: len(self.primary_candidates)]
+            == self.primary_candidates
+        ):
+            return self.fused
+        return self.rapid
 
 
 class FakeResolver:
-    def __init__(self, primary, rapid):
+    def __init__(
+        self,
+        primary,
+        rapid,
+        *,
+        fused=None,
+        fusion_enabled=False,
+    ):
         self.primary = primary
         self.rapid = rapid
+        self.fused = fused if fused is not None else rapid
+        self.fusion_enabled = fusion_enabled
         self.calls = 0
+        self.inputs = []
 
     def resolve(self, linked):
         self.calls += 1
-        return self.primary if linked.kind == "primary" else self.rapid
+        self.inputs.append(linked)
+        if linked.kind == "primary":
+            return self.primary
+        if linked.kind == "fused":
+            return self.fused
+        return self.rapid
 
 
 class FakeAdjudicator:
-    def __init__(self, primary_outcome):
+    def __init__(self, primary_outcome, *, fused_outcome=None):
         self.primary_outcome = primary_outcome
+        self.fused_outcome = fused_outcome
         self.calls = 0
+        self.inputs = []
 
     def adjudicate_case(self, resolved):
         self.calls += 1
+        self.inputs.append(resolved)
+        if self.calls > 1 and self.fused_outcome is not None:
+            return self.fused_outcome
         return self.primary_outcome
+
+
+class RecordingAdjudicator:
+    def __init__(self):
+        self.delegate = AdjudicationEngine(default_confidence=0.37)
+        self.inputs = []
+
+    def adjudicate_case(self, resolved):
+        self.inputs.append(resolved)
+        return self.delegate.adjudicate_case(resolved)
 
 
 def processor(
@@ -272,18 +408,31 @@ def processor(
     rapid_candidates=(),
     primary_active=APPLICANT,
     rapid_active=APPLICANT,
+    fused_active=APPLICANT,
     rapid_error=None,
     primary_candidates=("primary",),
+    fusion_enabled=False,
+    fused_resolved=None,
+    fused_outcome=None,
 ):
     renderer = FakeRenderer()
     primary_extractor = FakeExtractor(primary_candidates)
     linker = FakeLinker(
         primary_active=primary_active,
         rapid_active=rapid_active,
+        fused_active=fused_active,
         primary_candidates=primary_candidates,
     )
-    resolver = FakeResolver(primary_resolved, rapid_resolved)
-    adjudicator = FakeAdjudicator(primary_outcome or outcome())
+    resolver = FakeResolver(
+        primary_resolved,
+        rapid_resolved,
+        fused=fused_resolved,
+        fusion_enabled=fusion_enabled,
+    )
+    adjudicator = FakeAdjudicator(
+        primary_outcome or outcome(),
+        fused_outcome=fused_outcome,
+    )
     factory = FakeRapidFactory(rapid_candidates, error=rapid_error)
     recovery = RapidOutputRecoveryProcessor(
         renderer=renderer,
@@ -329,6 +478,11 @@ class RapidOcrEngineTests(unittest.TestCase):
         self.assertEqual(
             params["EngineConfig.onnxruntime.inter_op_num_threads"], 1
         )
+        self.assertEqual(params["Global.text_score"], 0.30)
+        self.assertIn("rapidocr:version=3.9.2", adapter.provenance_id)
+        for digest in RapidOcrEngine._MODEL_SHA256.values():
+            self.assertIn(digest, adapter.provenance_id)
+        self.assertIn("text_score=0.30:ort_threads=1/1", adapter.provenance_id)
 
         tokens = adapter.read_page(
             types.SimpleNamespace(index=2, image_png=b"png")
@@ -374,6 +528,498 @@ class RapidPackagingContractTests(unittest.TestCase):
             self.assertIn(digest, provenance)
 
 
+class RapidFusionModeTests(unittest.TestCase):
+    @staticmethod
+    def production_shape_processor(primary_candidates, rapid_candidates):
+        renderer = FakeRenderer()
+        adjudicator = RecordingAdjudicator()
+        factory = FakeRapidFactory(rapid_candidates)
+        recovery = RapidOutputRecoveryProcessor(
+            renderer=renderer,
+            primary_extractor=FakeExtractor(primary_candidates),
+            linker=CaseLinker(),
+            resolver=EvidencePrecedenceResolver(fusion_enabled=True),
+            adjudicator=adjudicator,
+            rapid_extractor_factory=factory,
+        )
+        return recovery, adjudicator, factory
+
+    def test_fusion_mode_skips_both_output_only_repair_paths(self):
+        intake = evidence(
+            "applicant_name",
+            APPLICANT,
+            evidence_type=EvidenceType.INTAKE_FORM,
+            confidence=0.84,
+        )
+        biometric = evidence(
+            "applicant_name",
+            "Zed Zornax",
+            evidence_type=EvidenceType.BIOMETRIC_SLIP,
+            confidence=0.95,
+            applicant="Zed Zornax",
+        )
+        rapid_probe = evidence("fee_status", None, applicant=None)
+        primary = resolved_case(unknown={"fee_status"})
+        fused = resolved_case(unknown={"fee_status"})
+        primary_row = row()
+        recovery, _renderer, linker, resolver, adjudicator, factory = processor(
+            primary,
+            resolved_case(),
+            primary_outcome=outcome(primary_row),
+            rapid_candidates=(rapid_probe,),
+            primary_candidates=(intake, biometric),
+            fusion_enabled=True,
+            fused_resolved=fused,
+            fused_outcome=outcome(primary_row),
+        )
+
+        with mock.patch.object(
+            RapidOutputRecoveryProcessor,
+            "_repair_biometric_applicant",
+            side_effect=AssertionError("legacy biometric repair was called"),
+        ), mock.patch.object(
+            RapidOutputRecoveryProcessor,
+            "_repair_source_priority_fields",
+            side_effect=AssertionError("legacy source repair was called"),
+        ):
+            result = recovery.process_case(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(result, primary_row)
+        self.assertEqual(result.applicant_name, APPLICANT)
+        self.assertEqual(factory.calls, 1)
+        self.assertEqual(linker.calls, 2)
+        self.assertEqual(resolver.calls, 2)
+        # The independent policy probe produced no accepted resolved change,
+        # so normal policy is not rerun and no vacuous revalidation is counted.
+        self.assertEqual(adjudicator.calls, 1)
+        self.assertEqual(resolver.inputs[-1].kind, "fused")
+
+    def test_fused_active_applicant_drives_row_and_recovery_audit(self):
+        recovered_name = "Miraul Miraquell"
+        rapid_name = evidence(
+            "applicant_name",
+            recovered_name,
+            applicant=recovered_name,
+        )
+        primary = resolved_case(
+            unknown={"applicant_name"},
+            active=None,
+        )
+        fused = resolved_case(
+            values={"applicant_name": recovered_name},
+            considered={"applicant_name": (rapid_name,)},
+            active=recovered_name,
+        )
+        primary_row = row(applicant_name="unknown")
+        fused_row = row(applicant_name=recovered_name)
+        recovery, _renderer, linker, resolver, adjudicator, _factory = processor(
+            primary,
+            resolved_case(),
+            primary_outcome=outcome(primary_row),
+            primary_active=None,
+            rapid_candidates=(rapid_name,),
+            fusion_enabled=True,
+            fused_resolved=fused,
+            fused_active=recovered_name,
+            fused_outcome=outcome(fused_row),
+        )
+
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(audited.row.applicant_name, recovered_name)
+        self.assertEqual(
+            audited.row.applicant_name,
+            adjudicator.inputs[-1].active_applicant,
+        )
+        self.assertIs(adjudicator.inputs[-1], fused)
+        self.assertEqual(linker.inputs[-1][-1], rapid_name)
+        self.assertEqual(resolver.inputs[-1].active_applicant, recovered_name)
+        applicant_audit = audited.audit.field("applicant_name")
+        self.assertEqual(
+            applicant_audit.serialization_after_origin,
+            SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+        )
+        self.assertIs(applicant_audit.winning_evidence, rapid_name)
+
+    def test_legacy_mode_still_exercises_output_only_repair_path(self):
+        intake = evidence(
+            "applicant_name",
+            APPLICANT,
+            evidence_type=EvidenceType.INTAKE_FORM,
+            confidence=0.84,
+        )
+        biometric = evidence(
+            "applicant_name",
+            "Zed Zornax",
+            evidence_type=EvidenceType.BIOMETRIC_SLIP,
+            confidence=0.95,
+            applicant="Zed Zornax",
+        )
+        primary = resolved_case(unknown={"applicant_name"})
+        recovery, _renderer, _linker, resolver, adjudicator, factory = processor(
+            primary,
+            resolved_case(),
+            primary_outcome=outcome(row(applicant_name=APPLICANT)),
+            primary_candidates=(intake, biometric),
+            fusion_enabled=False,
+        )
+
+        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(result.applicant_name, "Zed Zornax")
+        self.assertEqual(resolver.calls, 1)
+        self.assertEqual(adjudicator.calls, 1)
+        self.assertEqual(factory.calls, 0)
+
+    def test_fusion_keeps_higher_authority_primary_value(self):
+        primary_name = evidence(
+            "applicant_name",
+            APPLICANT,
+            evidence_type=EvidenceType.INTAKE_FORM,
+            route_id="primary_visible",
+        )
+        primary_fee = evidence(
+            "fee_status",
+            "paid",
+            evidence_type=EvidenceType.INTAKE_FORM,
+            confidence=0.70,
+            route_id="primary_visible",
+        )
+        lower_rapid_fee = evidence(
+            "fee_status",
+            "unpaid",
+            evidence_type=EvidenceType.REGISTRY_EXTRACT,
+            confidence=0.99,
+            page=1,
+        )
+        recovered_species = evidence(
+            "species_code",
+            "ARCTURIAN",
+            evidence_type=EvidenceType.BIOMETRIC_SLIP,
+            page=2,
+        )
+        recovery, adjudicator, factory = self.production_shape_processor(
+            (primary_name, primary_fee),
+            (lower_rapid_fee, recovered_species),
+        )
+
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(audited.row.fee_status, "paid")
+        self.assertEqual(audited.row.species_code, "ARCTURIAN")
+        self.assertEqual(len(adjudicator.inputs), 2)
+        fused_fee = adjudicator.inputs[-1].fields["fee_status"]
+        self.assertEqual(fused_fee.state, FieldState.RESOLVED)
+        self.assertEqual(fused_fee.value, "paid")
+        self.assertIs(fused_fee.winning_evidence, primary_fee)
+        self.assertGreater(
+            fused_fee.fusion_trace.safety_count(
+                "lower_authority_ignored_count"
+            ),
+            0,
+        )
+        self.assertEqual(factory.calls, 1)
+
+    def test_correlated_primary_and_rapid_view_does_not_double_vote(self):
+        primary_name = evidence(
+            "applicant_name",
+            APPLICANT,
+            evidence_type=EvidenceType.INTAKE_FORM,
+            route_id="primary_visible",
+        )
+        primary_paid = evidence(
+            "fee_status",
+            "paid",
+            evidence_type=EvidenceType.INTAKE_FORM,
+            route_id="primary_visible",
+        )
+        correlated_rapid_paid = evidence(
+            "fee_status",
+            "paid",
+            evidence_type=EvidenceType.INTAKE_FORM,
+            confidence=0.99,
+        )
+        independent_unpaid = evidence(
+            "fee_status",
+            "unpaid",
+            evidence_type=EvidenceType.INTAKE_FORM,
+            page=1,
+        )
+        recovered_species = evidence(
+            "species_code",
+            "ARCTURIAN",
+            evidence_type=EvidenceType.BIOMETRIC_SLIP,
+            page=2,
+        )
+        recovery, adjudicator, _factory = self.production_shape_processor(
+            (primary_name, primary_paid),
+            (
+                correlated_rapid_paid,
+                independent_unpaid,
+                recovered_species,
+            ),
+        )
+
+        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+
+        fused_fee = adjudicator.inputs[-1].fields["fee_status"]
+        self.assertEqual(fused_fee.state, FieldState.CONTESTED)
+        self.assertIsNone(fused_fee.value)
+        self.assertEqual(fused_fee.fusion_trace.observation_count, 2)
+        self.assertEqual(
+            fused_fee.fusion_trace.correlated_candidate_count,
+            1,
+        )
+        self.assertEqual(
+            fused_fee.fusion_trace.independent_evidence_count,
+            2,
+        )
+        # The schema fallback is not promoted to fused evidence.
+        self.assertEqual(result.fee_status, "paid")
+
+    def test_weak_rapid_decision_and_policy_marker_are_not_fused(self):
+        primary_name = evidence(
+            "applicant_name",
+            APPLICANT,
+            evidence_type=EvidenceType.INTAKE_FORM,
+            route_id="primary_visible",
+        )
+        weak_approval = evidence(
+            "adjudication",
+            "APPROVED",
+            evidence_type=EvidenceType.SIGNED_MANUAL_NOTE,
+            confidence=0.30,
+        )
+        unaudited_waiver = evidence(
+            "hardship_waiver",
+            "true",
+            evidence_type=EvidenceType.SIGNED_MANUAL_NOTE,
+            confidence=0.99,
+        )
+        recovered_species = evidence(
+            "species_code",
+            "ARCTURIAN",
+            evidence_type=EvidenceType.BIOMETRIC_SLIP,
+            page=2,
+        )
+        recovery, adjudicator, _factory = self.production_shape_processor(
+            (primary_name,),
+            (weak_approval, unaudited_waiver, recovered_species),
+        )
+
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(audited.row.adjudication, "NEEDS_REVIEW")
+        self.assertEqual(audited.row.species_code, "ARCTURIAN")
+        fused = adjudicator.inputs[-1]
+        self.assertEqual(
+            fused.fields["adjudication"].state,
+            FieldState.UNKNOWN,
+        )
+        self.assertEqual(
+            fused.fields["hardship_waiver"].state,
+            FieldState.UNKNOWN,
+        )
+        self.assertEqual(
+            audited.audit.field(
+                "species_code"
+            ).serialization_after_origin,
+            SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+        )
+
+    def test_late_biohazard_recovery_preserves_new_policy_review(
+        self,
+    ):
+        required_gaps = (
+            "required_output_unknown:home_world",
+            "required_output_unknown:risk_flags",
+            "required_output_unknown:sponsor_id",
+        )
+        primary_policy = outcome(
+            row(confidence=0.23),
+            review_reasons=required_gaps,
+        )
+        recovered_policy = outcome(
+            row(confidence=0.34),
+            review_reasons=("fee_status_unknown",),
+        )
+        recovered_biohazard = evidence(
+            "biohazard_check",
+            "clean",
+            evidence_type=EvidenceType.BIOMETRIC_SLIP,
+        )
+        primary = resolved_case()
+        fused = with_resolved_fields(
+            resolved_case(),
+            biohazard_check=recovered_biohazard,
+        )
+
+        class PolicyByResolvedBiohazard:
+            def adjudicate_case(self, resolved):
+                biohazard = resolved.fields.get("biohazard_check")
+                if (
+                    biohazard is not None
+                    and biohazard.state is FieldState.RESOLVED
+                    and biohazard.value == "clean"
+                ):
+                    return recovered_policy
+                return primary_policy
+
+        renderer = FakeRenderer()
+        primary_candidates = ("primary",)
+        linker = FakeLinker(primary_candidates=primary_candidates)
+        resolver = FakeResolver(
+            primary,
+            resolved_case(),
+            fused=fused,
+            fusion_enabled=True,
+        )
+        factory = FakeRapidFactory((recovered_biohazard,))
+        recovery = RapidOutputRecoveryProcessor(
+            renderer=renderer,
+            primary_extractor=FakeExtractor(primary_candidates),
+            linker=linker,
+            resolver=resolver,
+            adjudicator=ReviewDenialRecoveryAdjudicator(
+                PolicyByResolvedBiohazard()
+            ),
+            rapid_extractor_factory=factory,
+        )
+
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(audited.row.adjudication, "NEEDS_REVIEW")
+        self.assertEqual(audited.row.confidence, 0.34)
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "contradicted_synthetic_reason_removed_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "late_biohazard_evidence_preserved_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "review_confidence_restored_count"
+            ],
+            0,
+        )
+        self.assertEqual(
+            audited.confidence_context.recovery_route,
+            "late_visible",
+        )
+        self.assertEqual(factory.calls, 1)
+
+    def test_late_signed_authority_is_absolute_over_complete_normal_denial(
+        self,
+    ):
+        signed_approval = evidence(
+            "adjudication",
+            "APPROVED",
+            evidence_type=EvidenceType.SIGNED_MANUAL_NOTE,
+            confidence=0.95,
+        )
+        primary = resolved_case()
+        fused = with_resolved_fields(
+            resolved_case(),
+            adjudication=signed_approval,
+        )
+        primary_candidates = ("primary",)
+        factory = FakeRapidFactory((signed_approval,))
+
+        class PolicyBySignedAuthority:
+            def adjudicate_case(self, resolved):
+                adjudication = resolved.fields.get("adjudication")
+                if (
+                    adjudication is not None
+                    and adjudication.state is FieldState.RESOLVED
+                    and adjudication.value == "APPROVED"
+                ):
+                    return outcome(
+                        row(
+                            adjudication="APPROVED",
+                            confidence=0.93,
+                        ),
+                        approval_facts=(
+                            "authoritative_visible_decision",
+                        ),
+                        authoritative_source=True,
+                    )
+                return outcome(
+                    row(adjudication="DENIED", confidence=0.61),
+                    denial_reasons=("ordinary_policy_denial",),
+                )
+
+        recovery = RapidOutputRecoveryProcessor(
+            renderer=FakeRenderer(),
+            primary_extractor=FakeExtractor(primary_candidates),
+            linker=FakeLinker(primary_candidates=primary_candidates),
+            resolver=FakeResolver(
+                primary,
+                resolved_case(),
+                fused=fused,
+                fusion_enabled=True,
+            ),
+            adjudicator=ReviewDenialRecoveryAdjudicator(
+                PolicyBySignedAuthority()
+            ),
+            rapid_extractor_factory=factory,
+        )
+
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(audited.row.adjudication, "APPROVED")
+        self.assertEqual(audited.row.confidence, 0.93)
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "signed_late_authority_recovery_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "late_adjudication_evidence_preserved_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts["normal_policy_rerun_count"],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts["forced_approval_count"],
+            0,
+        )
+
+    def test_policy_probe_without_accepted_change_has_zero_audit_counts(self):
+        primary = resolved_case()
+        recovery, *_rest = processor(
+            primary,
+            primary,
+            fusion_enabled=True,
+            fused_resolved=primary,
+            rapid_candidates=(),
+        )
+
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertTrue(audited.policy_audit_counts)
+        self.assertEqual(
+            sum(audited.policy_audit_counts.values()),
+            0,
+        )
+
+
 class RapidOutputRecoveryTests(unittest.TestCase):
     def test_repairs_only_applicant_from_stronger_exact_case_biometric_value(self):
         intake_name = APPLICANT
@@ -384,12 +1030,15 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 intake_name,
                 evidence_type=EvidenceType.INTAKE_FORM,
                 confidence=0.84,
+                route_id="primary_visible_ocr",
             ),
             evidence(
                 "applicant_name",
                 biometric_name,
                 evidence_type=EvidenceType.BIOMETRIC_SLIP,
                 confidence=0.91,
+                applicant=biometric_name,
+                route_id="primary_visible_ocr",
             ),
         )
         primary = resolved_case(unknown={"applicant_name"})
@@ -406,7 +1055,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary_candidates=candidates,
         )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
         expected = primary_row.to_dict()
         expected["applicant_name"] = biometric_name
@@ -416,6 +1066,17 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(resolver.calls, 1)
         self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(factory.calls, 0)
+        applicant_audit = audited.audit.field("applicant_name")
+        self.assertEqual(
+            applicant_audit.serialization_after_origin,
+            SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+        )
+        self.assertEqual(applicant_audit.final_evidence_value, biometric_name)
+        self.assertIs(applicant_audit.winning_evidence, candidates[1])
+        self.assertEqual(
+            audited.confidence_context.recovery_route,
+            "primary",
+        )
 
     def test_biometric_applicant_repair_abstains_on_every_scope_ambiguity(self):
         intake = evidence(
@@ -429,6 +1090,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             "Zed Zornax",
             evidence_type=EvidenceType.BIOMETRIC_SLIP,
             confidence=0.91,
+            applicant="Zed Zornax",
         )
         variants = {
             "biometric_below_minimum": (
@@ -648,7 +1310,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary_candidates=candidates,
         )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
         expected = primary_row.to_dict()
         expected.update(
@@ -664,6 +1327,124 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(resolver.calls, 1)
         self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(factory.calls, 0)
+        expected_winners = {
+            "visa_class": sponsor_visa,
+            "sponsor_id": sponsor_sponsor,
+            "arrival_date": registry_arrival,
+        }
+        for field_name, winner in expected_winners.items():
+            with self.subTest(audit_field=field_name):
+                field_audit = audited.audit.field(field_name)
+                self.assertEqual(
+                    field_audit.serialization_after_origin,
+                    SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+                )
+                self.assertIs(field_audit.winning_evidence, winner)
+
+    def test_primary_visible_repair_excludes_stale_pre_repair_fusion_trace(
+        self,
+    ):
+        intake_visa = evidence(
+            "visa_class",
+            "TRANSIT-7",
+            evidence_type=EvidenceType.INTAKE_FORM,
+            confidence=0.82,
+            route_id="primary_visible_ocr",
+        )
+        sponsor_visa = evidence(
+            "visa_class",
+            "XW-1",
+            evidence_type=EvidenceType.SPONSOR_ATTESTATION,
+            confidence=0.94,
+            cues=("structured_sponsor_narrative",),
+            route_id="primary_visible_ocr",
+        )
+        primary = resolved_case(
+            values={"visa_class": "TRANSIT-7"},
+            considered={"visa_class": (intake_visa, sponsor_visa)},
+            fusion_traces={
+                "visa_class": fusion_trace(
+                    disagreement_ratio=0.75,
+                    entropy_bits=1.0,
+                )
+            },
+        )
+        primary_row = row(
+            visa_class="TRANSIT-7",
+            adjudication="DENIED",
+            confidence=0.61,
+        )
+        recovery, *_components = processor(
+            primary,
+            resolved_case(),
+            primary_outcome=outcome(primary_row),
+            primary_candidates=(intake_visa, sponsor_visa),
+        )
+
+        final = recovery.process_case_with_confidence_context(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(final.row.visa_class, "XW-1")
+        self.assertEqual(final.context.recovery_route, "primary")
+        self.assertEqual(final.context.ocr_disagreement, 0.0)
+        self.assertEqual(final.context.resolution_entropy, 0.0)
+        self.assertTrue(final.context.has_conflict)
+
+    def test_primary_visible_repair_selects_route_that_produced_candidate_box(self):
+        candidate_box = Rect(1, 2, 3, 4)
+        unrelated_box = Rect(20, 30, 40, 50)
+        candidate = CandidateEvidence(
+            field_name="visa_class",
+            value="XW-1",
+            evidence_type=EvidenceType.SPONSOR_ATTESTATION,
+            page_index=1,
+            box=candidate_box,
+            legible=True,
+            superseded=False,
+            ocr_confidence=0.94,
+            source="visible_ocr",
+            case_id_hint=CASE_ID,
+            applicant_hint=APPLICANT,
+            ocr_provenance=(
+                make_ocr_provenance(
+                    source_sha256=SOURCE_SHA256,
+                    page_index=1,
+                    view_box=unrelated_box,
+                    applicant_scope=APPLICANT,
+                    route_id="a_supporting_route",
+                    engine_id="test:ocr",
+                    view_id="supporting_view",
+                ),
+                make_ocr_provenance(
+                    source_sha256=SOURCE_SHA256,
+                    page_index=1,
+                    view_box=candidate_box,
+                    applicant_scope=APPLICANT,
+                    route_id="z_candidate_route",
+                    engine_id="test:ocr",
+                    view_id="cropped_view",
+                    transform=CoordinateTransform.crop_translation(
+                        left=100,
+                        upper=200,
+                    ),
+                ),
+            ),
+        )
+
+        audit = RapidOutputRecoveryProcessor._primary_visible_repair_audit(
+            field_name="visa_class",
+            candidate=candidate,
+            source_sha256=SOURCE_SHA256,
+            serialization_before="TRANSIT-7",
+            serialization_after="XW-1",
+            primary_resolved=resolved_case(
+                values={"visa_class": "TRANSIT-7"},
+            ),
+        )
+
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit.recovery_source, "z_candidate_route")
 
     def test_source_priority_repairs_abstain_on_scope_and_conflicts(self):
         intake = evidence(
@@ -766,6 +1547,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(factory.calls, 0)
 
     def test_overlays_only_unknown_values_and_preserves_existing_priors(self):
+        recovered_species = evidence("species_code", "ARCTURIAN")
         primary = resolved_case(
             values={"fee_status": "unknown"},
             unknown={"species_code", "home_world"},
@@ -776,6 +1558,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 "fee_status": "paid",
             },
             unknown={"home_world"},
+            considered={"species_code": (recovered_species,)},
         )
         primary_row = row(
             species_code="TRIANGULAN",
@@ -788,6 +1571,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary,
             rapid,
             primary_outcome=outcome(primary_row),
+            rapid_candidates=(recovered_species,),
         )
 
         result = recovery.process_case(Path(CASE_ID + ".pdf"))
@@ -802,9 +1586,17 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(factory.calls, 1)
 
-    def test_rapid_literal_unknown_preserves_primary_fee_prior(self):
+    def test_visible_rapid_literal_unknown_replaces_primary_fee_default(self):
+        visible_unknown = evidence(
+            "fee_status",
+            "unknown",
+            applicant=None,
+        )
         primary = resolved_case(unknown={"fee_status"})
-        rapid = resolved_case(values={"fee_status": "unknown"})
+        rapid = resolved_case(
+            values={"fee_status": "unknown"},
+            considered={"fee_status": (visible_unknown,)},
+        )
         primary_row = row(
             fee_status="paid",
             adjudication="NEEDS_REVIEW",
@@ -814,17 +1606,96 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary,
             rapid,
             primary_outcome=outcome(primary_row),
+            rapid_candidates=(visible_unknown,),
         )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
-        self.assertEqual(result.fee_status, "paid")
+        self.assertEqual(result.fee_status, "unknown")
         self.assertEqual(result.adjudication, "NEEDS_REVIEW")
         self.assertEqual(result.confidence, 0.37)
+        fee_audit = audited.audit.field("fee_status")
+        self.assertEqual(fee_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(
+            fee_audit.serialization_before_origin,
+            SerializationOrigin.OUTPUT_DEFAULT,
+        )
+        self.assertEqual(
+            fee_audit.serialization_after_origin,
+            SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+        )
+        self.assertEqual(fee_audit.final_evidence_value, "unknown")
+        self.assertEqual(
+            fee_audit.ocr_provenance,
+            visible_unknown.ocr_provenance,
+        )
+        self.assertEqual(
+            audited.confidence_context.recovery_route,
+            "rapid_visible",
+        )
+
+    def test_non_applicant_recovery_cannot_switch_active_applicant_scope(self):
+        foreign_species = evidence(
+            "species_code",
+            "ARCTURIAN",
+            applicant="Other Applicant",
+        )
+        primary = resolved_case(unknown={"species_code"})
+        rapid = resolved_case(
+            values={"species_code": "ARCTURIAN"},
+            considered={"species_code": (foreign_species,)},
+            active="Other Applicant",
+        )
+        primary_row = row(species_code="TRIANGULAN")
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            primary_outcome=outcome(primary_row),
+            rapid_active="Other Applicant",
+            rapid_candidates=(foreign_species,),
+        )
+
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(audited.row.species_code, "TRIANGULAN")
+        species_audit = audited.audit.field("species_code")
+        self.assertEqual(species_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(species_audit.final_evidence_state, FieldState.UNKNOWN)
+        self.assertTrue(species_audit.after_is_output_default)
+        self.assertIsNone(species_audit.recovery_source)
+
+    def test_missing_rapid_winner_keeps_default_explicit_in_audit(self):
+        primary = resolved_case(unknown={"fee_status"})
+        rapid = resolved_case(values={"fee_status": "unknown"})
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            primary_outcome=outcome(row(fee_status="paid")),
+        )
+
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+
+        self.assertEqual(audited.row.fee_status, "paid")
+        fee_audit = audited.audit.field("fee_status")
+        self.assertEqual(fee_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(fee_audit.final_evidence_state, FieldState.UNKNOWN)
+        self.assertIsNone(fee_audit.recovery_source)
+        self.assertTrue(fee_audit.before_is_output_default)
+        self.assertTrue(fee_audit.after_is_output_default)
 
     def test_recovers_rapid_active_applicant_when_primary_is_absent(self):
+        recovered_applicant = evidence(
+            "applicant_name",
+            "Miraul Miraquell",
+            applicant="Miraul Miraquell",
+        )
         primary = resolved_case(unknown={"applicant_name"}, active=None)
-        rapid = resolved_case(values={"applicant_name": "Miraul Miraquell"})
+        rapid = resolved_case(
+            values={"applicant_name": "Miraul Miraquell"},
+            considered={"applicant_name": (recovered_applicant,)},
+            active="Miraul Miraquell",
+        )
         primary_row = row(applicant_name="unknown")
         recovery, *_rest = processor(
             primary,
@@ -832,6 +1703,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             primary_outcome=outcome(primary_row),
             primary_active=None,
             rapid_active="Miraul Miraquell",
+            rapid_candidates=(recovered_applicant,),
         )
 
         result = recovery.process_case(Path(CASE_ID + ".pdf"))
@@ -840,12 +1712,24 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
     def test_non_none_risk_recovers_only_when_primary_risk_is_unknown(self):
         anchor = evidence("risk_flags", None, applicant=None)
+        visible_warrant = evidence(
+            "risk_flags",
+            "active_warrant",
+            applicant=None,
+        )
         primary = resolved_case(
             unknown={"risk_flags"},
             considered={"risk_flags": (anchor,)},
         )
-        rapid = resolved_case(values={"risk_flags": "active_warrant"})
-        recovery, *_rest = processor(primary, rapid)
+        rapid = resolved_case(
+            values={"risk_flags": "active_warrant"},
+            considered={"risk_flags": (visible_warrant,)},
+        )
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            rapid_candidates=(visible_warrant,),
+        )
 
         recovered = recovery.process_case(Path(CASE_ID + ".pdf"))
 
@@ -864,18 +1748,33 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
         self.assertEqual(protected_row.risk_flags, "none")
 
-    def test_rapid_none_does_not_fill_an_unknown_risk(self):
+    def test_visible_rapid_none_fills_unknown_risk_as_explicit_evidence(self):
         anchor = evidence("risk_flags", None, applicant=None)
+        visible_none = evidence("risk_flags", "none", applicant=None)
         primary = resolved_case(
             unknown={"risk_flags"},
             considered={"risk_flags": (anchor,)},
         )
-        rapid = resolved_case(values={"risk_flags": "none"})
-        recovery, *_rest = processor(primary, rapid)
+        rapid = resolved_case(
+            values={"risk_flags": "none"},
+            considered={"risk_flags": (visible_none,)},
+        )
+        recovery, *_rest = processor(
+            primary,
+            rapid,
+            rapid_candidates=(visible_none,),
+        )
 
-        result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        audited = recovery.process_case_with_audit(Path(CASE_ID + ".pdf"))
+        result = audited.row
 
         self.assertEqual(result.risk_flags, "none")
+        risk_audit = audited.audit.field("risk_flags")
+        self.assertEqual(risk_audit.primary_state, FieldState.UNKNOWN)
+        self.assertEqual(risk_audit.final_evidence_state, FieldState.RESOLVED)
+        self.assertEqual(risk_audit.final_evidence_value, "none")
+        self.assertTrue(risk_audit.before_is_output_default)
+        self.assertTrue(risk_audit.after_is_explicit_visible_value)
 
     def test_semantic_head_denies_each_visible_disqualifying_rapid_risk(self):
         for risk_flag in (
@@ -1216,6 +2115,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             "Zed Zornax",
             evidence_type=EvidenceType.BIOMETRIC_SLIP,
             confidence=0.91,
+            applicant="Zed Zornax",
         )
         risk_anchor = evidence("risk_flags", None, applicant=None)
         rapid_risk = evidence(
@@ -1273,26 +2173,33 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(result.adjudication, "DENIED")
         self.assertEqual(result.confidence, 0.37)
 
-    def test_xw1_multisource_recovery_accepts_only_the_two_audited_fee_shapes(self):
+    def test_xw1_multisource_recovery_requires_visible_none_risk(self):
         required_facts = (
             "application_date_current_or_exempt",
             "sponsor_present_and_not_publicly_barred",
         )
+        visible_none = evidence("risk_flags", "none", applicant=None)
         variants = {
-            "paid_with_only_unknown_risk": {
+            "paid_with_only_serialized_default_risk_abstains": {
                 "fee_status": "paid",
                 "unknown": {"risk_flags"},
+                "considered": {},
                 "review_reasons": (
                     "required_output_unknown:risk_flags",
                     "risk_flags_unknown",
                 ),
                 "approval_facts": (*required_facts, "fee_paid"),
+                "expected_adjudication": "NEEDS_REVIEW",
+                "expected_confidence": 0.25,
             },
-            "unsupported_waiver_only": {
+            "unsupported_waiver_with_visible_none_risk": {
                 "fee_status": "waived",
                 "unknown": set(),
+                "considered": {"risk_flags": (visible_none,)},
                 "review_reasons": ("unsupported_fee_waiver",),
                 "approval_facts": required_facts,
+                "expected_adjudication": "NEEDS_REVIEW",
+                "expected_confidence": 0.25,
             },
         }
 
@@ -1309,6 +2216,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                         "fee_status": values["fee_status"],
                     },
                     unknown=values["unknown"],
+                    considered=values["considered"],
                 )
                 recovery, _renderer, _linker, _resolver, _adjudicator, factory = (
                     processor(
@@ -1319,7 +2227,10 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                             review_reasons=values["review_reasons"],
                             approval_facts=values["approval_facts"],
                         ),
-                        primary_candidates=xw1_multisource_candidates(),
+                        primary_candidates=(
+                            *xw1_multisource_candidates(),
+                            *((visible_none,) if values["considered"] else ()),
+                        ),
                     )
                 )
 
@@ -1328,10 +2239,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 expected = primary_row.to_dict()
                 expected.update(
                     {
-                        "adjudication": "APPROVED",
-                        "confidence": (
-                            XW1_MULTISOURCE_REVIEW_APPROVAL_CONFIDENCE
-                        ),
+                        "adjudication": values["expected_adjudication"],
+                        "confidence": values["expected_confidence"],
                     }
                 )
                 self.assertEqual(result.to_dict(), expected)
@@ -1573,6 +2482,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(rapid_result.confidence, 0.25)
 
     def test_frozen_review_approval_head_matches_each_early_return_branch(self):
+        visible_none = evidence("risk_flags", "none", applicant=None)
         six_applicant_candidates = tuple(
             evidence("applicant_name", APPLICANT, page=page)
             for page in range(6)
@@ -1603,27 +2513,25 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 primary_row = values["prediction"]
                 recovery, _renderer, _linker, _resolver, _adjudicator, factory = (
                     processor(
-                        resolved_case(),
+                        resolved_case(
+                            considered={"risk_flags": (visible_none,)},
+                        ),
                         resolved_case(),
                         primary_outcome=outcome(
                             primary_row,
                             review_reasons=values["review_reasons"],
                             approval_facts=values["approval_facts"],
                         ),
-                        primary_candidates=values["candidates"],
+                        primary_candidates=(
+                            *values["candidates"],
+                            visible_none,
+                        ),
                     )
                 )
 
                 result = recovery.process_case(Path(CASE_ID + ".pdf"))
 
-                expected = primary_row.to_dict()
-                expected.update(
-                    {
-                        "adjudication": "APPROVED",
-                        "confidence": REVIEW_APPROVAL_CONFIDENCE,
-                    }
-                )
-                self.assertEqual(result.to_dict(), expected)
+                self.assertEqual(result, primary_row)
                 self.assertEqual(factory.calls, 0)
 
     def test_review_approval_head_enforces_strict_boundaries_and_common_guards(self):
@@ -1659,6 +2567,18 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 "review_reasons": ("required_sponsor_unknown",),
                 "approval_facts": ("no_visible_biohazard_risk",),
             },
+            "serialized_sponsor_default_abstains": {
+                "prediction": row(sponsor_id="SPN-0000"),
+                "candidates": six_applicant_candidates,
+                "review_reasons": ("required_sponsor_unknown",),
+                "approval_facts": (),
+            },
+            "serialized_arrival_default_abstains": {
+                "prediction": row(arrival_date="1900-01-01"),
+                "candidates": six_applicant_candidates,
+                "review_reasons": ("arrival_date_unknown",),
+                "approval_facts": (),
+            },
             "risk_must_normalize_to_none": {
                 "prediction": row(risk_flags="illegible_biometrics"),
                 "candidates": six_applicant_candidates,
@@ -1692,41 +2612,51 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 self.assertEqual(result, primary_row)
 
         normalized_risk_row = row(risk_flags="NoNe")
+        visible_none = evidence("risk_flags", "none", applicant=None)
         recovery, *_rest = processor(
-            resolved_case(),
+            resolved_case(considered={"risk_flags": (visible_none,)}),
             resolved_case(),
             primary_outcome=outcome(normalized_risk_row),
-            primary_candidates=six_applicant_candidates,
+            primary_candidates=(*six_applicant_candidates, visible_none),
         )
 
         normalized_risk = recovery.process_case(Path(CASE_ID + ".pdf"))
 
-        self.assertEqual(normalized_risk.adjudication, "APPROVED")
+        self.assertEqual(normalized_risk.adjudication, "NEEDS_REVIEW")
         self.assertEqual(
             normalized_risk.confidence,
-            REVIEW_APPROVAL_CONFIDENCE,
+            normalized_risk_row.confidence,
         )
 
     def test_review_approval_head_runs_after_rapid_output_recovery(self):
+        visible_none = evidence("risk_flags", "none", applicant=None)
+        recovered_species = evidence("species_code", "ARCTURIAN")
         six_applicant_candidates = tuple(
             evidence("applicant_name", APPLICANT, page=page)
             for page in range(6)
         )
-        primary = resolved_case(unknown={"species_code"})
-        rapid = resolved_case(values={"species_code": "ARCTURIAN"})
+        primary = resolved_case(
+            unknown={"species_code"},
+            considered={"risk_flags": (visible_none,)},
+        )
+        rapid = resolved_case(
+            values={"species_code": "ARCTURIAN"},
+            considered={"species_code": (recovered_species,)},
+        )
         recovery, _renderer, _linker, _resolver, _adjudicator, factory = (
             processor(
                 primary,
                 rapid,
-                primary_candidates=six_applicant_candidates,
+                primary_candidates=(*six_applicant_candidates, visible_none),
+                rapid_candidates=(recovered_species,),
             )
         )
 
         result = recovery.process_case(Path(CASE_ID + ".pdf"))
 
         self.assertEqual(result.species_code, "ARCTURIAN")
-        self.assertEqual(result.adjudication, "APPROVED")
-        self.assertEqual(result.confidence, REVIEW_APPROVAL_CONFIDENCE)
+        self.assertEqual(result.adjudication, "NEEDS_REVIEW")
+        self.assertEqual(result.confidence, 0.37)
         self.assertEqual(factory.calls, 1)
 
     def test_review_approval_head_preserves_authority_and_denial_precedence(self):
@@ -1889,6 +2819,104 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
         self.assertEqual(factory.calls, 1)
         self.assertEqual(factory.instances[0].calls, 2)
+
+    def test_nonfusion_context_uses_recovered_trace_not_stale_primary_trace(
+        self,
+    ):
+        recovered_species = evidence(
+            "species_code",
+            "ARCTURIAN",
+        )
+        primary = resolved_case(
+            unknown={"species_code"},
+            fusion_traces={
+                "species_code": fusion_trace(
+                    disagreement_ratio=0.0,
+                    entropy_bits=0.0,
+                )
+            },
+        )
+        rapid = resolved_case(
+            values={"species_code": "ARCTURIAN"},
+            considered={"species_code": (recovered_species,)},
+            fusion_traces={
+                "species_code": fusion_trace(
+                    disagreement_ratio=0.5,
+                    entropy_bits=1.0,
+                )
+            },
+        )
+        recovery, *_components = processor(
+            primary,
+            rapid,
+            primary_outcome=outcome(
+                row(
+                    species_code="TRIANGULAN",
+                    adjudication="NEEDS_REVIEW",
+                )
+            ),
+            rapid_candidates=(recovered_species,),
+        )
+
+        final = recovery.process_case_with_confidence_context(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(final.row.species_code, "ARCTURIAN")
+        self.assertEqual(final.context.recovery_route, "rapid_visible")
+        self.assertEqual(final.context.ocr_disagreement, 0.5)
+        self.assertEqual(final.context.resolution_entropy, 1.0)
+        self.assertTrue(final.context.has_conflict)
+
+    def test_contextual_api_uses_the_accepted_visible_audit_state(self):
+        considered = {
+            field_name: (evidence(field_name, value),)
+            for field_name, value in BASE_VALUES.items()
+        }
+        primary = resolved_case(considered=considered)
+        primary_row = row()
+        recovery, *_components = processor(
+            primary,
+            resolved_case(),
+            primary_outcome=outcome(primary_row),
+        )
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+        fusion_observations = []
+        policy_observations = []
+        recovery._fusion_audit_observer = fusion_observations.append
+        recovery._policy_audit_observer = policy_observations.append
+
+        final = recovery.process_case_with_confidence_context(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(final.row, audited.row)
+        self.assertEqual(final.row, primary_row)
+        self.assertEqual(final.context.final_class, "NEEDS_REVIEW")
+        self.assertEqual(final.context.policy_route, "deterministic_policy")
+        self.assertEqual(final.context.recovery_route, "primary")
+        self.assertEqual(final.context.visible_completeness, 1.0)
+        self.assertIsNone(final.context.model_margin)
+        self.assertIsNone(final.context.ensemble_agreement)
+        self.assertEqual(
+            tuple(audited.to_dict()),
+            (
+                "row",
+                "audit",
+                "fusion_audit_counts",
+                "policy_audit_counts",
+            ),
+        )
+        self.assertEqual(
+            fusion_observations,
+            [audited.fusion_audit_counts],
+        )
+        self.assertEqual(
+            policy_observations,
+            [audited.policy_audit_counts],
+        )
 
 
 if __name__ == "__main__":

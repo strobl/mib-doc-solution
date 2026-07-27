@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from .confidence import CalibrationArtifactError
+from .final_confidence import (
+    FinalConfidenceContext,
+    FinalPredictionWithConfidenceContext,
+)
 from .models import PredictionRow
 
 
@@ -79,6 +83,14 @@ class OutputConfidenceArtifactError(CalibrationArtifactError):
 class FinalPredictionProcessor(Protocol):
     def process_case(self, pdf_path: Path) -> PredictionRow | None:
         """Return the final typed row after all output and decision recovery."""
+
+
+class ContextualFinalPredictionProcessor(Protocol):
+    def process_case_with_confidence_context(
+        self,
+        pdf_path: Path,
+    ) -> FinalPredictionWithConfidenceContext:
+        """Return the accepted final row and its identity-free context."""
 
 
 def _contains_sensitive_value(value: Any) -> bool:
@@ -325,7 +337,21 @@ class OutputConfidenceRecalibrator:
     def artifact_id(self) -> str:
         return self._map.artifact_id
 
-    def recalibrate(self, row: PredictionRow) -> PredictionRow:
+    def recalibrate(
+        self,
+        row: PredictionRow,
+        *,
+        context: FinalConfidenceContext | None = None,
+    ) -> PredictionRow:
+        if context is not None:
+            if not isinstance(context, FinalConfidenceContext):
+                raise TypeError(
+                    "output-confidence context must be FinalConfidenceContext"
+                )
+            if context.final_class != row.adjudication:
+                raise ValueError(
+                    "output-confidence context does not match final row"
+                )
         confidence = self._map.predict(row)
         if confidence == row.confidence:
             return row
@@ -340,9 +366,30 @@ class OutputConfidenceRecalibrationProcessor:
     recalibrator: OutputConfidenceRecalibrator
 
     def process_case(self, pdf_path: Path) -> PredictionRow | None:
-        row = self.processor.process_case(pdf_path)
+        contextual_process = getattr(
+            self.processor,
+            "process_case_with_confidence_context",
+            None,
+        )
+        context: FinalConfidenceContext | None = None
+        if callable(contextual_process):
+            contextual_result = contextual_process(pdf_path)
+            if not isinstance(
+                contextual_result,
+                FinalPredictionWithConfidenceContext,
+            ):
+                raise TypeError(
+                    "contextual final processor returned an invalid result"
+                )
+            row = contextual_result.row
+            context = contextual_result.context
+        else:
+            # Compatibility for narrow custom/test processors which predate
+            # WO-19.  The submitted production graph always uses the strict
+            # contextual API.
+            row = self.processor.process_case(pdf_path)
         if row is None:
             return None
         if not isinstance(row, PredictionRow):
             raise TypeError("output-confidence postprocessor requires PredictionRow")
-        return self.recalibrator.recalibrate(row)
+        return self.recalibrator.recalibrate(row, context=context)

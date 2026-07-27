@@ -1,4 +1,5 @@
 import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,10 @@ class CanonicalWriterTests(unittest.TestCase):
             parsed = json.loads(lines[0])
             self.assertEqual(tuple(parsed), FIELD_NAMES)
             self.assertNotIn("ignored_extra", parsed)
+            self.assertEqual(
+                stat.S_IMODE(output.stat().st_mode),
+                0o644,
+            )
 
     def test_writer_sorts_rows_for_byte_determinism(self):
         with tempfile.TemporaryDirectory() as temporary_dir:

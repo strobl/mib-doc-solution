@@ -8,6 +8,7 @@ __pycache__/
 tmp/
 output/
 .env
+/evaluation/program/.program-integrity.lock
 
 # Bulk challenge data is distributed as a versioned zip.
 data/train/

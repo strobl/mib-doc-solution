@@ -6,7 +6,10 @@ import unittest
 from pathlib import Path
 
 from mib_pipeline import (
+    FINAL_CONFIDENCE_CONTEXT_SCHEMA_VERSION,
     FIELD_NAMES,
+    FinalConfidenceContext,
+    FinalPredictionWithConfidenceContext,
     OutputConfidenceArtifactError,
     OutputConfidenceRecalibrationProcessor,
     OutputConfidenceRecalibrator,
@@ -46,6 +49,37 @@ class FakeFinalProcessor:
     def process_case(self, pdf_path):
         self.seen.append(pdf_path)
         return self.row
+
+
+class FakeContextualFinalProcessor(FakeFinalProcessor):
+    def __init__(self, row, context):
+        super().__init__(row)
+        self.context = context
+
+    def process_case_with_confidence_context(self, pdf_path):
+        self.seen.append(pdf_path)
+        return FinalPredictionWithConfidenceContext(
+            row=self.row,
+            context=self.context,
+        )
+
+
+def final_context(**overrides):
+    values = {
+        "schema_version": FINAL_CONFIDENCE_CONTEXT_SCHEMA_VERSION,
+        "final_class": "NEEDS_REVIEW",
+        "policy_route": "deterministic_policy",
+        "authoritative": False,
+        "visible_completeness": 1.0,
+        "has_conflict": False,
+        "ocr_disagreement": 0.0,
+        "recovery_route": "primary",
+        "model_margin": None,
+        "ensemble_agreement": None,
+        "resolution_entropy": 0.0,
+    }
+    values.update(overrides)
+    return FinalConfidenceContext(**values)
 
 
 class FrozenOutputConfidenceArtifactTests(unittest.TestCase):
@@ -198,6 +232,44 @@ class OutputConfidenceRecalibratorTests(unittest.TestCase):
             review_processor.process_case(source).confidence,
             final_review.confidence,
         )
+
+    def test_processor_consumes_contextual_final_result_and_only_changes_confidence(self):
+        final_review = prediction(confidence=0.2)
+        inner = FakeContextualFinalProcessor(
+            final_review,
+            final_context(
+                visible_completeness=8 / 9,
+                has_conflict=True,
+                ocr_disagreement=0.2,
+                recovery_route="rapid_visible",
+                resolution_entropy=0.1,
+            ),
+        )
+        processor = OutputConfidenceRecalibrationProcessor(
+            processor=inner,
+            recalibrator=self.recalibrator,
+        )
+
+        recalibrated = processor.process_case(Path("MIB-000001.pdf"))
+
+        self.assertEqual(inner.seen, [Path("MIB-000001.pdf")])
+        self.assertNotEqual(recalibrated.confidence, final_review.confidence)
+        before = final_review.to_dict()
+        after = recalibrated.to_dict()
+        self.assertEqual(
+            {name: value for name, value in before.items() if name != "confidence"},
+            {name: value for name, value in after.items() if name != "confidence"},
+        )
+
+    def test_context_class_mismatch_fails_before_recalibration(self):
+        final_review = prediction(confidence=0.2)
+        mismatched = final_context(final_class="DENIED")
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.recalibrator.recalibrate(
+                final_review,
+                context=mismatched,
+            )
 
 
 if __name__ == "__main__":

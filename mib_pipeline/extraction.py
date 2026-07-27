@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from enum import Enum
 from pathlib import Path
@@ -19,6 +19,12 @@ from typing import Any, Iterable, Protocol
 
 from .ingestion import Rect, RenderedCase, RenderedPage
 from .models import ADJUDICATION_VALUES, CASE_ID_PATTERN, FEE_VALUES, SPONSOR_ID_PATTERN
+from .provenance import (
+    CoordinateTransform,
+    OcrProvenance,
+    make_ocr_provenance,
+    merge_ocr_provenance,
+)
 
 
 class RecoverableOcrError(RuntimeError):
@@ -70,6 +76,43 @@ class CandidateEvidence:
     source: str = "visible_ocr"
     case_id_hint: str | None = None
     applicant_hint: str | None = None
+    ocr_provenance: tuple[OcrProvenance, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.ocr_provenance:
+            page_indices = {
+                item.observation.page_index
+                for item in self.ocr_provenance
+            }
+            if page_indices != {self.page_index}:
+                raise ValueError(
+                    "OCR provenance must refer to the candidate page"
+                )
+            source_digests = {
+                item.observation.source_sha256
+                for item in self.ocr_provenance
+            }
+            if len(source_digests) != 1:
+                raise ValueError(
+                    "OCR provenance cannot mix source documents"
+                )
+            applicant_scopes = {
+                item.observation.applicant_scope
+                for item in self.ocr_provenance
+                if item.observation.applicant_scope is not None
+            }
+            if (
+                self.applicant_hint is not None
+                and applicant_scopes - {self.applicant_hint}
+            ):
+                raise ValueError(
+                    "OCR provenance applicant scope must match the candidate"
+                )
+            object.__setattr__(
+                self,
+                "ocr_provenance",
+                merge_ocr_provenance(self.ocr_provenance),
+            )
 
 
 # Packet topology is policy-only visible evidence.  Keep the marker field
@@ -77,7 +120,6 @@ class CandidateEvidence:
 # conflict in the resolver.
 PAGE_TYPE_MARKER_FIELDS = {
     "fee_receipt": "page_type_present_fee_receipt",
-    "other": "page_type_present_other",
     "sponsor_attestation": "page_type_present_sponsor_attestation",
 }
 
@@ -110,6 +152,16 @@ class TesseractOcrEngine:
         self._language = language
         self._psm = page_segmentation_mode
         self._timeout_seconds = timeout_seconds
+
+    @property
+    def provenance_id(self) -> str:
+        """Stable configuration identity without executable or process state."""
+
+        binary_name = Path(self._binary).name
+        return (
+            f"tesseract:binary={binary_name}:oem1:"
+            f"psm{self._psm}:lang={self._language}"
+        )
 
     @staticmethod
     def _parse_tsv(tsv_text: str, page_index: int) -> tuple[OcrToken, ...]:
@@ -213,6 +265,16 @@ class TesseractOcrEngine:
             completed.stdout.decode("utf-8", errors="replace"),
             page.index,
         )
+
+
+def stable_ocr_engine_id(engine: Any) -> str:
+    """Return a deterministic engine identity and never an object ``repr``."""
+
+    declared = getattr(engine, "provenance_id", None)
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip()
+    engine_type = type(engine)
+    return f"{engine_type.__module__}.{engine_type.__qualname__}"
 
 
 def group_ocr_lines(tokens: Iterable[OcrToken]) -> tuple[OcrLine, ...]:
@@ -516,6 +578,17 @@ CONSENSUS_RETRY_FIELDS = (
     "fee_status",
 )
 
+# A sideways page is admitted only after the primary pass found no candidates.
+# Unlike other retry routes, its two rotated OCR views may recover the
+# applicant name and risk flags because an otherwise unreadable orientation
+# cannot provide primary-pass identity or a policy-safe risk state.  The
+# relaxed, candidate-free route below additionally requires every recovered
+# field to carry the exact active case anchor.
+ORIENTATION_RETRY_FIELDS = CONSENSUS_RETRY_FIELDS + (
+    "applicant_name",
+    "risk_flags",
+)
+
 # Applicant names are generated compositionally.  Storing the 12 stems and 12
 # endings is a general OCR language model, not a case/name lookup table.
 APPLICANT_STEMS = (
@@ -625,6 +698,10 @@ class TesseractPsm6RefinementModel:
         self._cache: dict[tuple[int, bytes], tuple[OcrLine, ...]] = {}
         self._inflight: set[tuple[int, bytes]] = set()
         self._cache_condition = threading.Condition()
+
+    @property
+    def provenance_engine_id(self) -> str:
+        return stable_ocr_engine_id(self._ocr)
 
     @staticmethod
     def _page_key(page: RenderedPage) -> tuple[int, bytes]:
@@ -763,6 +840,10 @@ class VisibleEvidenceExtractor:
         risk_flag_retry: bool | None = None,
         risk_flag_ocr_engines: tuple[Any, Any, Any] | None = None,
         packet_page_type_markers: bool = False,
+        ocr_route_id: str = "primary_visible_ocr",
+        ocr_view_id: str = "rendered_page",
+        ocr_coordinate_transform: CoordinateTransform | None = None,
+        ocr_engine_id: str | None = None,
     ) -> None:
         if not 0.0 <= minimum_legible_confidence <= refinement_gate <= 1.0:
             raise ValueError("confidence thresholds must satisfy 0 <= minimum <= gate <= 1")
@@ -837,10 +918,69 @@ class VisibleEvidenceExtractor:
         ):
             raise ValueError("risk flag retry requires exactly three OCR engines")
         self._risk_flag_ocr_engines = risk_flag_ocr_engines
+        if not ocr_route_id.strip() or not ocr_view_id.strip():
+            raise ValueError("OCR route and view identifiers must be non-empty")
+        self._ocr_route_id = ocr_route_id.strip()
+        self._ocr_view_id = ocr_view_id.strip()
+        self._ocr_coordinate_transform = (
+            ocr_coordinate_transform or CoordinateTransform.identity()
+        )
+        self._ocr_engine_id = (
+            ocr_engine_id.strip()
+            if ocr_engine_id is not None and ocr_engine_id.strip()
+            else stable_ocr_engine_id(self._ocr)
+        )
         # Only the production primary extractor needs policy topology.  Keep
         # it opt-in so secondary OCR passes and generic extraction consumers
         # retain their original field-candidate contract.
         self._packet_page_type_markers = packet_page_type_markers
+
+    def _attach_ocr_provenance(
+        self,
+        candidate: CandidateEvidence,
+        rendered_case: RenderedCase,
+        *,
+        route_id: str | None = None,
+        engine: Any | None = None,
+        engine_id: str | None = None,
+        view_id: str | None = None,
+        transform: CoordinateTransform | None = None,
+    ) -> CandidateEvidence:
+        if candidate.source != "visible_ocr":
+            return candidate
+        explicit_route = any(
+            item is not None
+            for item in (route_id, engine, engine_id, view_id, transform)
+        )
+        if any(
+            item.observation.source_sha256 != rendered_case.source_sha256
+            for item in candidate.ocr_provenance
+        ):
+            raise ValueError(
+                "OCR provenance source must match the rendered case"
+            )
+        if candidate.ocr_provenance and not explicit_route:
+            return candidate
+        resolved_engine_id = engine_id
+        if resolved_engine_id is None and engine is not None:
+            resolved_engine_id = stable_ocr_engine_id(engine)
+        provenance = make_ocr_provenance(
+            source_sha256=rendered_case.source_sha256,
+            page_index=candidate.page_index,
+            view_box=candidate.box,
+            applicant_scope=candidate.applicant_hint,
+            route_id=route_id or self._ocr_route_id,
+            engine_id=resolved_engine_id or self._ocr_engine_id,
+            view_id=view_id or self._ocr_view_id,
+            transform=transform or self._ocr_coordinate_transform,
+        )
+        return replace(
+            candidate,
+            ocr_provenance=merge_ocr_provenance(
+                candidate.ocr_provenance,
+                (provenance,),
+            ),
+        )
 
     @staticmethod
     def _page_image(page: RenderedPage) -> Any:
@@ -902,10 +1042,10 @@ class VisibleEvidenceExtractor:
                 marker_box = marker_box.union(line.box)
             confidence = min(line.confidence for line in heading_lines)
         else:
-            # An existing rendered page with no readable heading is the exact
-            # ``other`` bucket used by the frozen first-four-lines feature.
-            marker_box = page.crop_box
-            confidence = 1.0
+            # Only recognized, evidence-bearing types have marker fields.
+            # This branch is defensive because an unrecognized/empty heading
+            # returns ``other`` above and is rejected before marker creation.
+            return None
         return CandidateEvidence(
             field_name=field_name,
             value="present",
@@ -1704,16 +1844,18 @@ class VisibleEvidenceExtractor:
             view_cue="threshold_fee_receipt_view",
         )
 
-    @staticmethod
     def _fee_receipt_footer_case_ids(
+        self,
+        rendered_case: RenderedCase,
         page: RenderedPage,
         image: Any,
         engine: Any,
-    ) -> set[str]:
-        """Re-read only the visible footer when the primary case ID is lost."""
+    ) -> tuple[set[str], tuple[OcrProvenance, ...]]:
+        """Re-read the visible footer and retain its physical-page support."""
 
         width, height = image.size
-        footer = image.crop((0, int(height * 0.86), width, height))
+        footer_upper = int(height * 0.86)
+        footer = image.crop((0, footer_upper, width, height))
         buffer = io.BytesIO()
         footer.save(buffer, format="PNG")
         footer_page = RenderedPage(
@@ -1732,18 +1874,39 @@ class VisibleEvidenceExtractor:
                 group_ocr_lines(engine.read_page(footer_page))
             )
         except RecoverableOcrError:
-            return set()
-        return {
-            value
+            return set(), ()
+        matches = tuple(
+            (value, line)
             for line in lines
             if (
-                value := VisibleEvidenceExtractor._normalize_value(
-                    "case_id",
-                    line.text,
+                value := self._normalize_value(
+                    "case_id", line.text
                 )
             )
             is not None
-        }
+        )
+        transform = CoordinateTransform.crop_translation(
+            left=0,
+            upper=footer_upper,
+        )
+        provenance = merge_ocr_provenance(
+            *(
+                (
+                    make_ocr_provenance(
+                        source_sha256=rendered_case.source_sha256,
+                        page_index=page.index,
+                        view_box=line.box,
+                        applicant_scope=None,
+                        route_id="fee_receipt_footer_case_gate",
+                        engine_id=stable_ocr_engine_id(engine),
+                        view_id="fee_footer_14_percent",
+                        transform=transform,
+                    ),
+                )
+                for _value, line in matches
+            )
+        )
+        return {value for value, _line in matches}, provenance
 
     @staticmethod
     def _fee_receipt_same_row(label: OcrLine, value: OcrLine) -> bool:
@@ -1967,8 +2130,13 @@ class VisibleEvidenceExtractor:
         thresholds = (120, 140, 160, 180)
         source_image = self._page_image(page)
         pass_candidates: list[CandidateEvidence] = []
+        footer_gate_provenance: tuple[OcrProvenance, ...] = ()
         if rendered_case.case_id not in visible_case_ids:
-            footer_case_ids = self._fee_receipt_footer_case_ids(
+            (
+                footer_case_ids,
+                footer_gate_provenance,
+            ) = self._fee_receipt_footer_case_ids(
+                rendered_case,
                 page,
                 source_image,
                 engines[0],
@@ -1984,7 +2152,23 @@ class VisibleEvidenceExtractor:
             active_applicant=linked.active_applicant,
         )
         if redundant_candidate is not None:
-            return (redundant_candidate,)
+            redundant_candidate = self._attach_ocr_provenance(
+                redundant_candidate,
+                rendered_case,
+                route_id="fee_receipt_redundant_rows",
+                engine_id=self._ocr_engine_id,
+                view_id="rendered_page",
+                transform=CoordinateTransform.identity(),
+            )
+            return (
+                replace(
+                    redundant_candidate,
+                    ocr_provenance=merge_ocr_provenance(
+                        redundant_candidate.ocr_provenance,
+                        footer_gate_provenance,
+                    ),
+                ),
+            )
 
         if any(
             candidate.value is not None
@@ -2007,7 +2191,16 @@ class VisibleEvidenceExtractor:
             view_cue="primary_fee_receipt_view",
         )
         if primary_candidate is not None:
-            pass_candidates.append(primary_candidate)
+            pass_candidates.append(
+                self._attach_ocr_provenance(
+                    primary_candidate,
+                    rendered_case,
+                    route_id="fee_receipt_retry",
+                    engine_id=self._ocr_engine_id,
+                    view_id="rendered_page",
+                    transform=CoordinateTransform.identity(),
+                )
+            )
         for threshold, engine in zip(thresholds, engines):
             crop_page, crop_pixels = self._fee_receipt_crop(
                 page,
@@ -2022,7 +2215,16 @@ class VisibleEvidenceExtractor:
                 active_applicant=linked.active_applicant,
             )
             if candidate is not None:
-                pass_candidates.append(candidate)
+                pass_candidates.append(
+                    self._attach_ocr_provenance(
+                        candidate,
+                        rendered_case,
+                        route_id="fee_receipt_retry",
+                        engine=engine,
+                        view_id=f"fee_top_30_threshold_{threshold}",
+                        transform=CoordinateTransform.identity(),
+                    )
+                )
 
         values = {candidate.value for candidate in pass_candidates}
         if len(pass_candidates) < 3 or len(values) != 1:
@@ -2050,6 +2252,13 @@ class VisibleEvidenceExtractor:
                 visual_cues=("threshold_consensus_fee_receipt",),
                 case_id_hint=rendered_case.case_id,
                 applicant_hint=linked.active_applicant,
+                ocr_provenance=merge_ocr_provenance(
+                    *(
+                        candidate.ocr_provenance
+                        for candidate in pass_candidates
+                    ),
+                    footer_gate_provenance,
+                ),
             ),
         )
 
@@ -2263,6 +2472,12 @@ class VisibleEvidenceExtractor:
                 refinement_gate=self._refinement_gate,
                 consensus_retry=False,
                 sparse_intake_retry=False,
+                ocr_route_id="sparse_intake_retry",
+                ocr_view_id="sparse_intake_crop",
+                ocr_coordinate_transform=CoordinateTransform.crop_translation(
+                    left=crop_left,
+                    upper=crop_upper,
+                ),
             )
             try:
                 retry_candidates = retry_extractor.extract(retry_case)
@@ -2328,6 +2543,10 @@ class VisibleEvidenceExtractor:
                     ),
                     case_id_hint=rendered_case.case_id,
                     applicant_hint=active_applicant,
+                    ocr_provenance=merge_ocr_provenance(
+                        first.ocr_provenance,
+                        second.ocr_provenance,
+                    ),
                 )
             )
         return tuple(recovered)
@@ -2377,7 +2596,7 @@ class VisibleEvidenceExtractor:
         baseline: tuple[CandidateEvidence, ...],
         routing_lines: dict[int, tuple[OcrLine, ...]],
     ) -> tuple[RenderedPage, ...]:
-        """Route at most two candidate-free pages using primary OCR only."""
+        """Route at most two candidate-free, blank-or-anchored primary pages."""
 
         case_id = rendered_case.case_id
         if not isinstance(case_id, str) or not CASE_ID_PATTERN.fullmatch(case_id):
@@ -2404,7 +2623,12 @@ class VisibleEvidenceExtractor:
                 for line in lines
                 if (match := self._ORIENTATION_FOOTER_RE.search(line.text))
             )
-            if not exact_footer:
+            # A physically quarter-turned raster can leave the primary OCR
+            # completely empty, including the normally trusted footer.  Admit
+            # that narrow blank-primary case; the retry result is accepted
+            # only when both rotated views bind every field to the exact
+            # active case.  Non-empty unanchored OCR still fails closed.
+            if not exact_footer and lines:
                 continue
             # Any structured primary candidate, including illegible evidence,
             # makes this an ordinary precedence/linkage problem rather than a
@@ -2503,6 +2727,14 @@ class VisibleEvidenceExtractor:
             fee_receipt_retry=False,
             sparse_intake_retry=False,
             orientation_retry=False,
+            ocr_route_id="orientation_retry",
+            ocr_view_id=f"rotated_{angle % 360}_degrees",
+            ocr_coordinate_transform=CoordinateTransform.inverse_quarter_turn(
+                angle_degrees=angle,
+                source_width=page.width_px,
+                source_height=page.height_px,
+            ),
+            ocr_engine_id=stable_ocr_engine_id(engine),
         )
         try:
             retry_candidates = retry_extractor.extract(retry_case)
@@ -2512,7 +2744,7 @@ class VisibleEvidenceExtractor:
         grouped: dict[str, list[CandidateEvidence]] = {}
         for candidate in retry_candidates:
             if (
-                candidate.field_name not in CONSENSUS_RETRY_FIELDS
+                candidate.field_name not in ORIENTATION_RETRY_FIELDS
                 or candidate.value is None
                 or not candidate.legible
                 or candidate.superseded
@@ -2583,13 +2815,18 @@ class VisibleEvidenceExtractor:
                 if candidate.ocr_confidence >= other.ocr_confidence
                 else other
             )
+            physical_box = (
+                chosen.ocr_provenance[0].observation.box
+                if chosen.ocr_provenance
+                else chosen.box
+            )
             accepted.append(
                 CandidateEvidence(
                     field_name=chosen.field_name,
                     value=chosen.value,
                     evidence_type=chosen.evidence_type,
                     page_index=chosen.page_index,
-                    box=chosen.box,
+                    box=physical_box,
                     legible=chosen.legible,
                     superseded=chosen.superseded,
                     ocr_confidence=min(
@@ -2606,6 +2843,10 @@ class VisibleEvidenceExtractor:
                     source=chosen.source,
                     case_id_hint=chosen.case_id_hint,
                     applicant_hint=chosen.applicant_hint,
+                    ocr_provenance=merge_ocr_provenance(
+                        candidate.ocr_provenance,
+                        other.ocr_provenance,
+                    ),
                 )
             )
         return tuple(accepted)
@@ -2635,6 +2876,17 @@ class VisibleEvidenceExtractor:
             tuple[tuple[CandidateEvidence, ...], set[str]]
         ] = []
         for page in pages:
+            primary_case_anchor = any(
+                match is not None
+                and match.group(1).upper()
+                == rendered_case.case_id.upper()
+                for line in routing_lines.get(page.index, ())
+                if (
+                    match := self._ORIENTATION_FOOTER_RE.search(
+                        line.text
+                    )
+                )
+            )
             scans: list[
                 tuple[
                     int,
@@ -2672,6 +2924,21 @@ class VisibleEvidenceExtractor:
                         best_pass[1],
                         confirmation[1],
                     )
+                    if not primary_case_anchor:
+                        accepted = tuple(
+                            candidate
+                            for candidate in accepted
+                            if (
+                                best_pass[1][
+                                    candidate.field_name
+                                ].case_id_hint
+                                == rendered_case.case_id
+                                and confirmation[1][
+                                    candidate.field_name
+                                ].case_id_hint
+                                == rendered_case.case_id
+                            )
+                        )
             accepted_fields = {candidate.field_name for candidate in accepted}
             unconfirmed_labels = set(best_labels) - accepted_fields
             page_results.append((accepted, unconfirmed_labels))
@@ -2846,45 +3113,34 @@ class VisibleEvidenceExtractor:
                 flags.update(self._fuzzy_risk_flags_from_text(line.text))
                 if flags:
                     risk_records.append((flags, line, cues))
-            observed_flags = {
-                flag
-                for flags, _line, _cues in risk_records
-                for flag in flags
-            }
-            if not observed_flags:
+            if not risk_records:
                 continue
 
-            _flags, representative, _cues = max(
-                risk_records,
-                key=lambda record: (
-                    len(record[0]),
-                    record[1].confidence,
-                ),
-            )
-            risk_box = risk_records[0][1].box
-            for _record_flags, line, _record_cues in risk_records[1:]:
-                risk_box = risk_box.union(line.box)
-            risk_cues = {
-                cue
-                for _record_flags, _line, cues in risk_records
-                for cue in cues
-            }
-            risk_cues.add("trusted_footer_scope_repair")
-            recovered.append(
-                CandidateEvidence(
-                    field_name="risk_flags",
-                    value="|".join(sorted(observed_flags)),
-                    evidence_type=heading_type,
-                    page_index=page.index,
-                    box=risk_box,
-                    legible=True,
-                    superseded=False,
-                    ocr_confidence=representative.confidence,
-                    visual_cues=tuple(sorted(risk_cues)),
-                    case_id_hint=rendered_case.case_id,
-                    applicant_hint=None,
+            # Keep every risk phrase attached to the pixels that actually
+            # support it.  Combining separate lines into one value would make
+            # the aggregate inherit a representative box and confidence that
+            # never supported all of its flags.
+            for flags, line, cues in risk_records:
+                recovered.append(
+                    CandidateEvidence(
+                        field_name="risk_flags",
+                        value="|".join(sorted(flags)),
+                        evidence_type=heading_type,
+                        page_index=page.index,
+                        box=line.box,
+                        legible=True,
+                        superseded=False,
+                        ocr_confidence=line.confidence,
+                        visual_cues=tuple(
+                            sorted(
+                                set(cues)
+                                | {"trusted_footer_scope_repair"}
+                            )
+                        ),
+                        case_id_hint=rendered_case.case_id,
+                        applicant_hint=None,
+                    )
                 )
-            )
 
             if resolved.value("adjudication") is not None:
                 continue
@@ -3044,6 +3300,9 @@ class VisibleEvidenceExtractor:
             orientation_retry=False,
             trusted_scope_repair=False,
             risk_flag_retry=False,
+            ocr_route_id="risk_flag_retry",
+            ocr_view_id="risk_top_40_percent_crop",
+            ocr_coordinate_transform=CoordinateTransform.identity(),
         )
         try:
             retry_candidates = retry_extractor.extract(retry_case)
@@ -3141,13 +3400,18 @@ class VisibleEvidenceExtractor:
             for cue in candidate.visual_cues
         }
         cues.add("cropped_risk_consensus")
+        physical_box = (
+            chosen.ocr_provenance[0].observation.box
+            if chosen.ocr_provenance
+            else chosen.box
+        )
         return (
             CandidateEvidence(
                 field_name="risk_flags",
                 value=value,
                 evidence_type=chosen.evidence_type,
                 page_index=page.index,
-                box=chosen.box,
+                box=physical_box,
                 legible=True,
                 superseded=False,
                 ocr_confidence=min(
@@ -3158,6 +3422,12 @@ class VisibleEvidenceExtractor:
                 source=chosen.source,
                 case_id_hint=rendered_case.case_id,
                 applicant_hint=None,
+                ocr_provenance=merge_ocr_provenance(
+                    *(
+                        candidate.ocr_provenance
+                        for candidate in representatives
+                    )
+                ),
             ),
         )
 
@@ -3285,7 +3555,7 @@ class VisibleEvidenceExtractor:
             TesseractOcrEngine(page_segmentation_mode=4),
         )
         passes: list[tuple[CandidateEvidence, ...]] = []
-        for engine in engines:
+        for pass_index, engine in enumerate(engines):
             retry_extractor = VisibleEvidenceExtractor(
                 ocr_engine=engine,
                 cue_detector=self._cues,
@@ -3293,6 +3563,8 @@ class VisibleEvidenceExtractor:
                 minimum_legible_confidence=self._minimum_legible_confidence,
                 refinement_gate=self._refinement_gate,
                 consensus_retry=False,
+                ocr_route_id="consensus_retry",
+                ocr_view_id=f"full_page_pass_{pass_index + 1}",
             )
             try:
                 retry_candidates = retry_extractor.extract(retry_case)
@@ -3678,6 +3950,7 @@ class VisibleEvidenceExtractor:
                     continue
 
                 confidence = source_line.confidence
+                refinement_engine_id: str | None = None
                 if (
                     self._refinement_model is not None
                     and confidence < self._refinement_gate
@@ -3694,9 +3967,19 @@ class VisibleEvidenceExtractor:
                             if refined_match is None:
                                 raw_value = refined_text
                                 confidence = refined_confidence
+                                refinement_engine_id = getattr(
+                                    self._refinement_model,
+                                    "provenance_engine_id",
+                                    stable_ocr_engine_id(self._refinement_model),
+                                )
                             elif refined_match[0] == field_name:
                                 raw_value = refined_match[1]
                                 confidence = refined_confidence
+                                refinement_engine_id = getattr(
+                                    self._refinement_model,
+                                    "provenance_engine_id",
+                                    stable_ocr_engine_id(self._refinement_model),
+                                )
 
                 normalized = self._normalize_value(field_name, raw_value)
                 minimum_confidence = self._minimum_legible_confidence
@@ -3728,21 +4011,29 @@ class VisibleEvidenceExtractor:
                     if field_name == "applicant_name" and candidate_value is not None
                     else current_applicant
                 )
-                candidates.append(
-                    CandidateEvidence(
-                        field_name=field_name,
-                        value=candidate_value,
-                        evidence_type=candidate_type,
-                        page_index=page.index,
-                        box=source_line.box,
-                        legible=legible,
-                        superseded="strikethrough" in combined_cues,
-                        ocr_confidence=confidence,
-                        visual_cues=combined_cues,
-                        case_id_hint=candidate_case_id,
-                        applicant_hint=candidate_applicant,
-                    )
+                candidate = CandidateEvidence(
+                    field_name=field_name,
+                    value=candidate_value,
+                    evidence_type=candidate_type,
+                    page_index=page.index,
+                    box=source_line.box,
+                    legible=legible,
+                    superseded="strikethrough" in combined_cues,
+                    ocr_confidence=confidence,
+                    visual_cues=combined_cues,
+                    case_id_hint=candidate_case_id,
+                    applicant_hint=candidate_applicant,
                 )
+                if refinement_engine_id is not None:
+                    candidate = self._attach_ocr_provenance(
+                        self._attach_ocr_provenance(candidate, rendered_case),
+                        rendered_case,
+                        route_id="field_refinement",
+                        engine_id=refinement_engine_id,
+                        view_id=self._ocr_view_id,
+                        transform=self._ocr_coordinate_transform,
+                    )
+                candidates.append(candidate)
                 if field_name == "case_id" and candidate_value is not None:
                     # A clean header/footer that repeats the filename case ID
                     # anchors the whole physical page.  Do not let one damaged
@@ -3988,95 +4279,137 @@ class VisibleEvidenceExtractor:
             # A page for a different case can contain a perfectly visible risk
             # marker.  CaseLinker must not receive it, and an all-foreign set
             # must remain an ordinary extraction gap rather than crashing the
-            # whole PDF while selecting a representative observation below.
+            # whole PDF while selecting physical observations below.
             if scoped:
-                observed_values = {
-                    flag
-                    for flags, _line, _cues, _type, _case in scoped
-                    for flag in flags
-                }
-                _flags, line, cues, candidate_type, candidate_case_id = min(
-                    scoped,
-                    key=lambda item: (
-                        {
-                            EvidenceType.ADJUDICATOR_STAMP: 1,
-                            EvidenceType.SIGNED_MANUAL_NOTE: 1,
-                            EvidenceType.INTAKE_FORM: 2,
-                            EvidenceType.BIOMETRIC_SLIP: 3,
-                            EvidenceType.SPONSOR_ATTESTATION: 4,
-                            EvidenceType.REGISTRY_EXTRACT: 5,
-                            EvidenceType.TEXT_LAYER: 6,
-                        }[item[3]],
-                        item[1].page_index,
-                    ),
-                )
-                # A labeled line can yield a conservative direct value while
-                # the full, still-visible line yields a strict superset (for
-                # example one clean flag plus one mildly damaged flag).  Drop
-                # only that redundant same-line subset.  An explicit `none`
-                # is deliberately not a known-flag set, so it remains as a
-                # same-rank conflict instead of being silently overridden.
-                redundant_subset_ids: set[int] = set()
-                for candidate in candidates:
-                    if (
-                        candidate.field_name != "risk_flags"
-                        or not candidate.legible
-                        or candidate.value is None
-                        or candidate.superseded
-                        or "strikethrough" in candidate.visual_cues
-                        or "correction" in candidate.visual_cues
-                        or candidate.evidence_type is not candidate_type
-                        or candidate.page_index != line.page_index
-                        or candidate.case_id_hint != candidate_case_id
-                    ):
-                        continue
-                    candidate_flags = set(candidate.value.split("|"))
-                    if (
-                        candidate_flags
-                        and candidate_flags < observed_values
-                        and candidate_flags <= KNOWN_RISK_FLAGS
-                    ):
-                        redundant_subset_ids.add(id(candidate))
-                if redundant_subset_ids:
-                    candidates[:] = [
-                        candidate
-                        for candidate in candidates
-                        if id(candidate) not in redundant_subset_ids
-                    ]
-                aggregate_cues = set(cues)
-                if any(
-                    "fuzzy_risk_phrase" in observation_cues
-                    for (
-                        _observation_flags,
-                        _line,
-                        observation_cues,
-                        _type,
-                        _case,
-                    ) in scoped
-                ):
-                    aggregate_cues.add("fuzzy_risk_phrase")
-                candidates.append(
-                    CandidateEvidence(
-                        field_name="risk_flags",
-                        value="|".join(sorted(observed_values)),
-                        evidence_type=candidate_type,
-                        page_index=line.page_index,
-                        box=line.box,
-                        legible=True,
-                        superseded="strikethrough" in cues,
-                        ocr_confidence=line.confidence,
-                        visual_cues=tuple(sorted(aggregate_cues)),
-                        case_id_hint=candidate_case_id,
-                        # Risk markers apply to the active case as a whole. Do not
-                        # let a lower-precedence applicant mention on a later page
-                        # scope a visible case-level risk marker away.
-                        applicant_hint=None,
+                grouped: dict[
+                    tuple[EvidenceType, int, Rect, str | None],
+                    list[
+                        tuple[
+                            tuple[str, ...],
+                            OcrLine,
+                            tuple[str, ...],
+                            EvidenceType,
+                            str | None,
+                        ]
+                    ],
+                ] = {}
+                for observation in scoped:
+                    _flags, line, _cues, candidate_type, candidate_case_id = (
+                        observation
                     )
-                )
+                    key = (
+                        candidate_type,
+                        line.page_index,
+                        line.box,
+                        candidate_case_id,
+                    )
+                    grouped.setdefault(key, []).append(observation)
+
+                for (
+                    candidate_type,
+                    page_index,
+                    physical_box,
+                    candidate_case_id,
+                ), observations in grouped.items():
+                    observed_values = {
+                        flag
+                        for flags, _line, _cues, _type, _case in observations
+                        for flag in flags
+                    }
+                    aggregate_cues = {
+                        cue
+                        for _flags, _line, cues, _type, _case in observations
+                        for cue in cues
+                    }
+                    value = "|".join(sorted(observed_values))
+
+                    # A direct labeled candidate and fuzzy phrase recovery can
+                    # describe the same physical line.  Merge only within that
+                    # exact observation/evidence rank.  In particular, never
+                    # borrow a box or rank from a different line or page.
+                    compatible = [
+                        (candidate_index, candidate)
+                        for candidate_index, candidate in enumerate(candidates)
+                        if (
+                            candidate.field_name == "risk_flags"
+                            and candidate.legible
+                            and candidate.value is not None
+                            and not candidate.superseded
+                            and "strikethrough" not in candidate.visual_cues
+                            and "correction" not in candidate.visual_cues
+                            and candidate.evidence_type is candidate_type
+                            and candidate.page_index == page_index
+                            and candidate.box == physical_box
+                            and candidate.case_id_hint == candidate_case_id
+                        )
+                    ]
+                    exact = [
+                        (candidate_index, candidate)
+                        for candidate_index, candidate in compatible
+                        if candidate.value == value
+                    ]
+                    if exact:
+                        candidate_index, candidate = exact[0]
+                        candidates[candidate_index] = replace(
+                            candidate,
+                            visual_cues=tuple(
+                                sorted(
+                                    set(candidate.visual_cues)
+                                    | aggregate_cues
+                                )
+                            ),
+                        )
+                        continue
+
+                    redundant_subset_ids = {
+                        id(candidate)
+                        for _candidate_index, candidate in compatible
+                        if (
+                            (candidate_flags := set(
+                                candidate.value.split("|")
+                            ))
+                            and candidate_flags < observed_values
+                            and candidate_flags <= KNOWN_RISK_FLAGS
+                        )
+                    }
+                    if redundant_subset_ids:
+                        candidates[:] = [
+                            candidate
+                            for candidate in candidates
+                            if id(candidate) not in redundant_subset_ids
+                        ]
+                    representative = max(
+                        observations,
+                        key=lambda item: item[1].confidence,
+                    )[1]
+                    candidates.append(
+                        CandidateEvidence(
+                            field_name="risk_flags",
+                            value=value,
+                            evidence_type=candidate_type,
+                            page_index=page_index,
+                            box=physical_box,
+                            legible=True,
+                            superseded=False,
+                            ocr_confidence=representative.confidence,
+                            visual_cues=tuple(sorted(aggregate_cues)),
+                            case_id_hint=candidate_case_id,
+                            # Risk markers apply to the active case as a whole.
+                            applicant_hint=None,
+                        )
+                    )
         baseline = tuple(candidates)
         if self._trusted_scope_repair:
             candidates.extend(
-                self._trusted_scope_repair_evidence(
+                self._attach_ocr_provenance(
+                    candidate,
+                    rendered_case,
+                    route_id="trusted_scope_repair",
+                    engine_id=self._ocr_engine_id,
+                    view_id="rendered_page",
+                    transform=CoordinateTransform.identity(),
+                )
+                for candidate in self._trusted_scope_repair_evidence(
                     rendered_case,
                     baseline,
                     routing_lines,
@@ -4135,4 +4468,7 @@ class VisibleEvidenceExtractor:
         if marker is not None:
             candidates.append(marker)
         candidates.extend(page_type_markers)
-        return tuple(candidates)
+        return tuple(
+            self._attach_ocr_provenance(candidate, rendered_case)
+            for candidate in candidates
+        )

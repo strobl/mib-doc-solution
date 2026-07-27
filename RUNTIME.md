@@ -13,8 +13,14 @@ published six-level precedence hierarchy, and applies deterministic policy.
 When and only when a scored primary output field is internally
 `FieldState.UNKNOWN`, a separate RapidOCR pass may read the already-rendered
 pages and fill that output value. A visibly resolved literal `unknown` is not
-an internal gap and remains immutable. RapidOCR is resolved independently; it
-does not add evidence to the primary case or cause policy to be re-run.
+an internal gap and remains immutable. The same independent OCR view also runs
+a bounded policy probe for a primary case that is not already bound by visible
+authoritative decision evidence. If the primary outputs are complete, that
+probe admits only adjudication and biohazard-check candidates. Primary and
+RapidOCR evidence remain separately auditable; a visible, provenance-complete
+late change is fused and ordinary policy is revalidated before it may affect
+the final row. Any malformed, ambiguous, or unauditable recovery leaves the
+primary prediction unchanged.
 Missing, contested, illegible, or untrusted-only decision evidence is routed to
 `NEEDS_REVIEW`; `APPROVED` is emitted only after the stricter approval bar is
 cleared. An offline, versioned isotonic map first calibrates a policy-derived
@@ -81,9 +87,13 @@ docker run --rm \
 ```
 
 The entrypoint rejects missing or extra arguments. It reads only the supplied
-input directory and writes only the exact supplied output path. The image runs
-as an unprivileged user, sets `/tmp` as its temporary and home directory, and
-does not require a writable container root.
+input directory and writes only the exact supplied output path. The evaluator
+does not guarantee that its host-owned output bind mount shares a UID/GID with
+the image, so the image retains the default root user to make that portable
+write boundary reliable on native Linux. The measured harness drops all
+capabilities and applies `no-new-privileges`; the container root and input stay
+read-only, network access is disabled, and only `/tmp` plus the output mount are
+writable. The final atomic prediction file is made host-readable.
 
 ## Offline and resource guarantees
 
@@ -96,6 +106,29 @@ does not require a writable container root.
 - Final predictions are written to the caller-provided output mount.
 - The submitted image is designed for the evaluator's 4-vCPU, 8-GiB RAM,
   512-PID, and 2-GiB `/tmp` limits.
+
+## Runtime certification evidence
+
+`scripts/run_docker_submission.py` builds or inspects a source-bound image,
+enforces the complete offline Docker envelope, validates exact canonical JSONL
+coverage, inventories model and runtime artifacts, and records aggregate-only
+runtime evidence. Repeat mode requires at least two byte-identical completed
+runs. The GitHub workflow uses two independently built, parallel 5,000-case
+single-run captures and admits a determinism claim only after
+`devtools/wo20_parallel_compare.py` verifies their source/input bindings,
+coverage, output hash and bytes, limits, platform, and artifact inventory.
+
+The fields named `peak_process_tree_rss_*` and `peak_container_memory_*` are the
+maximum observed values from in-container `/proc` polling and the conservative
+maximum of in-container cgroup peak/current readings plus `docker stats`.
+Where the kernel exposes `memory.peak`, that value is included; fallback
+readings remain sampled observations rather than a claim of an absolute peak.
+Each run records the selected cgroup source and value, the Docker stats peak,
+and the Docker stats sample count before taking the conservative maximum of
+the sources that were actually available.
+The Docker 8-GiB limit and OOM state remain hard enforcement. A whole-run
+timeout is enforced; the absence of a separate per-case deadline is reported
+as a warning and may not be hidden by the evidence.
 
 ## Verify locally
 

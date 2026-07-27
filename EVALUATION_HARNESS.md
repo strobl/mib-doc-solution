@@ -5,7 +5,7 @@ PDFs, split assignments, case-level reports, and calibration samples outside the
 submitted runtime image. Reports are explicitly labeled as local engineering
 benchmarks, not official leaderboard scores.
 
-## Honest split
+## Historical deterministic public partitions
 
 Generate a deterministic, adjudication-stratified tuning/calibration/release
 manifest to an external working directory:
@@ -18,8 +18,9 @@ python3 scripts/evaluation_harness.py split \
   --output /tmp/mib-evaluation/splits.json
 ```
 
-The three partitions are disjoint. A calibration or release result must declare
-which split(s) were used for tuning, and the harness rejects self-evaluation.
+The three partitions are disjoint, but they are not unseen: all public labels
+have since been evaluated. A calibration or release result must declare which
+split(s) were used for tuning, and the harness rejects self-evaluation.
 If any cases were inspected before freezing a revised split, pass their CSV via
 `--forced-tuning-manifest`. The splitter pins them to tuning before assigning
 fresh calibration and release cases, preventing accidental holdout reuse.
@@ -41,9 +42,11 @@ python3 scripts/evaluation_harness.py run-benchmark \
   --run-report /tmp/mib-evaluation/runtime.json
 ```
 
-The instrumented runner uses the same renderer, extractor, resolver, policy
-engine, pinned artifacts, four-worker limit, and canonical writer as the
-submission. Its trace/sample output stays outside the runtime image.
+The instrumented runner and `solution.py` call the same
+`build_production_processor()` composition root. This prevents a development
+benchmark from silently omitting late RapidOCR recovery, decision recovery, or
+final confidence recalibration. Its final-confidence sample output stays
+outside the runtime image.
 
 Then wrap the official evaluator:
 
@@ -64,6 +67,8 @@ calibration scores; missing/invalid rows; catastrophic false approvals;
 per-field match rates; classification, damage, difficulty, and adversarial
 groups; and runtime/memory measurements. Use `--coverage full_training` for the
 reproducible 1,000-case public training benchmark instead of a small subset.
+Every report carries an explicit evidence class and a SHA-256 pin for the
+measured manifest (or truth file for a full-training diagnostic).
 
 ## False-approval gate
 
@@ -74,25 +79,50 @@ python3 scripts/evaluation_harness.py gate \
   --output /tmp/mib-evaluation/release-decision.json
 ```
 
-The gate blocks results measured on tuning data, mismatched comparison splits,
-missing required measurements, detected identity leakage, and any increase in
-catastrophic false approvals. It also identifies newly regressed golden and
-adversarial cases before adoption.
+The gate blocks results measured on tuning data, mismatched or unpinned
+comparison splits, missing required measurements, detected identity leakage,
+any catastrophic false-approval increase, missing/invalid rows, and newly
+regressed golden or adversarial cases.
 
 ## Pinned artifacts
 
-`fit-calibration` fits pool-adjacent-violators isotonic regression from an
-external JSONL file containing `case_id`, `split_name`, `raw_signal`, and the
-boolean `correct` target. It also requires the external split manifest and
-rejects samples outside its calibration partition or overlapping its tuning
-partition. Case IDs are used only to prove separation and sample uniqueness and
-are removed from the published artifact. `validate-exceptions` admits only
+`fit-calibration` fits pool-adjacent-violators isotonic regression only from an
+external JSONL file containing `case_id`, `split_name`,
+`signal_stage=pre_policy_calibration`, `raw_signal`, and the boolean `correct`
+target. It requires the external split manifest and rejects wrong-stage,
+mixed-stage, out-of-partition, or tuning-overlap samples. The production-parity
+benchmark deliberately emits `final_emitted_confidence` diagnostics instead;
+those samples cannot be applied to the inner policy calibrator. WO-19 owns any
+new final-output calibration fitter. Case IDs are used only to prove separation
+and sample uniqueness and are removed from the published artifact.
+`validate-exceptions` admits only
 strict `DENIED`/`NEEDS_REVIEW` rules with trusted visible support, held-out
 support, split separation, no identity key, and no false-approval regression.
 
-Only the resulting `confidence_calibration.json` and `policy_exceptions.json`
-may be copied into `mib_pipeline/artifacts/`. The leakage scanner rejects case
-IDs, filenames, PDF/file hashes, and identity lookup keys before publication.
+Only validated runtime artifacts may be copied into
+`mib_pipeline/artifacts/`. The evaluator scans all three current pinned
+artifacts by default:
+
+- `confidence_calibration.json`;
+- `policy_exceptions.json`; and
+- `output_confidence_recalibration.json`.
+
+The leakage scanner rejects case IDs, filenames, PDF/file hashes, and identity
+lookup keys before publication.
+
+## Experiment firewall
+
+The public 1,000 cases have already been evaluated and are not an unseen
+holdout. Before score-tuning work, use the hash-chained controls in
+`devtools/experiment_control.py` for frozen baseline manifests, an append-only
+experiment ledger, taint events, repeated group-exclusive layout folds, the
+protected aggregate-access budget, runtime source/artifact scanning, and
+candidate rollback.
+
+Protected-fold reports contain aggregate metrics only. Case-level split
+manifests, labels, predictions, evaluator rows, and traces stay in the external
+evaluation directory. The complete protocol and hard-stop gates are recorded
+in [`evaluation/EXPERIMENT_FIREWALL.md`](evaluation/EXPERIMENT_FIREWALL.md).
 
 ## Separate evaluation image
 

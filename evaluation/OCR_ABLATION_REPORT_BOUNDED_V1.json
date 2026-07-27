@@ -1,0 +1,156 @@
+{
+  "benchmark_context": "public_label_exposed_diagnostic_not_unseen_not_official_leaderboard",
+  "benchmark_id": "public-hash32-ocr-ablation-v1",
+  "cohort": {
+    "adjudication_counts": {
+      "approved": 8,
+      "denied": 12,
+      "needs_review": 12
+    },
+    "input_pdf_count": 32,
+    "input_tree_sha256": "baf4a2ec982dcd578a10c8f58182310ab60148aeb308388e468d712b7f042a5f",
+    "selection": "32 smallest SHA-256 digests of PDF bytes; labels were not used for selection",
+    "truth_sha256": "595c00b5bf1eb2f4e79c4fa5c8e131d8d14f16704f4f5f9771a9ae9e221193db"
+  },
+  "environment": {
+    "max_workers": 4,
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "python": "3.12.13",
+    "tesseract": "tesseract 5.5.0"
+  },
+  "external_aggregate_report_sha256": "9948f15962352bce61982959cf642f99fe20e80927ba2f8dbc11b519a02e530c",
+  "measurement": {
+    "answered": 576,
+    "attempted": 576,
+    "deterministic_configuration_pairs": 9,
+    "omitted": 0,
+    "run_count": 18,
+    "total_cpu_seconds": 4910.632,
+    "total_wall_seconds": 1531.147
+  },
+  "production_baseline": {
+    "calibration_score": 16.046523367733855,
+    "catastrophic_false_approvals": 0,
+    "classification_score": 73.75,
+    "complete": true,
+    "deterministic": true,
+    "extraction_score": 45.763888888888886,
+    "invalid_records": 0,
+    "mean_brier": 0.09883691580665362,
+    "missing_records": 0,
+    "peak_memory_mib_max": 1989.390625,
+    "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+    "repeat_count": 2,
+    "total_score": 135.56041225662273
+  },
+  "report_schema": "mib_ocr_ablation_committed_aggregate_v1",
+  "safety_definition": "complete output and no catastrophic-false-approval increase",
+  "scope_complete": false,
+  "source_revision": "67aaa95723ffa280b392435095e91f3d2190139a",
+  "variants": [
+    {
+      "config_sha256": "c12777fb23ff78cd1f0871b7931a44697285f941e841cee16e9f8a20ab9fd8a0",
+      "deterministic": true,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 281.814009,
+      "variant_id": "without_psm6_refinement"
+      ,"variant_peak_memory_mib_max": 2239.640625
+      ,"variant_wall_seconds_median": 87.5759374164918
+    },
+    {
+      "config_sha256": "6a3839a7cdfe8d44eb428c63b8de3c2a13951f89889a3b8ea02dec2a40d3a293",
+      "deterministic": true,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 274.061422,
+      "variant_id": "without_cross_view_consensus"
+      ,"variant_peak_memory_mib_max": 2031.71875
+      ,"variant_wall_seconds_median": 84.54277506252402
+    },
+    {
+      "config_sha256": "6633fa1a543af12155747a88830b3d554e27a0ffebe67871472986738ac76ab7",
+      "deterministic": true,
+      "predictions_sha256": "4116699be6639e5b3f0039d4a59c753d9ed6a4a177981ab5eb8749c96810ee3a",
+      "recommendation": "secondary",
+      "safety_pass": true,
+      "score_contribution": 0.13491007763417429,
+      "score_gain_per_cpu_second": 0.0004664463892667145,
+      "variant_cpu_seconds_median": 307.302992,
+      "variant_id": "without_fee_threshold_consensus"
+      ,"variant_peak_memory_mib_max": 2663.078125
+      ,"variant_wall_seconds_median": 93.98321056249551
+    },
+    {
+      "config_sha256": "a276d74f2bf2fc90b63271f4b3ae43cd5e47f20b1e3d425c97fd059faff55e07",
+      "deterministic": true,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 286.91867249999996,
+      "variant_id": "without_sparse_intake_crop_consensus"
+      ,"variant_peak_memory_mib_max": 2573.765625
+      ,"variant_wall_seconds_median": 89.05015950000961
+    },
+    {
+      "config_sha256": "0c9b18fc8c914bba107b42159d35479ea85b1dbc68d6a05de0d1947028f01a4c",
+      "deterministic": true,
+      "predictions_sha256": "8597d6da04ed83805af2f84613a740f946447ec612d7ff8482aac987139a3a66",
+      "recommendation": "rejected_negative_delta",
+      "safety_pass": true,
+      "score_contribution": -0.5530409833040721,
+      "score_gain_per_cpu_second": -0.0019121178662293832,
+      "variant_cpu_seconds_median": 283.9119565,
+      "variant_id": "without_orientation_retry"
+      ,"variant_peak_memory_mib_max": 2364.5
+      ,"variant_wall_seconds_median": 86.75726300000679
+    },
+    {
+      "config_sha256": "9514e63666d971d97aec128053c1d44a78f40188b2f6dede13017337c55a2a9e",
+      "deterministic": true,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 286.93657399999995,
+      "variant_id": "without_trusted_scope_repair"
+      ,"variant_peak_memory_mib_max": 2475.015625
+      ,"variant_wall_seconds_median": 88.95010004151845
+    },
+    {
+      "config_sha256": "74d49cc4174e6989454a509856aa12f38661c6cb1f1a857989346e5b8a9bce52",
+      "deterministic": true,
+      "predictions_sha256": "6f8d619ccc3ba5ec4f37853213e782774ead4fe3c5a4e8c72f9270abdb38f8e3",
+      "recommendation": "not_selected_zero_delta",
+      "safety_pass": true,
+      "score_contribution": 0.0,
+      "score_gain_per_cpu_second": 0.0,
+      "variant_cpu_seconds_median": 290.8183345,
+      "variant_id": "without_risk_geometry_retry"
+      ,"variant_peak_memory_mib_max": 2183.296875
+      ,"variant_wall_seconds_median": 92.05302993746591
+    },
+    {
+      "config_sha256": "a46eec19ad76f0690db99697080843d9e5f6a883a14b8a3fa6d0a9563ccb97bf",
+      "deterministic": true,
+      "predictions_sha256": "04a27e56c3e572fb9c01661f2e139adc4e7b8a30ed4d989ba39e481860c6ba19",
+      "recommendation": "winner",
+      "safety_pass": true,
+      "score_contribution": 2.9672251716944515,
+      "score_gain_per_cpu_second": 0.010259066570484188,
+      "variant_cpu_seconds_median": 154.322474,
+      "variant_id": "without_targeted_rapidocr"
+      ,"variant_peak_memory_mib_max": 343.203125
+      ,"variant_wall_seconds_median": 51.01386739599227
+    }
+  ]
+}

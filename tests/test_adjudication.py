@@ -234,6 +234,78 @@ class AdjudicationPolicyTests(unittest.TestCase):
         self.assertIn("stale_application", stale.trace.denial_reasons)
         self.assertEqual(exempt.row.adjudication, "APPROVED")
 
+    def test_schema_sentinels_are_unknown_not_policy_evidence(self):
+        sentinel_sponsor = self.decision(
+            resolved_case(sponsor_id="SPN-0000")
+        )
+        sentinel_arrival = self.decision(
+            resolved_case(arrival_date="1900-01-01")
+        )
+
+        self.assertEqual(
+            sentinel_sponsor.row.adjudication,
+            "NEEDS_REVIEW",
+        )
+        self.assertIn(
+            "required_sponsor_unknown",
+            sentinel_sponsor.trace.review_reasons,
+        )
+        self.assertNotIn(
+            "sponsor_present_and_not_publicly_barred",
+            sentinel_sponsor.trace.approval_facts,
+        )
+        self.assertEqual(
+            sentinel_arrival.row.adjudication,
+            "NEEDS_REVIEW",
+        )
+        self.assertIn(
+            "arrival_date_unknown",
+            sentinel_arrival.trace.review_reasons,
+        )
+        self.assertNotIn(
+            "stale_application",
+            sentinel_arrival.trace.denial_reasons,
+        )
+
+    def test_visible_placeholder_literals_never_satisfy_required_outputs(self):
+        placeholders = (
+            ("risk_flags", "unknown"),
+            ("home_world", "unknown"),
+            ("species_code", "unknown"),
+            ("declared_purpose", "unknown"),
+            ("declared_purpose", "null"),
+            ("declared_purpose", "none"),
+            ("home_world", "other"),
+        )
+        for field_name, value in placeholders:
+            with self.subTest(field_name=field_name, value=value):
+                outcome = self.decision(
+                    resolved_case(**{field_name: value})
+                )
+                self.assertEqual(
+                    outcome.row.adjudication,
+                    "NEEDS_REVIEW",
+                )
+                self.assertNotIn(
+                    "strict_approval_bar_cleared",
+                    outcome.trace.approval_facts,
+                )
+                self.assertTrue(
+                    any(
+                        reason.startswith(
+                            f"required_output_"
+                        )
+                        and reason.endswith(f":{field_name}")
+                        for reason in outcome.trace.review_reasons
+                    ),
+                    outcome.trace.review_reasons,
+                )
+
+        explicit_none = self.decision(
+            resolved_case(risk_flags="none")
+        )
+        self.assertEqual(explicit_none.row.adjudication, "APPROVED")
+
     def test_unknown_sponsor_reviews_but_barred_sponsor_denies(self):
         missing = self.decision(resolved_case(omit=("sponsor_id",)))
         barred = self.decision(resolved_case(sponsor_id="SPN-0139"))
@@ -669,7 +741,7 @@ class AdjudicationPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.row.adjudication, "NEEDS_REVIEW")
-        self.assertIn("arrival_date_not_visible", outcome.trace.review_reasons)
+        self.assertIn("arrival_date_unknown", outcome.trace.review_reasons)
 
     def test_untrusted_disqualifying_facts_route_to_review_not_denial(self):
         risk = self.decision(

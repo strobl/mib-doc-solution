@@ -1148,6 +1148,143 @@ class VisibleEvidenceTests(unittest.TestCase):
             )
         )
 
+    def test_orientation_retry_recovers_blank_primary_with_exact_case_anchor(
+        self,
+    ):
+        primary = FakeOcrEngine(())
+        rotated_tokens = (
+            token("Case ID: MIB-000001", 1, confidence=0.96),
+            token("Applicant Name: Astra Vale", 2, confidence=0.94),
+            token("Visa Class: MED-3", 3, confidence=0.91),
+            token("Risk Flags: none", 4, confidence=0.93),
+        )
+        scan_90 = FakeOcrEngine(rotated_tokens)
+        scan_270 = FakeOcrEngine(())
+        confirmation = FakeOcrEngine(rotated_tokens)
+
+        candidates = VisibleEvidenceExtractor(
+            ocr_engine=primary,
+            cue_detector=NoCueDetector(),
+            consensus_retry=False,
+            fee_receipt_retry=False,
+            sparse_intake_retry=False,
+            orientation_retry=True,
+            orientation_ocr_engines=(scan_90, scan_270, confirmation),
+        ).extract(self.rendered_case())
+        recovered = {
+            item.field_name: item.value
+            for item in candidates
+            if "sparse_orientation_consensus" in item.visual_cues
+        }
+
+        self.assertEqual(
+            recovered,
+            {
+                "applicant_name": "Astra Vale",
+                "risk_flags": "none",
+                "visa_class": "MED-3",
+            },
+        )
+
+    def test_orientation_retry_rejects_blank_primary_foreign_case_anchor(
+        self,
+    ):
+        primary = FakeOcrEngine(())
+        rotated_tokens = (
+            token("Case ID: MIB-000002", 1, confidence=0.96),
+            token("Applicant Name: Astra Vale", 2, confidence=0.94),
+            token("Visa Class: MED-3", 3, confidence=0.91),
+            token("Risk Flags: none", 4, confidence=0.93),
+        )
+        scan_90 = FakeOcrEngine(rotated_tokens)
+        scan_270 = FakeOcrEngine(())
+        confirmation = FakeOcrEngine(rotated_tokens)
+
+        candidates = VisibleEvidenceExtractor(
+            ocr_engine=primary,
+            cue_detector=NoCueDetector(),
+            consensus_retry=False,
+            fee_receipt_retry=False,
+            sparse_intake_retry=False,
+            orientation_retry=True,
+            orientation_ocr_engines=(scan_90, scan_270, confirmation),
+        ).extract(self.rendered_case())
+
+        self.assertFalse(
+            any(
+                "sparse_orientation_consensus" in item.visual_cues
+                for item in candidates
+            )
+        )
+
+    def test_orientation_retry_requires_case_anchor_in_both_rotated_views(
+        self,
+    ):
+        anchored = (
+            token("Case ID: MIB-000001", 1, confidence=0.96),
+            token("Applicant Name: Astra Vale", 2, confidence=0.94),
+            token("Visa Class: MED-3", 3, confidence=0.91),
+            token("Risk Flags: none", 4, confidence=0.93),
+        )
+        unanchored = (
+            token("Applicant Name: Astra Vale", 1, confidence=0.94),
+            token("Visa Class: MED-3", 2, confidence=0.91),
+            token("Risk Flags: none", 3, confidence=0.93),
+        )
+
+        for scan_tokens, confirmation_tokens in (
+            (anchored, unanchored),
+            (unanchored, anchored),
+        ):
+            with self.subTest(
+                scan_anchored=scan_tokens is anchored,
+            ):
+                candidates = VisibleEvidenceExtractor(
+                    ocr_engine=FakeOcrEngine(()),
+                    cue_detector=NoCueDetector(),
+                    consensus_retry=False,
+                    fee_receipt_retry=False,
+                    sparse_intake_retry=False,
+                    orientation_retry=True,
+                    orientation_ocr_engines=(
+                        FakeOcrEngine(scan_tokens),
+                        FakeOcrEngine(()),
+                        FakeOcrEngine(confirmation_tokens),
+                    ),
+                ).extract(self.rendered_case())
+
+                self.assertFalse(
+                    any(
+                        "sparse_orientation_consensus"
+                        in item.visual_cues
+                        for item in candidates
+                    )
+                )
+
+    def test_orientation_retry_rejects_nonempty_unanchored_primary(self):
+        primary = FakeOcrEngine(
+            (token("unanchored sideways noise", 1),)
+        )
+        engines = tuple(FakeOcrEngine(()) for _index in range(3))
+
+        candidates = VisibleEvidenceExtractor(
+            ocr_engine=primary,
+            cue_detector=NoCueDetector(),
+            consensus_retry=False,
+            fee_receipt_retry=False,
+            sparse_intake_retry=False,
+            orientation_retry=True,
+            orientation_ocr_engines=engines,
+        ).extract(self.rendered_case())
+
+        self.assertFalse(
+            any(
+                "sparse_orientation_consensus" in item.visual_cues
+                for item in candidates
+            )
+        )
+        self.assertEqual([engine.calls for engine in engines], [[], [], []])
+
     def test_orientation_retry_vetoes_any_primary_page_candidate(self):
         primary = FakeOcrEngine(
             (
