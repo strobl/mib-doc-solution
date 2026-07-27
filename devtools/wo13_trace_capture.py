@@ -1285,16 +1285,22 @@ def verify_dataset_archive_authority(
 
 
 def _canonical_absolute_path(value: Any, *, label: str) -> Path:
-    if not isinstance(value, str) or not value:
+    try:
+        raw_value = os.fspath(value)
+    except TypeError as exc:
+        raise TraceCaptureError(
+            f"{label} must be a non-empty absolute path"
+        ) from exc
+    if not isinstance(raw_value, str) or not raw_value:
         raise TraceCaptureError(f"{label} must be a non-empty absolute path")
-    path = Path(value)
+    path = Path(raw_value)
     if not path.is_absolute():
         raise TraceCaptureError(f"{label} must be an absolute path")
     try:
         resolved = path.resolve(strict=True)
     except OSError as exc:
         raise TraceCaptureError(f"{label} does not exist") from exc
-    if resolved.as_posix() != value:
+    if resolved.as_posix() != raw_value:
         raise TraceCaptureError(
             f"{label} must be its canonical resolved absolute path"
         )

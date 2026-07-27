@@ -26,6 +26,7 @@ from devtools.wo13_trace_capture import (
     TraceCollector,
     TraceSignals,
     TracingCaseProcessor,
+    _canonical_absolute_path,
     _instrument_rapid_processor,
     _parser,
     _run_trace_capture_core,
@@ -1364,6 +1365,14 @@ class Wo13TraceCaptureTests(unittest.TestCase):
         self.assertIn("--runtime-contract", help_text)
         self.assertIn("--baseline-predictions", help_text)
         self.assertIn("--authority-manifest", help_text)
+
+    def test_cli_path_objects_retain_canonical_absolute_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve()
+            self.assertEqual(
+                _canonical_absolute_path(path, label="fixture"),
+                path,
+            )
 
 
 if __name__ == "__main__":
