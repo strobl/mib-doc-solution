@@ -21,6 +21,7 @@ from .decision_recovery import (
     empty_policy_audit_counts,
 )
 from .extraction import CandidateEvidence, EvidenceType
+from .final_confidence import FinalConfidenceContext
 from .ingestion import Rect
 from .models import PredictionRow
 from .provenance import OcrProvenance
@@ -762,6 +763,7 @@ class VisibleRecoveryResult:
     policy_audit_counts: Mapping[str, int] = field(
         default_factory=empty_policy_audit_counts
     )
+    confidence_context: FinalConfidenceContext | None = None
 
     def __post_init__(self) -> None:
         fusion_counts = dict(self.fusion_audit_counts)
@@ -798,6 +800,14 @@ class VisibleRecoveryResult:
         )
         if self.row.case_id != self.audit.case_id:
             raise ValueError("row and recovery audit case IDs must match")
+        if (
+            self.confidence_context is not None
+            and self.confidence_context.final_class
+            != self.row.adjudication
+        ):
+            raise ValueError(
+                "row adjudication and final confidence context must match"
+            )
         for field_name, field_audit in self.audit.fields.items():
             if not hasattr(self.row, field_name):
                 raise ValueError(

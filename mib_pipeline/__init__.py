@@ -60,6 +60,14 @@ from .confidence import (
     DecisionSignalModel,
     PinnedIsotonicMap,
 )
+from .final_confidence import (
+    FINAL_CLASSES,
+    FINAL_CONFIDENCE_CONTEXT_SCHEMA_VERSION,
+    FINAL_POLICY_ROUTES,
+    FINAL_RECOVERY_ROUTES,
+    FinalConfidenceContext,
+    FinalPredictionWithConfidenceContext,
+)
 from .fusion import EvidenceFuser, FusionDecision, FusionTrace
 from .decision_recovery import (
     REVIEW_APPROVAL_CONFIDENCE,
@@ -147,8 +155,14 @@ __all__ = [
     "FeatureLevelHybridDecision",
     "ExtractThenFallbackProcessor",
     "FEATURE_NAMES",
+    "FINAL_CLASSES",
+    "FINAL_CONFIDENCE_CONTEXT_SCHEMA_VERSION",
+    "FINAL_POLICY_ROUTES",
+    "FINAL_RECOVERY_ROUTES",
     "FIELD_NAMES",
     "FieldState",
+    "FinalConfidenceContext",
+    "FinalPredictionWithConfidenceContext",
     "LinkedCase",
     "GeneralizablePolicyExceptionStore",
     "GatedHybridDecisionRecoveryAdjudicator",

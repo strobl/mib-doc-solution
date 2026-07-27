@@ -847,6 +847,7 @@ class RecoveryAuditTests(unittest.TestCase):
         second = result.to_dict()
 
         self.assertEqual(first, second)
+        self.assertNotIn("confidence_context", first)
         self.assertEqual(
             first["audit"]["fields"]["risk_flags"]["ocr_provenance"],
             [

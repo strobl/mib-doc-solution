@@ -13,6 +13,7 @@ contains one stronger, exact-case biometric value.
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 from datetime import date
 from pathlib import Path
@@ -30,12 +31,18 @@ from .extraction import (
     OcrToken,
     VisibleEvidenceExtractor,
 )
+from .final_confidence import (
+    FINAL_CONFIDENCE_CONTEXT_SCHEMA_VERSION,
+    FinalConfidenceContext,
+    FinalPredictionWithConfidenceContext,
+)
 from .ingestion import Rect, RenderedCase, RenderedPage
 from .models import PredictionRow
 from .recovery_audit import (
     CandidateValidationPolicy,
     RecoveryAuditOverlay,
     RecoveryFieldAudit,
+    SerializationOrigin,
     VisibleRecoveryResult,
     observed_applicant_scopes,
     recovered_field_audit,
@@ -801,6 +808,11 @@ class RapidOutputRecoveryProcessor:
         linked_recovery_scope: str | None = None,
         final_fusion_audit_counts: Mapping[str, int] | None = None,
         policy_audit_counts: Mapping[str, int] | None = None,
+        final_resolved: ResolvedCase | None = None,
+        recovered_resolved: ResolvedCase | None = None,
+        accepted_recovered_field_names: frozenset[str] = frozenset(),
+        policy_route: str = "deterministic_policy",
+        authoritative: bool = False,
     ) -> VisibleRecoveryResult:
         """Pair the row with a complete immutable field-state audit overlay."""
 
@@ -821,6 +833,167 @@ class RapidOutputRecoveryProcessor:
                     linked_recovery_scope=linked_recovery_scope,
                 )
             )
+        accepted_policy_counts = (
+            empty_policy_audit_counts()
+            if policy_audit_counts is None
+            else policy_audit_counts
+        )
+        resolved_for_context = final_resolved or primary_resolved
+        accepted_visible_repair_conflict = False
+        if final_resolved is not None:
+            final_fields = tuple(
+                final_resolved.fields.get(field_name)
+                for field_name in _COMPLETE_REVIEW_OUTPUT_FIELDS
+            )
+        else:
+            accepted_fields: list[ResolvedField | None] = []
+            for audit in audits:
+                accepted_field = primary_resolved.fields.get(
+                    audit.field_name
+                )
+                if (
+                    audit.serialization_after_origin
+                    is SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE
+                    and audit.field_name
+                    in accepted_recovered_field_names
+                    and recovered_resolved is not None
+                ):
+                    recovered_field = recovered_resolved.fields.get(
+                        audit.field_name
+                    )
+                    if (
+                        recovered_field is None
+                        or recovered_field.state
+                        is not audit.final_evidence_state
+                        or recovered_field.value
+                        != audit.final_evidence_value
+                    ):
+                        raise ValueError(
+                            "accepted recovered field does not match its "
+                            "recovery audit"
+                        )
+                    accepted_field = recovered_field
+                elif (
+                    audit.serialization_after_origin
+                    is SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE
+                    and (
+                        accepted_field is None
+                        or accepted_field.state
+                        is not audit.final_evidence_state
+                        or accepted_field.value
+                        != audit.final_evidence_value
+                    )
+                ):
+                    # Output-only primary repairs deliberately do not mutate
+                    # the frozen resolver result.  Its FusionTrace therefore
+                    # describes the pre-repair winner and must not enter the
+                    # accepted final-confidence context.
+                    accepted_visible_repair_conflict = bool(
+                        accepted_visible_repair_conflict
+                        or (
+                            audit.primary_state is FieldState.RESOLVED
+                            and audit.final_evidence_state
+                            is FieldState.RESOLVED
+                            and audit.primary_evidence_value
+                            != audit.final_evidence_value
+                        )
+                    )
+                    accepted_field = ResolvedField(
+                        field_name=audit.field_name,
+                        state=audit.final_evidence_state,
+                        value=audit.final_evidence_value,
+                        winning_evidence=audit.winning_evidence,
+                        considered=(
+                            ()
+                            if audit.winning_evidence is None
+                            else (audit.winning_evidence,)
+                        ),
+                        reason="accepted audited primary visible repair",
+                        fusion_trace=None,
+                    )
+                accepted_fields.append(accepted_field)
+            final_fields = tuple(accepted_fields)
+        traces = tuple(
+            item.fusion_trace
+            for item in final_fields
+            if item is not None and item.fusion_trace is not None
+        )
+        visible_complete = sum(
+            audit.final_evidence_state is FieldState.RESOLVED
+            and audit.after_is_explicit_visible_value
+            for audit in audits
+        )
+        ocr_disagreement = (
+            sum(trace.disagreement_ratio for trace in traces) / len(traces)
+            if traces
+            else 0.0
+        )
+        normalized_entropies = tuple(
+            min(
+                1.0,
+                max(
+                    0.0,
+                    trace.entropy_bits
+                    / math.log2(max(2, trace.independent_evidence_count)),
+                ),
+            )
+            for trace in traces
+        )
+        resolution_entropy = (
+            sum(normalized_entropies) / len(normalized_entropies)
+            if normalized_entropies
+            else 0.0
+        )
+        recovered_sources = {
+            audit.recovery_source
+            for audit in audits
+            if audit.serialization_after_origin
+            is SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE
+        }
+        if None in recovered_sources:
+            raise ValueError(
+                "recovered visible evidence has no auditable route"
+            )
+        if RAPID_RECOVERY_ROUTE_ID in recovered_sources:
+            recovery_route = "rapid_visible"
+        elif (
+            accepted_policy_counts.get(
+                "late_recovery_before_revalidation_count",
+                0,
+            )
+            > 0
+        ):
+            recovery_route = "late_visible"
+        else:
+            recovery_route = "primary"
+        accepted_contested = any(
+            item is not None and item.state is FieldState.CONTESTED
+            for item in final_fields
+        )
+        context = FinalConfidenceContext(
+            schema_version=FINAL_CONFIDENCE_CONTEXT_SCHEMA_VERSION,
+            final_class=row.adjudication,
+            policy_route=(
+                "binding_authority" if authoritative else policy_route
+            ),
+            authoritative=authoritative,
+            visible_completeness=visible_complete
+            / len(_COMPLETE_REVIEW_OUTPUT_FIELDS),
+            has_conflict=bool(
+                resolved_for_context.unresolved_linkage
+                or resolved_for_context.contested_fields
+                or accepted_contested
+                or accepted_visible_repair_conflict
+                or ocr_disagreement > 0.0
+            ),
+            ocr_disagreement=ocr_disagreement,
+            recovery_route=recovery_route,
+            # WO-18's candidate was rejected and remains disabled.  Phase A
+            # records that no model diagnostics entered the accepted result.
+            model_margin=None,
+            ensemble_agreement=None,
+            resolution_entropy=resolution_entropy,
+        )
         return VisibleRecoveryResult(
             row=row,
             audit=RecoveryAuditOverlay.from_fields(
@@ -833,10 +1006,9 @@ class RapidOutputRecoveryProcessor:
                 else final_fusion_audit_counts
             ),
             policy_audit_counts=(
-                empty_policy_audit_counts()
-                if policy_audit_counts is None
-                else policy_audit_counts
+                accepted_policy_counts
             ),
+            confidence_context=context,
         )
 
     @staticmethod
@@ -1447,6 +1619,7 @@ class RapidOutputRecoveryProcessor:
         rapid_resolved = self._resolver.resolve(rapid_linked)
         payload = primary_row.to_dict()
         recovered_audits = dict(pre_recovery_audits)
+        rapid_recovered_field_names: set[str] = set()
 
         # Overlay only fields whose primary state is truly UNKNOWN and whose
         # Rapid winner retains a complete physical observation.  Literal
@@ -1499,6 +1672,7 @@ class RapidOutputRecoveryProcessor:
             if audit is not None:
                 payload[field_name] = recovered_field.value
                 recovered_audits[field_name] = audit
+                rapid_recovered_field_names.add(field_name)
 
         # Ordinary output recovery and the signed-decision override preserve
         # primary identity and calibration. The frozen semantic denial head
@@ -1513,26 +1687,32 @@ class RapidOutputRecoveryProcessor:
             primary_outcome=primary_outcome,
             rapid_candidates=rapid_candidates,
         )
+        semantic_denial = False
         if decision is not None:
             payload["adjudication"] = decision
-        elif self._semantic_denial_rules(
-            case_id=primary_resolved.case_id,
-            source_sha256=rendered.source_sha256,
-            payload=payload,
-            primary_candidates=primary_candidates,
-            rapid_candidates=rapid_candidates,
-            primary_resolved=primary_resolved,
-            rapid_resolved=rapid_resolved,
-            primary_outcome=primary_outcome,
-            unknown_fields=unknown_fields,
-            recover_risk=recover_risk,
-        ):
-            payload["adjudication"] = "DENIED"
-            payload["confidence"] = SEMANTIC_DENIAL_CONFIDENCE
+        else:
+            semantic_denial = bool(
+                self._semantic_denial_rules(
+                    case_id=primary_resolved.case_id,
+                    source_sha256=rendered.source_sha256,
+                    payload=payload,
+                    primary_candidates=primary_candidates,
+                    rapid_candidates=rapid_candidates,
+                    primary_resolved=primary_resolved,
+                    rapid_resolved=rapid_resolved,
+                    primary_outcome=primary_outcome,
+                    unknown_fields=unknown_fields,
+                    recover_risk=recover_risk,
+                )
+            )
+            if semantic_denial:
+                payload["adjudication"] = "DENIED"
+                payload["confidence"] = SEMANTIC_DENIAL_CONFIDENCE
         final_row = PredictionRow.from_mapping(
             payload,
             fallback_case_id=primary_row.case_id,
         )
+        pre_head_row = final_row
         final_row = self._apply_review_approval_heads(
             final_row=final_row,
             source_sha256=rendered.source_sha256,
@@ -1546,11 +1726,33 @@ class RapidOutputRecoveryProcessor:
             row=final_row,
             primary_resolved=primary_resolved,
             recovered_audits=recovered_audits,
+            recovered_resolved=rapid_resolved,
+            accepted_recovered_field_names=frozenset(
+                rapid_recovered_field_names
+            ),
             linked_recovery_scope=(
                 primary_resolved.active_applicant
                 or rapid_resolved.active_applicant
             ),
             policy_audit_counts=policy_audit_counts,
+            policy_route=(
+                "binding_authority"
+                if decision is not None
+                else (
+                    "visible_policy_violation"
+                    if semantic_denial
+                    else (
+                        "recovery_head"
+                        if final_row.adjudication
+                        != pre_head_row.adjudication
+                        else "deterministic_policy"
+                    )
+                )
+            ),
+            authoritative=bool(
+                decision is not None
+                or primary_outcome.trace.authoritative_source
+            ),
         )
 
     @classmethod
@@ -1767,6 +1969,12 @@ class RapidOutputRecoveryProcessor:
                 primary_resolved=primary_resolved,
                 linked_recovery_scope=primary_resolved.active_applicant,
                 policy_audit_counts=primary_staged.audit_counts,
+                policy_route=(
+                    "recovery_head"
+                    if final_row.adjudication != primary_row.adjudication
+                    else "deterministic_policy"
+                ),
+                authoritative=primary_outcome.trace.authoritative_source,
             )
 
         try:
@@ -1927,6 +2135,13 @@ class RapidOutputRecoveryProcessor:
                     fused_resolved.fusion_audit_counts
                 ),
                 policy_audit_counts=policy_audit_counts,
+                final_resolved=fused_resolved,
+                policy_route=(
+                    "revalidated_policy"
+                    if late_resolved_change
+                    else "deterministic_policy"
+                ),
+                authoritative=fused_outcome.trace.authoritative_source,
             )
         except Exception:
             # Fusion and RapidOCR are optional recovery.  A malformed,
@@ -1944,6 +2159,12 @@ class RapidOutputRecoveryProcessor:
                 primary_resolved=primary_resolved,
                 linked_recovery_scope=primary_resolved.active_applicant,
                 policy_audit_counts=primary_staged.audit_counts,
+                policy_route=(
+                    "recovery_head"
+                    if final_row.adjudication != primary_row.adjudication
+                    else "deterministic_policy"
+                ),
+                authoritative=primary_outcome.trace.authoritative_source,
             )
 
     def process_case_with_audit(self, pdf_path: Path) -> VisibleRecoveryResult:
@@ -2049,6 +2270,13 @@ class RapidOutputRecoveryProcessor:
                 recovered_audits=pre_recovery_audits,
                 linked_recovery_scope=primary_resolved.active_applicant,
                 policy_audit_counts=primary_staged.audit_counts,
+                policy_route=(
+                    "recovery_head"
+                    if final_row.adjudication
+                    != primary_outcome.row.adjudication
+                    else "deterministic_policy"
+                ),
+                authoritative=primary_outcome.trace.authoritative_source,
             )
 
         try:
@@ -2079,12 +2307,18 @@ class RapidOutputRecoveryProcessor:
                 recovered_audits=pre_recovery_audits,
                 linked_recovery_scope=primary_resolved.active_applicant,
                 policy_audit_counts=primary_staged.audit_counts,
+                policy_route=(
+                    "recovery_head"
+                    if final_row.adjudication
+                    != primary_outcome.row.adjudication
+                    else "deterministic_policy"
+                ),
+                authoritative=primary_outcome.trace.authoritative_source,
             )
 
-    def process_case(self, pdf_path: Path) -> PredictionRow:
-        """Return the schema row while keeping the audit API opt-in."""
+    def _notify_audit_observers(self, result: VisibleRecoveryResult) -> None:
+        """Publish aggregate audit counters for either public runtime API."""
 
-        result = self.process_case_with_audit(pdf_path)
         observer = getattr(self, "_fusion_audit_observer", None)
         if observer is not None:
             if not callable(observer):
@@ -2095,4 +2329,25 @@ class RapidOutputRecoveryProcessor:
             if not callable(policy_observer):
                 raise TypeError("policy audit observer must be callable")
             policy_observer(result.policy_audit_counts)
+
+    def process_case_with_confidence_context(
+        self,
+        pdf_path: Path,
+    ) -> FinalPredictionWithConfidenceContext:
+        """Return the accepted row and its identity-free final-stage context."""
+
+        result = self.process_case_with_audit(pdf_path)
+        self._notify_audit_observers(result)
+        if result.confidence_context is None:
+            raise RuntimeError("final confidence context was not produced")
+        return FinalPredictionWithConfidenceContext(
+            row=result.row,
+            context=result.confidence_context,
+        )
+
+    def process_case(self, pdf_path: Path) -> PredictionRow:
+        """Return the schema row while keeping the audit API opt-in."""
+
+        result = self.process_case_with_audit(pdf_path)
+        self._notify_audit_observers(result)
         return result.row

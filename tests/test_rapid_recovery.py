@@ -9,6 +9,7 @@ from mib_pipeline.adjudication import (
     DecisionTrace,
 )
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
+from mib_pipeline.fusion import FusionTrace
 from mib_pipeline.ingestion import Rect
 from mib_pipeline.models import PredictionRow
 from mib_pipeline.decision_recovery import ReviewDenialRecoveryAdjudicator
@@ -94,7 +95,44 @@ def evidence(
     )
 
 
-def field(name, value, *, state=FieldState.RESOLVED, considered=()):
+def fusion_trace(
+    *,
+    disagreement_ratio=0.0,
+    entropy_bits=0.0,
+    independent_evidence_count=2,
+):
+    return FusionTrace(
+        winning_rank=2,
+        candidate_count=2,
+        eligible_candidate_count=2,
+        winning_rank_candidate_count=2,
+        observation_count=2,
+        independent_evidence_count=independent_evidence_count,
+        independent_agreement_count=(
+            1 if disagreement_ratio > 0.0 else 2
+        ),
+        correlated_candidate_count=0,
+        independent_evidence_type_count=1,
+        independent_page_count=2,
+        disagreement_count=int(disagreement_ratio > 0.0),
+        entropy_bits=entropy_bits,
+        disagreement_ratio=disagreement_ratio,
+        provenance_complete_count=2,
+        provenance_completeness=1.0,
+        value_counts=(("accepted", 1), ("other", 1)),
+        veto_reasons=(),
+        safety_counters=(),
+    )
+
+
+def field(
+    name,
+    value,
+    *,
+    state=FieldState.RESOLVED,
+    considered=(),
+    fusion_trace=None,
+):
     winner = next(
         (candidate for candidate in considered if candidate.value == value),
         None,
@@ -106,6 +144,7 @@ def field(name, value, *, state=FieldState.RESOLVED, considered=()):
         winning_evidence=winner,
         considered=tuple(considered),
         reason="test field",
+        fusion_trace=fusion_trace,
     )
 
 
@@ -114,18 +153,21 @@ def resolved_case(
     values=None,
     unknown=(),
     considered=None,
+    fusion_traces=None,
     active=APPLICANT,
     unresolved_linkage=False,
     unresolved_reasons=(),
 ):
     values = {**BASE_VALUES, **(values or {})}
     considered = considered or {}
+    fusion_traces = fusion_traces or {}
     fields = {
         name: field(
             name,
             None if name in unknown else value,
             state=FieldState.UNKNOWN if name in unknown else FieldState.RESOLVED,
             considered=considered.get(name, ()),
+            fusion_trace=fusion_traces.get(name),
         )
         for name, value in values.items()
     }
@@ -868,6 +910,10 @@ class RapidFusionModeTests(unittest.TestCase):
             ],
             0,
         )
+        self.assertEqual(
+            audited.confidence_context.recovery_route,
+            "late_visible",
+        )
         self.assertEqual(factory.calls, 1)
 
     def test_late_signed_authority_is_absolute_over_complete_normal_denial(
@@ -984,6 +1030,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 intake_name,
                 evidence_type=EvidenceType.INTAKE_FORM,
                 confidence=0.84,
+                route_id="primary_visible_ocr",
             ),
             evidence(
                 "applicant_name",
@@ -991,6 +1038,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 evidence_type=EvidenceType.BIOMETRIC_SLIP,
                 confidence=0.91,
                 applicant=biometric_name,
+                route_id="primary_visible_ocr",
             ),
         )
         primary = resolved_case(unknown={"applicant_name"})
@@ -1025,6 +1073,10 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(applicant_audit.final_evidence_value, biometric_name)
         self.assertIs(applicant_audit.winning_evidence, candidates[1])
+        self.assertEqual(
+            audited.confidence_context.recovery_route,
+            "primary",
+        )
 
     def test_biometric_applicant_repair_abstains_on_every_scope_ambiguity(self):
         intake = evidence(
@@ -1289,6 +1341,56 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 )
                 self.assertIs(field_audit.winning_evidence, winner)
 
+    def test_primary_visible_repair_excludes_stale_pre_repair_fusion_trace(
+        self,
+    ):
+        intake_visa = evidence(
+            "visa_class",
+            "TRANSIT-7",
+            evidence_type=EvidenceType.INTAKE_FORM,
+            confidence=0.82,
+            route_id="primary_visible_ocr",
+        )
+        sponsor_visa = evidence(
+            "visa_class",
+            "XW-1",
+            evidence_type=EvidenceType.SPONSOR_ATTESTATION,
+            confidence=0.94,
+            cues=("structured_sponsor_narrative",),
+            route_id="primary_visible_ocr",
+        )
+        primary = resolved_case(
+            values={"visa_class": "TRANSIT-7"},
+            considered={"visa_class": (intake_visa, sponsor_visa)},
+            fusion_traces={
+                "visa_class": fusion_trace(
+                    disagreement_ratio=0.75,
+                    entropy_bits=1.0,
+                )
+            },
+        )
+        primary_row = row(
+            visa_class="TRANSIT-7",
+            adjudication="DENIED",
+            confidence=0.61,
+        )
+        recovery, *_components = processor(
+            primary,
+            resolved_case(),
+            primary_outcome=outcome(primary_row),
+            primary_candidates=(intake_visa, sponsor_visa),
+        )
+
+        final = recovery.process_case_with_confidence_context(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(final.row.visa_class, "XW-1")
+        self.assertEqual(final.context.recovery_route, "primary")
+        self.assertEqual(final.context.ocr_disagreement, 0.0)
+        self.assertEqual(final.context.resolution_entropy, 0.0)
+        self.assertTrue(final.context.has_conflict)
+
     def test_primary_visible_repair_selects_route_that_produced_candidate_box(self):
         candidate_box = Rect(1, 2, 3, 4)
         unrelated_box = Rect(20, 30, 40, 50)
@@ -1527,6 +1629,10 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(
             fee_audit.ocr_provenance,
             visible_unknown.ocr_provenance,
+        )
+        self.assertEqual(
+            audited.confidence_context.recovery_route,
+            "rapid_visible",
         )
 
     def test_non_applicant_recovery_cannot_switch_active_applicant_scope(self):
@@ -2713,6 +2819,104 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
         self.assertEqual(factory.calls, 1)
         self.assertEqual(factory.instances[0].calls, 2)
+
+    def test_nonfusion_context_uses_recovered_trace_not_stale_primary_trace(
+        self,
+    ):
+        recovered_species = evidence(
+            "species_code",
+            "ARCTURIAN",
+        )
+        primary = resolved_case(
+            unknown={"species_code"},
+            fusion_traces={
+                "species_code": fusion_trace(
+                    disagreement_ratio=0.0,
+                    entropy_bits=0.0,
+                )
+            },
+        )
+        rapid = resolved_case(
+            values={"species_code": "ARCTURIAN"},
+            considered={"species_code": (recovered_species,)},
+            fusion_traces={
+                "species_code": fusion_trace(
+                    disagreement_ratio=0.5,
+                    entropy_bits=1.0,
+                )
+            },
+        )
+        recovery, *_components = processor(
+            primary,
+            rapid,
+            primary_outcome=outcome(
+                row(
+                    species_code="TRIANGULAN",
+                    adjudication="NEEDS_REVIEW",
+                )
+            ),
+            rapid_candidates=(recovered_species,),
+        )
+
+        final = recovery.process_case_with_confidence_context(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(final.row.species_code, "ARCTURIAN")
+        self.assertEqual(final.context.recovery_route, "rapid_visible")
+        self.assertEqual(final.context.ocr_disagreement, 0.5)
+        self.assertEqual(final.context.resolution_entropy, 1.0)
+        self.assertTrue(final.context.has_conflict)
+
+    def test_contextual_api_uses_the_accepted_visible_audit_state(self):
+        considered = {
+            field_name: (evidence(field_name, value),)
+            for field_name, value in BASE_VALUES.items()
+        }
+        primary = resolved_case(considered=considered)
+        primary_row = row()
+        recovery, *_components = processor(
+            primary,
+            resolved_case(),
+            primary_outcome=outcome(primary_row),
+        )
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+        fusion_observations = []
+        policy_observations = []
+        recovery._fusion_audit_observer = fusion_observations.append
+        recovery._policy_audit_observer = policy_observations.append
+
+        final = recovery.process_case_with_confidence_context(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(final.row, audited.row)
+        self.assertEqual(final.row, primary_row)
+        self.assertEqual(final.context.final_class, "NEEDS_REVIEW")
+        self.assertEqual(final.context.policy_route, "deterministic_policy")
+        self.assertEqual(final.context.recovery_route, "primary")
+        self.assertEqual(final.context.visible_completeness, 1.0)
+        self.assertIsNone(final.context.model_margin)
+        self.assertIsNone(final.context.ensemble_agreement)
+        self.assertEqual(
+            tuple(audited.to_dict()),
+            (
+                "row",
+                "audit",
+                "fusion_audit_counts",
+                "policy_audit_counts",
+            ),
+        )
+        self.assertEqual(
+            fusion_observations,
+            [audited.fusion_audit_counts],
+        )
+        self.assertEqual(
+            policy_observations,
+            [audited.policy_audit_counts],
+        )
 
 
 if __name__ == "__main__":
