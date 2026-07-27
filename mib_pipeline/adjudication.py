@@ -259,11 +259,38 @@ def _field(resolved_case: ResolvedCase, field_name: str) -> ResolvedField | None
     return resolved_case.fields.get(field_name)
 
 
+def _is_substantive_value(field_name: str, value: str | None) -> bool:
+    """Separate visible facts from schema/OCR placeholder literals."""
+
+    if not isinstance(value, str):
+        return False
+    normalized = " ".join(value.strip().split()).casefold()
+    if normalized in {"", "unknown", "null"}:
+        return False
+    if field_name == "sponsor_id" and normalized == "spn-0000":
+        return False
+    if field_name in {"arrival_date", "packet_receipt_date"} and (
+        normalized == "1900-01-01"
+    ):
+        return False
+    if field_name in OUTPUT_VALUE_FIELDS:
+        if normalized == "other":
+            return False
+        if normalized == "none" and field_name != "risk_flags":
+            return False
+    # A visibly printed risk ``none`` is a substantive clean observation.
+    return True
+
+
 def _value(resolved_case: ResolvedCase, field_name: str) -> str | None:
     field = _field(resolved_case, field_name)
     if field is None or field.state is not FieldState.RESOLVED:
         return None
-    return field.value
+    return (
+        field.value
+        if _is_substantive_value(field_name, field.value)
+        else None
+    )
 
 
 def _is_visible(field: ResolvedField | None) -> bool:
@@ -271,10 +298,15 @@ def _is_visible(field: ResolvedField | None) -> bool:
     return bool(
         field is not None
         and field.state is FieldState.RESOLVED
+        and _is_substantive_value(field.field_name, field.value)
         and evidence is not None
         and evidence.legible
+        and not evidence.superseded
         and evidence.source == "visible_ocr"
         and evidence.evidence_type is not EvidenceType.TEXT_LAYER
+        and "strikethrough" not in evidence.visual_cues
+        and "sample_denial_watermark" not in evidence.visual_cues
+        and "synthetic_default" not in evidence.visual_cues
     )
 
 
@@ -330,6 +362,10 @@ class AdjudicationEngine:
             and evidence is not None
             and evidence.evidence_type
             in {EvidenceType.ADJUDICATOR_STAMP, EvidenceType.SIGNED_MANUAL_NOTE}
+            and evidence.case_id_hint
+            in {None, resolved_case.case_id}
+            and evidence.applicant_hint
+            in {None, resolved_case.active_applicant}
         ):
             return field.value
         return None
@@ -386,6 +422,13 @@ class AdjudicationEngine:
             for name in resolved_case.fields
             if _is_visible(_field(resolved_case, name))
             and (value := _value(resolved_case, name)) is not None
+            and not (
+                (name == "sponsor_id" and value == "SPN-0000")
+                or (
+                    name == "arrival_date"
+                    and value == "1900-01-01"
+                )
+            )
         }
         if _is_visible(_field(resolved_case, "risk_flags")):
             features["risk_flags"] = "|".join(sorted(flags)) if flags else "none"
@@ -634,6 +677,11 @@ class AdjudicationEngine:
         visa_class = _value(resolved_case, "visa_class")
         visa_visible = _is_visible(_field(resolved_case, "visa_class"))
         sponsor_id = _value(resolved_case, "sponsor_id")
+        # ``SPN-0000`` is the schema-safe serialization sentinel for an
+        # unresolved sponsor.  Even if a malformed upstream stage presents it
+        # as a resolved value, it is never policy evidence.
+        if sponsor_id == "SPN-0000":
+            sponsor_id = None
         home_world = _value(resolved_case, "home_world")
         home_world_visible = _is_visible(_field(resolved_case, "home_world"))
         fee_status = _value(resolved_case, "fee_status")
@@ -686,7 +734,14 @@ class AdjudicationEngine:
         else:
             approval_facts.append("diplomatic_sponsor_exemption")
 
-        arrival = _parse_date(_value(resolved_case, "arrival_date"))
+        arrival_value = _value(resolved_case, "arrival_date")
+        # ``1900-01-01`` is the output-schema sentinel, not a genuinely old
+        # visible application.  Treat it exactly like an unresolved date.
+        arrival = (
+            None
+            if arrival_value == "1900-01-01"
+            else _parse_date(arrival_value)
+        )
         receipt_field = _field(resolved_case, "packet_receipt_date")
         receipt = _parse_date(_value(resolved_case, "packet_receipt_date"))
         if arrival is None:

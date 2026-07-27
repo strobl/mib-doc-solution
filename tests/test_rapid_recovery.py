@@ -11,6 +11,7 @@ from mib_pipeline.adjudication import (
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
 from mib_pipeline.ingestion import Rect
 from mib_pipeline.models import PredictionRow
+from mib_pipeline.decision_recovery import ReviewDenialRecoveryAdjudicator
 from mib_pipeline.provenance import CoordinateTransform, make_ocr_provenance
 from mib_pipeline.recovery_audit import SerializationOrigin
 from mib_pipeline.rapid_recovery import (
@@ -134,6 +135,28 @@ def resolved_case(
         fields=fields,
         unresolved_linkage=unresolved_linkage,
         unresolved_reasons=tuple(unresolved_reasons),
+    )
+
+
+def with_resolved_fields(
+    resolved,
+    **candidates,
+):
+    fields = dict(resolved.fields)
+    for field_name, candidate in candidates.items():
+        fields[field_name] = field(
+            field_name,
+            candidate.value,
+            considered=(candidate,),
+        )
+    return ResolvedCase(
+        case_id=resolved.case_id,
+        active_applicant=resolved.active_applicant,
+        fields=fields,
+        unresolved_linkage=resolved.unresolved_linkage,
+        unresolved_reasons=resolved.unresolved_reasons,
+        rescinded_decision=resolved.rescinded_decision,
+        fusion_audit_counts=resolved.fusion_audit_counts,
     )
 
 
@@ -524,7 +547,9 @@ class RapidFusionModeTests(unittest.TestCase):
         self.assertEqual(factory.calls, 1)
         self.assertEqual(linker.calls, 2)
         self.assertEqual(resolver.calls, 2)
-        self.assertEqual(adjudicator.calls, 2)
+        # The independent policy probe produced no accepted resolved change,
+        # so normal policy is not rerun and no vacuous revalidation is counted.
+        self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(resolver.inputs[-1].kind, "fused")
 
     def test_fused_active_applicant_drives_row_and_recovery_audit(self):
@@ -758,6 +783,194 @@ class RapidFusionModeTests(unittest.TestCase):
                 "species_code"
             ).serialization_after_origin,
             SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
+        )
+
+    def test_late_biohazard_recovery_revalidates_synthetic_reason_and_restores_review_confidence(
+        self,
+    ):
+        required_gaps = (
+            "required_output_unknown:home_world",
+            "required_output_unknown:risk_flags",
+            "required_output_unknown:sponsor_id",
+        )
+        primary_policy = outcome(
+            row(confidence=0.23),
+            review_reasons=required_gaps,
+        )
+        recovered_policy = outcome(
+            row(confidence=0.34),
+            review_reasons=("fee_status_unknown",),
+        )
+        recovered_biohazard = evidence(
+            "biohazard_check",
+            "clean",
+            evidence_type=EvidenceType.BIOMETRIC_SLIP,
+        )
+        primary = resolved_case()
+        fused = with_resolved_fields(
+            resolved_case(),
+            biohazard_check=recovered_biohazard,
+        )
+
+        class PolicyByResolvedBiohazard:
+            def adjudicate_case(self, resolved):
+                biohazard = resolved.fields.get("biohazard_check")
+                if (
+                    biohazard is not None
+                    and biohazard.state is FieldState.RESOLVED
+                    and biohazard.value == "clean"
+                ):
+                    return recovered_policy
+                return primary_policy
+
+        renderer = FakeRenderer()
+        primary_candidates = ("primary",)
+        linker = FakeLinker(primary_candidates=primary_candidates)
+        resolver = FakeResolver(
+            primary,
+            resolved_case(),
+            fused=fused,
+            fusion_enabled=True,
+        )
+        factory = FakeRapidFactory((recovered_biohazard,))
+        recovery = RapidOutputRecoveryProcessor(
+            renderer=renderer,
+            primary_extractor=FakeExtractor(primary_candidates),
+            linker=linker,
+            resolver=resolver,
+            adjudicator=ReviewDenialRecoveryAdjudicator(
+                PolicyByResolvedBiohazard()
+            ),
+            rapid_extractor_factory=factory,
+        )
+
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(audited.row.adjudication, "NEEDS_REVIEW")
+        self.assertEqual(audited.row.confidence, 0.23)
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "contradicted_synthetic_reason_removed_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "late_biohazard_evidence_preserved_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "review_confidence_restored_count"
+            ],
+            1,
+        )
+        self.assertEqual(factory.calls, 1)
+
+    def test_late_signed_authority_is_absolute_over_complete_normal_denial(
+        self,
+    ):
+        signed_approval = evidence(
+            "adjudication",
+            "APPROVED",
+            evidence_type=EvidenceType.SIGNED_MANUAL_NOTE,
+            confidence=0.95,
+        )
+        primary = resolved_case()
+        fused = with_resolved_fields(
+            resolved_case(),
+            adjudication=signed_approval,
+        )
+        primary_candidates = ("primary",)
+        factory = FakeRapidFactory((signed_approval,))
+
+        class PolicyBySignedAuthority:
+            def adjudicate_case(self, resolved):
+                adjudication = resolved.fields.get("adjudication")
+                if (
+                    adjudication is not None
+                    and adjudication.state is FieldState.RESOLVED
+                    and adjudication.value == "APPROVED"
+                ):
+                    return outcome(
+                        row(
+                            adjudication="APPROVED",
+                            confidence=0.93,
+                        ),
+                        approval_facts=(
+                            "authoritative_visible_decision",
+                        ),
+                        authoritative_source=True,
+                    )
+                return outcome(
+                    row(adjudication="DENIED", confidence=0.61),
+                    denial_reasons=("ordinary_policy_denial",),
+                )
+
+        recovery = RapidOutputRecoveryProcessor(
+            renderer=FakeRenderer(),
+            primary_extractor=FakeExtractor(primary_candidates),
+            linker=FakeLinker(primary_candidates=primary_candidates),
+            resolver=FakeResolver(
+                primary,
+                resolved_case(),
+                fused=fused,
+                fusion_enabled=True,
+            ),
+            adjudicator=ReviewDenialRecoveryAdjudicator(
+                PolicyBySignedAuthority()
+            ),
+            rapid_extractor_factory=factory,
+        )
+
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertEqual(audited.row.adjudication, "APPROVED")
+        self.assertEqual(audited.row.confidence, 0.93)
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "signed_late_authority_recovery_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts[
+                "late_adjudication_evidence_preserved_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts["normal_policy_rerun_count"],
+            1,
+        )
+        self.assertEqual(
+            audited.policy_audit_counts["forced_approval_count"],
+            0,
+        )
+
+    def test_policy_probe_without_accepted_change_has_zero_audit_counts(self):
+        primary = resolved_case()
+        recovery, *_rest = processor(
+            primary,
+            primary,
+            fusion_enabled=True,
+            fused_resolved=primary,
+            rapid_candidates=(),
+        )
+
+        audited = recovery.process_case_with_audit(
+            Path(CASE_ID + ".pdf")
+        )
+
+        self.assertTrue(audited.policy_audit_counts)
+        self.assertEqual(
+            sum(audited.policy_audit_counts.values()),
+            0,
         )
 
 
@@ -1879,10 +2092,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 "considered": {"risk_flags": (visible_none,)},
                 "review_reasons": ("unsupported_fee_waiver",),
                 "approval_facts": required_facts,
-                "expected_adjudication": "APPROVED",
-                "expected_confidence": (
-                    XW1_MULTISOURCE_REVIEW_APPROVAL_CONFIDENCE
-                ),
+                "expected_adjudication": "NEEDS_REVIEW",
+                "expected_confidence": 0.25,
             },
         }
 
@@ -2214,14 +2425,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
                 result = recovery.process_case(Path(CASE_ID + ".pdf"))
 
-                expected = primary_row.to_dict()
-                expected.update(
-                    {
-                        "adjudication": "APPROVED",
-                        "confidence": REVIEW_APPROVAL_CONFIDENCE,
-                    }
-                )
-                self.assertEqual(result.to_dict(), expected)
+                self.assertEqual(result, primary_row)
                 self.assertEqual(factory.calls, 0)
 
     def test_review_approval_head_enforces_strict_boundaries_and_common_guards(self):
@@ -2256,6 +2460,18 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                 "candidates": (),
                 "review_reasons": ("required_sponsor_unknown",),
                 "approval_facts": ("no_visible_biohazard_risk",),
+            },
+            "serialized_sponsor_default_abstains": {
+                "prediction": row(sponsor_id="SPN-0000"),
+                "candidates": six_applicant_candidates,
+                "review_reasons": ("required_sponsor_unknown",),
+                "approval_facts": (),
+            },
+            "serialized_arrival_default_abstains": {
+                "prediction": row(arrival_date="1900-01-01"),
+                "candidates": six_applicant_candidates,
+                "review_reasons": ("arrival_date_unknown",),
+                "approval_facts": (),
             },
             "risk_must_normalize_to_none": {
                 "prediction": row(risk_flags="illegible_biometrics"),
@@ -2300,10 +2516,10 @@ class RapidOutputRecoveryTests(unittest.TestCase):
 
         normalized_risk = recovery.process_case(Path(CASE_ID + ".pdf"))
 
-        self.assertEqual(normalized_risk.adjudication, "APPROVED")
+        self.assertEqual(normalized_risk.adjudication, "NEEDS_REVIEW")
         self.assertEqual(
             normalized_risk.confidence,
-            REVIEW_APPROVAL_CONFIDENCE,
+            normalized_risk_row.confidence,
         )
 
     def test_review_approval_head_runs_after_rapid_output_recovery(self):
@@ -2333,8 +2549,8 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         result = recovery.process_case(Path(CASE_ID + ".pdf"))
 
         self.assertEqual(result.species_code, "ARCTURIAN")
-        self.assertEqual(result.adjudication, "APPROVED")
-        self.assertEqual(result.confidence, REVIEW_APPROVAL_CONFIDENCE)
+        self.assertEqual(result.adjudication, "NEEDS_REVIEW")
+        self.assertEqual(result.confidence, 0.37)
         self.assertEqual(factory.calls, 1)
 
     def test_review_approval_head_preserves_authority_and_denial_precedence(self):

@@ -120,7 +120,6 @@ class CandidateEvidence:
 # conflict in the resolver.
 PAGE_TYPE_MARKER_FIELDS = {
     "fee_receipt": "page_type_present_fee_receipt",
-    "other": "page_type_present_other",
     "sponsor_attestation": "page_type_present_sponsor_attestation",
 }
 
@@ -1032,10 +1031,10 @@ class VisibleEvidenceExtractor:
                 marker_box = marker_box.union(line.box)
             confidence = min(line.confidence for line in heading_lines)
         else:
-            # An existing rendered page with no readable heading is the exact
-            # ``other`` bucket used by the frozen first-four-lines feature.
-            marker_box = page.crop_box
-            confidence = 1.0
+            # Only recognized, evidence-bearing types have marker fields.
+            # This branch is defensive because an unrecognized/empty heading
+            # returns ``other`` above and is rejected before marker creation.
+            return None
         return CandidateEvidence(
             field_name=field_name,
             value="present",

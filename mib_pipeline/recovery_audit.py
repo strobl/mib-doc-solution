@@ -16,6 +16,10 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Iterable, Mapping, Union
 
+from .decision_recovery import (
+    POLICY_AUDIT_COUNT_NAMES,
+    empty_policy_audit_counts,
+)
 from .extraction import CandidateEvidence, EvidenceType
 from .ingestion import Rect
 from .models import PredictionRow
@@ -755,6 +759,9 @@ class VisibleRecoveryResult:
     fusion_audit_counts: Mapping[str, int] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    policy_audit_counts: Mapping[str, int] = field(
+        default_factory=empty_policy_audit_counts
+    )
 
     def __post_init__(self) -> None:
         fusion_counts = dict(self.fusion_audit_counts)
@@ -773,6 +780,21 @@ class VisibleRecoveryResult:
             self,
             "fusion_audit_counts",
             MappingProxyType(dict(sorted(fusion_counts.items()))),
+        )
+        policy_counts = dict(self.policy_audit_counts)
+        if set(policy_counts) != set(POLICY_AUDIT_COUNT_NAMES) or any(
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for count in policy_counts.values()
+        ):
+            raise ValueError(
+                "policy audit counts must match the complete frozen contract"
+            )
+        object.__setattr__(
+            self,
+            "policy_audit_counts",
+            MappingProxyType(dict(sorted(policy_counts.items()))),
         )
         if self.row.case_id != self.audit.case_id:
             raise ValueError("row and recovery audit case IDs must match")
@@ -795,6 +817,7 @@ class VisibleRecoveryResult:
             "row": self.row.to_dict(),
             "audit": self.audit.to_dict(),
             "fusion_audit_counts": dict(self.fusion_audit_counts),
+            "policy_audit_counts": dict(self.policy_audit_counts),
         }
 
 
