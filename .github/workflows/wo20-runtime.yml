@@ -49,7 +49,10 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The immutable public archive is 2.88 GB and the first trusted download
+    # can exceed one hour on a cold GitHub-hosted runner.  The hash check and
+    # all later runtime limits remain unchanged.
+    timeout-minutes: 120
 
     outputs:
       source-sha: ${{ steps.source.outputs.sha }}
