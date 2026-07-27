@@ -546,7 +546,7 @@ class ReviewApprovalRecoveryTests(unittest.TestCase):
                 recovered, _baseline = recover(original, resolved_case())
                 self.assertIs(recovered, original)
 
-    def test_denial_recovery_has_priority_over_every_new_approval_rule(self):
+    def test_three_missing_outputs_are_not_a_denial_or_approval_signal(self):
         cases = (
             outcome(
                 review_reasons=(
@@ -588,8 +588,9 @@ class ReviewApprovalRecoveryTests(unittest.TestCase):
                         visible_field("visa_class", "XW-1"),
                     ),
                 )
-                self.assertEqual(recovered.row.adjudication, "DENIED")
-                self.assertIn(
+                self.assertIs(recovered, original)
+                self.assertEqual(recovered.row.adjudication, "NEEDS_REVIEW")
+                self.assertNotIn(
                     "review_denial_three_required_outputs_unknown",
                     recovered.trace.denial_reasons,
                 )
@@ -618,33 +619,38 @@ class ReviewDenialRecoveryTests(unittest.TestCase):
                     field_name,
                 )
 
-    def test_frozen_evidence_backed_rules_recover_review(self):
-        cases = (
-            (
-                outcome(prediction=row(arrival_date="2025-01-01")),
-                resolved_case(
-                    self.SPONSOR,
-                    visible_field("arrival_date", "2025-01-01"),
-                ),
-                "review_denial_sponsor_stale_gt180",
-            ),
-            (
-                outcome(
-                    review_reasons=(
-                        "required_output_unknown:home_world",
-                        "required_output_unknown:risk_flags",
-                        "required_output_unknown:sponsor_id",
-                    )
-                ),
-                resolved_case(),
-                "review_denial_three_required_outputs_unknown",
-            ),
+    def test_visible_stale_sponsor_rule_recovers_review(self):
+        original = outcome(prediction=row(arrival_date="2025-01-01"))
+        resolved = resolved_case(
+            self.SPONSOR,
+            visible_field("arrival_date", "2025-01-01"),
         )
-        for original, resolved, reason in cases:
-            with self.subTest(reason=reason):
-                recovered, baseline = recover(original, resolved)
-                self.assertEqual(baseline.calls, 1)
-                self.assert_recovered(original, recovered, reason)
+        recovered, baseline = recover(original, resolved)
+        self.assertEqual(baseline.calls, 1)
+        self.assert_recovered(
+            original,
+            recovered,
+            "review_denial_sponsor_stale_gt180",
+        )
+
+    def test_missingness_only_remains_review_with_original_confidence(self):
+        original = outcome(
+            review_reasons=(
+                "required_output_unknown:home_world",
+                "required_output_unknown:risk_flags",
+                "required_output_unknown:sponsor_id",
+            ),
+            prediction=row(confidence=0.29),
+        )
+        recovered, baseline = recover(original, resolved_case())
+        self.assertEqual(baseline.calls, 1)
+        self.assertIs(recovered, original)
+        self.assertEqual(recovered.row.adjudication, "NEEDS_REVIEW")
+        self.assertEqual(recovered.row.confidence, 0.29)
+        self.assertNotIn(
+            "review_denial_three_required_outputs_unknown",
+            recovered.trace.denial_reasons,
+        )
 
     def test_other_page_fallback_is_never_policy_evidence(self):
         baseline = outcome(review_reasons=("clean_biohazard_check_missing",))
@@ -756,7 +762,7 @@ class ReviewDenialRecoveryTests(unittest.TestCase):
 
         self.assertIsInstance(recovered, PredictionRow)
         self.assertEqual(tuple(recovered.to_dict()), tuple(original.row.to_dict()))
-        self.assertEqual(recovered.confidence, 0.551819438046983)
+        self.assertEqual(recovered.confidence, original.row.confidence)
 
 
 class PostRecoveryPolicyRevalidationTests(unittest.TestCase):
@@ -776,7 +782,24 @@ class PostRecoveryPolicyRevalidationTests(unittest.TestCase):
             )
         )
         wrapper = ReviewDenialRecoveryAdjudicator(baseline)
-        original = wrapper.adjudicate_staged(resolved_case())
+        policy_outcome = baseline.result
+        original = StagedAdjudication(
+            policy_outcome=policy_outcome,
+            outcome=AdjudicationOutcome(
+                row=replace(
+                    policy_outcome.row,
+                    adjudication="DENIED",
+                    confidence=REVIEW_DENIAL_CONFIDENCE,
+                ),
+                trace=replace(
+                    policy_outcome.trace,
+                    decision="DENIED",
+                    denial_reasons=(
+                        "review_denial_three_required_outputs_unknown",
+                    ),
+                ),
+            ),
+        )
         self.assertEqual(original.outcome.row.adjudication, "DENIED")
 
         baseline.result = outcome(
@@ -825,7 +848,25 @@ class PostRecoveryPolicyRevalidationTests(unittest.TestCase):
             )
         )
         wrapper = ReviewDenialRecoveryAdjudicator(baseline)
-        original = wrapper.adjudicate_staged(resolved_case())
+        policy_outcome = baseline.result
+        original = StagedAdjudication(
+            policy_outcome=policy_outcome,
+            outcome=AdjudicationOutcome(
+                row=replace(
+                    policy_outcome.row,
+                    adjudication="DENIED",
+                    confidence=REVIEW_DENIAL_CONFIDENCE,
+                ),
+                trace=replace(
+                    policy_outcome.trace,
+                    decision="DENIED",
+                    denial_reasons=(
+                        independent,
+                        "review_denial_three_required_outputs_unknown",
+                    ),
+                ),
+            ),
+        )
 
         baseline.result = outcome(
             review_reasons=("fee_status_unknown",),

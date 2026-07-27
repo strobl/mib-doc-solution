@@ -785,7 +785,7 @@ class RapidFusionModeTests(unittest.TestCase):
             SerializationOrigin.RECOVERED_VISIBLE_EVIDENCE,
         )
 
-    def test_late_biohazard_recovery_revalidates_synthetic_reason_and_restores_review_confidence(
+    def test_late_biohazard_recovery_preserves_new_policy_review(
         self,
     ):
         required_gaps = (
@@ -849,12 +849,12 @@ class RapidFusionModeTests(unittest.TestCase):
         )
 
         self.assertEqual(audited.row.adjudication, "NEEDS_REVIEW")
-        self.assertEqual(audited.row.confidence, 0.23)
+        self.assertEqual(audited.row.confidence, 0.34)
         self.assertEqual(
             audited.policy_audit_counts[
                 "contradicted_synthetic_reason_removed_count"
             ],
-            1,
+            0,
         )
         self.assertEqual(
             audited.policy_audit_counts[
@@ -866,7 +866,7 @@ class RapidFusionModeTests(unittest.TestCase):
             audited.policy_audit_counts[
                 "review_confidence_restored_count"
             ],
-            1,
+            0,
         )
         self.assertEqual(factory.calls, 1)
 

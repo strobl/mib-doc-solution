@@ -304,12 +304,11 @@ class ReviewDenialRecoveryAdjudicator:
             and cls._visible_marker(resolved_case, _SPONSOR_ATTESTATION_MARKER)
         ):
             matches.append("review_denial_sponsor_stale_gt180")
-        if {
-            "required_output_unknown:home_world",
-            "required_output_unknown:risk_flags",
-            "required_output_unknown:sponsor_id",
-        }.issubset(reasons):
-            matches.append("review_denial_three_required_outputs_unknown")
+        # Missing output topology is not affirmative evidence of a policy
+        # violation.  The former three-gap rule converted an evidence-poor
+        # review into a denial without any visible disqualifier.  Keep its
+        # reason token in ``SYNTHETIC_DENIAL_REASONS`` solely so revalidation
+        # can remove it from historical staged outcomes; never emit it again.
         return tuple(matches)
 
     @classmethod

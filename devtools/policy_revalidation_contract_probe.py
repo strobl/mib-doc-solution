@@ -21,7 +21,11 @@ from mib_pipeline.adjudication import (
     DecisionTrace,
     PolicyRuleSet,
 )
-from mib_pipeline.decision_recovery import ReviewDenialRecoveryAdjudicator
+from mib_pipeline.decision_recovery import (
+    REVIEW_DENIAL_CONFIDENCE,
+    ReviewDenialRecoveryAdjudicator,
+    StagedAdjudication,
+)
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
 from mib_pipeline.ingestion import Rect
 from mib_pipeline.models import PredictionRow
@@ -311,13 +315,25 @@ def run_contract_probes() -> Mapping[str, int]:
         _RecoveredOutputAwareBaseline()
     )
     primary = _resolved()
-    original = adjudicator.adjudicate_staged(primary)
+    current = adjudicator.adjudicate_staged(primary)
     synthetic_reason = "review_denial_three_required_outputs_unknown"
     _require(
-        original.policy_outcome.row.adjudication == "NEEDS_REVIEW"
-        and original.outcome.row.adjudication == "DENIED"
-        and synthetic_reason in original.outcome.trace.denial_reasons,
-        "legacy synthetic stage was not observed before late recovery",
+        current.policy_outcome.row.adjudication == "NEEDS_REVIEW"
+        and current.outcome.row.adjudication == "NEEDS_REVIEW"
+        and synthetic_reason not in current.outcome.trace.denial_reasons,
+        "retired missingness-only denial was reintroduced",
+    )
+    # Preserve WO-17's backwards-compatibility probe by replaying the exact
+    # historical staged shape.  Current production must not create this
+    # missingness-only denial, but revalidation must still remove one from a
+    # persisted/pre-upgrade staged record after trusted evidence arrives.
+    original = StagedAdjudication(
+        policy_outcome=current.policy_outcome,
+        outcome=_outcome(
+            denial_reasons=(synthetic_reason,),
+            confidence=REVIEW_DENIAL_CONFIDENCE,
+            adjudication="DENIED",
+        ),
     )
     counts["legacy_synthetic_before_late_recovery_count"] += 1
 
@@ -354,7 +370,18 @@ def run_contract_probes() -> Mapping[str, int]:
     independent_adjudicator = ReviewDenialRecoveryAdjudicator(
         _RecoveredOutputAwareBaseline(independent_denial=True)
     )
-    independent_original = independent_adjudicator.adjudicate_staged(primary)
+    independent_current = independent_adjudicator.adjudicate_staged(primary)
+    independent_original = StagedAdjudication(
+        policy_outcome=independent_current.policy_outcome,
+        outcome=_outcome(
+            denial_reasons=(
+                synthetic_reason,
+                "barred_sponsor:visible",
+            ),
+            confidence=REVIEW_DENIAL_CONFIDENCE,
+            adjudication="DENIED",
+        ),
+    )
     independent_final = independent_adjudicator.revalidate_after_recovery(
         recovered,
         original=independent_original,
@@ -446,10 +473,6 @@ def run_contract_probes() -> Mapping[str, int]:
     _require(
         full_synthetic.row.adjudication == "APPROVED"
         and full_synthetic_counts[
-            "contradicted_synthetic_reason_removed_count"
-        ]
-        > 0
-        and full_synthetic_counts[
             "late_recovery_before_revalidation_count"
         ]
         == 1
@@ -467,7 +490,9 @@ def run_contract_probes() -> Mapping[str, int]:
     counts["candidate_late_recovery_before_revalidation_count"] += 1
     counts["candidate_revalidation_after_late_recovery_count"] += 1
     counts["normal_policy_rerun_count"] += 1
-    counts["contradicted_synthetic_reason_removed_count"] += 1
+    counts["contradicted_synthetic_reason_removed_count"] += int(
+        policy_counts["contradicted_synthetic_reason_removed_count"] > 0
+    )
     counts["late_biohazard_evidence_preserved_count"] += 1
 
     signed_scenarios = (
