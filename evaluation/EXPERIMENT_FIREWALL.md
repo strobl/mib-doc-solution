@@ -29,11 +29,11 @@ contracts:
 | Control | Enforced property |
 | --- | --- |
 | `CanonicalHashChainStore` | Canonical JSONL, sequence and previous-head hash, locked append, compare-and-swap, and retained-head truncation detection |
-| `ExperimentLedger` | Unique experiment IDs and strict allowlist-based aggregate-only evidence; case IDs, PDF filenames, row/sample/outcome collections, predictions, and case-score payloads are rejected |
+| `ExperimentLedger` | Immutable `experiment_plan` preregistration followed by at most one plan-bound `experiment_result`; unique IDs and strict allowlist-based aggregate-only results reject case IDs, PDF filenames, row/sample/outcome collections, predictions, and case-score payloads |
 | `FrozenBaselineManifest` | Create-once path, byte-size, and SHA-256 pins; changed artifacts or a changed requested manifest fail verification |
 | `TaintRegistry` | Append-only exposure events; tainted groups cannot be untainted |
 | `RepeatedGroupedSplitManager` | Deterministic repeated K-fold assignment with whole layout/template groups kept together and tainted groups excluded |
-| `ProtectedAccessBudget` | An immutable finite aggregate-only access budget; one exclusive lock covers duplicate detection, limit enforcement, and append, so concurrent writers cannot overspend |
+| `ProtectedAccessBudget` | An immutable finite aggregate-only access budget; its first-event configuration and every access event are validated, and one exclusive lock covers duplicate detection, limit enforcement, and append so concurrent writers cannot overspend |
 | `RuntimeLeakageScanner` | Static Python/JSON scan for MIB case IDs, PDF filenames, case/label lookup maps, filename-to-digest tables, and per-file digest keys; allowlists are exact-path and exact-code only |
 | `CandidatePromotionGate` | The only authority that may persist `PASSED`; it evaluates every hard gate and derives protected authorization from the access ledger |
 | `CandidateStateStore` | Every pass/block decision is hash chained; direct pass injection fails and a blocked candidate never replaces the latest passing candidate |
@@ -69,23 +69,53 @@ committed and never cross into runtime.
 
 ## Experiment contract
 
-Before executing a candidate, record one hypothesis and one primary variable
-unless the experiment is explicitly factorial. The aggregate ledger evidence
-must contain:
+Before executing a candidate, call `ExperimentLedger.preregister` to append
+SHA-256 commitments to one externally retained hypothesis and one primary
+variable, the parent commit, a non-empty exact changed-file scope, evidence
+class, and frozen split-manifest hash. Hash commitments keep free-form plan text
+and any accidental identity outside the ledger. After execution,
+`ExperimentLedger.record_result` appends at most one aggregate-only result bound
+to the exact plan record hash. A result without a plan, a conflicting retry of a
+plan, or any duplicate result fails closed.
 
-- experiment ID and hypothesis;
-- parent commit SHA and exact changed files;
-- evidence class and split-manifest hash;
+The previously published one-stage `event=experiment` records remain readable
+and exactly retryable for backward compatibility, but the legacy API cannot
+create a new one-stage record and old records are not treated as
+preregistrations. Historical work that was not preregistered must be documented
+in a separate `retrospective_not_preregistered` reconciliation artifact; its
+verifier recomputes every evidence and ledger digest, ledger head/length, and
+latest passing-candidate binding. Such an artifact cannot mutate published
+ledgers, consume protected access, or authorize candidate promotion.
+`evaluation/program/RETROSPECTIVE_RECONCILIATION_WO15_WO21.json` is the
+durable WO15–WO21 use-site. It explicitly records
+`preregistered=false`, `promotion_authority=false`,
+`protected_access_consumed=false`, and unchanged baseline/candidate state.
+It is an auditable historical snapshot, not a backfilled governance record.
+
+Together the immutable plan and aggregate result capture the full experiment
+contract. The result is automatically bound to the experiment ID and plan hash,
+and records an adopt, reject, or rollback decision plus a non-identifying
+rationale token. Its evidence must contain:
+
 - baseline and candidate artifact hashes;
 - total, extraction, classification, and calibration scores;
 - catastrophic false approvals, missing rows, and invalid rows;
 - aggregate per-field and adjudication deltas;
 - golden/adversarial regression counts;
+- fold-consistency status and, for public-grouped adoption, repeated fold
+  counts, non-negative fold deltas, and per-repeat means where every repeat
+  still shows a positive gain after its strongest fold is removed;
 - wall time, process CPU time, peak RSS, `/tmp`, model, image, and output sizes;
 - decision-freeze result for a declared confidence-only change;
 - runtime leakage-scan result;
-- protected-access ID, when applicable; and
-- adopt, reject, or rollback decision with rationale.
+- the matching protected-access record hash, when applicable.
+
+For a protected result, `record_result` also verifies that hash against the
+actual configured protected-access ledger, requires the same candidate digest,
+and requires every protected-derived aggregate to match the recorded access
+exactly. An `adopt` result fails when any supplied boolean check is false.
+Recording an experiment result never authorizes promotion;
+`CandidatePromotionGate` remains the only passing authority.
 
 Individual protected-case outcomes must not enter the experiment ledger.
 Diagnosis that reveals a protected case or group appends a taint event before

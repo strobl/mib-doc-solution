@@ -1003,6 +1003,139 @@ class CaseLinkerTests(unittest.TestCase):
         self.assertEqual(result.case_id, "MIB-000001")
         self.assertTrue(result.unresolved)
 
+    def test_fully_scoped_foreign_case_page_is_excluded_without_ambiguity(self):
+        result = linked(
+            candidate(
+                "case_id",
+                "MIB-000001",
+                case_hint="MIB-000001",
+                applicant_hint=None,
+            ),
+            candidate(
+                "applicant_name",
+                "Zed Zarnax",
+                case_hint="MIB-000001",
+                applicant_hint="Zed Zarnax",
+            ),
+            candidate(
+                "fee_status",
+                "paid",
+                case_hint="MIB-000001",
+                applicant_hint="Zed Zarnax",
+            ),
+            candidate(
+                "case_id",
+                "MIB-000002",
+                case_hint="MIB-000002",
+                applicant_hint=None,
+                page=1,
+            ),
+            candidate(
+                "applicant_name",
+                "Other Person",
+                case_hint="MIB-000002",
+                applicant_hint="Other Person",
+                page=1,
+            ),
+            candidate(
+                "fee_status",
+                "unpaid",
+                case_hint="MIB-000002",
+                applicant_hint="Other Person",
+                page=1,
+            ),
+        )
+        resolved = EvidencePrecedenceResolver().resolve(result)
+
+        self.assertFalse(result.unresolved)
+        self.assertEqual(result.active_applicant, "Zed Zarnax")
+        self.assertEqual(resolved.value("fee_status"), "paid")
+        self.assertNotIn(
+            "Other Person",
+            {item.value for item in result.evidence},
+        )
+        self.assertNotIn(
+            "unpaid",
+            {item.value for item in result.evidence},
+        )
+
+    def test_mixed_or_unhinted_foreign_case_page_remains_unresolved(self):
+        unsafe_variants = (
+            (
+                candidate(
+                    "case_id",
+                    "MIB-000002",
+                    case_hint="MIB-000002",
+                    applicant_hint=None,
+                    page=1,
+                ),
+                candidate(
+                    "fee_status",
+                    "unpaid",
+                    case_hint=None,
+                    applicant_hint=None,
+                    page=1,
+                ),
+            ),
+            (
+                candidate(
+                    "case_id",
+                    "MIB-000002",
+                    case_hint="MIB-000002",
+                    applicant_hint=None,
+                    page=0,
+                ),
+            ),
+            (
+                candidate(
+                    "case_id",
+                    "MIB-000002",
+                    case_hint=None,
+                    applicant_hint=None,
+                    page=1,
+                ),
+                candidate(
+                    "fee_status",
+                    "unpaid",
+                    case_hint="MIB-000002",
+                    applicant_hint="Other Person",
+                    page=1,
+                ),
+            ),
+            (
+                candidate(
+                    "case_id",
+                    "MIB-000002",
+                    case_hint="MIB-000002",
+                    applicant_hint=None,
+                    page=1,
+                ),
+                candidate(
+                    "fee_status",
+                    "unpaid",
+                    case_hint="MIB-000001",
+                    applicant_hint="Other Person",
+                    page=1,
+                ),
+            ),
+        )
+        expected_anchor = candidate(
+            "case_id",
+            "MIB-000001",
+            case_hint="MIB-000001",
+            applicant_hint=None,
+        )
+
+        for unsafe in unsafe_variants:
+            with self.subTest(unsafe=unsafe):
+                result = linked(expected_anchor, *unsafe)
+
+                self.assertTrue(result.unresolved)
+                self.assertIn(
+                    "visible case_id conflicts with source filename",
+                    result.unresolved_reasons,
+                )
+
     def test_expected_and_foreign_visible_ids_quarantine_unhinted_facts(self):
         result = linked(
             candidate(

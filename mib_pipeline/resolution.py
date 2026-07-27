@@ -449,6 +449,66 @@ class CaseLinker:
                 return False
         return True
 
+    @classmethod
+    def _case_pages_are_separable(
+        cls,
+        expected_case_id: str,
+        candidates: tuple[CandidateEvidence, ...],
+        conflicting_case_ids: set[str],
+    ) -> bool:
+        """Return whether every visible case occupies an exact, disjoint page.
+
+        A packet can contain an archival page for another case without making
+        the filename-selected case ambiguous.  That is safe only when the
+        expected case is itself visibly anchored and every extracted fact on
+        every case-bearing page carries the same exact case hint as that
+        page's single clean case marker.  Unhinted facts, mixed case markers,
+        or orphan pages keep the conservative unresolved result.
+        """
+
+        visible_ids = {expected_case_id, *conflicting_case_ids}
+        page_case_ids: dict[int, set[str]] = {}
+        for candidate in candidates:
+            if (
+                candidate.field_name == "case_id"
+                and cls._is_clean_visible_candidate(candidate)
+                and candidate.value in visible_ids
+            ):
+                page_case_ids.setdefault(candidate.page_index, set()).add(
+                    candidate.value
+                )
+
+        if not any(
+            page_ids == {expected_case_id}
+            for page_ids in page_case_ids.values()
+        ):
+            return False
+        if (
+            any(len(page_ids) != 1 for page_ids in page_case_ids.values())
+            or not conflicting_case_ids.issubset(
+                {
+                    next(iter(page_ids))
+                    for page_ids in page_case_ids.values()
+                }
+            )
+        ):
+            return False
+
+        for candidate in candidates:
+            page_ids = page_case_ids.get(candidate.page_index)
+            if page_ids is None:
+                return False
+            page_case_id = next(iter(page_ids))
+            if candidate.field_name == "case_id":
+                if (
+                    candidate.value != page_case_id
+                    or candidate.case_id_hint != page_case_id
+                ):
+                    return False
+            elif candidate.case_id_hint != page_case_id:
+                return False
+        return True
+
     @staticmethod
     def _exact_lower_corroboration(
         case_id: str,
@@ -505,7 +565,14 @@ class CaseLinker:
         if expected is not None:
             case_id = expected
             conflicting_visible_case_ids = visible_case_ids - {expected}
-            if conflicting_visible_case_ids:
+            if (
+                conflicting_visible_case_ids
+                and not self._case_pages_are_separable(
+                    expected,
+                    candidates,
+                    conflicting_visible_case_ids,
+                )
+            ):
                 reasons.append("visible case_id conflicts with source filename")
         elif len(visible_case_ids) == 1:
             case_id = next(iter(visible_case_ids))

@@ -13,7 +13,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 try:  # pragma: no cover - all supported challenge hosts are POSIX.
@@ -189,6 +189,94 @@ _AGGREGATE_STRING_VALUES = frozenset(
         "verified",
     }
 )
+_EXPERIMENT_PLAN_KEYS = frozenset(
+    {
+        "changed_files",
+        "evidence_label",
+        "hypothesis_sha256",
+        "parent_commit_sha",
+        "primary_variable_sha256",
+        "split_manifest_sha256",
+    }
+)
+_EXPERIMENT_EVIDENCE_LABELS = frozenset(
+    {"aggregate_only", "protected", "public_grouped_robustness_not_unseen"}
+)
+_EXPERIMENT_RESULT_DECISIONS = frozenset({"adopt", "reject", "rollback"})
+_EXPERIMENT_RESULT_REQUIRED_KEYS = frozenset(
+    {
+        "baseline_artifact_sha256",
+        "candidate_artifact_sha256",
+        "checks",
+        "confusion_counts",
+        "field_metrics",
+        "metrics",
+        "regression_counts",
+    }
+)
+_EXPERIMENT_RESULT_REQUIRED_CHECKS = frozenset(
+    {
+        "decision_freeze_verified",
+        "deterministic",
+        "fold_consistent",
+        "runtime_leakage_clean",
+    }
+)
+_EXPERIMENT_RESULT_REQUIRED_METRICS = frozenset(
+    {
+        "calibration_score",
+        "candidate_image_bytes",
+        "candidate_model_bytes",
+        "catastrophic_false_approvals",
+        "classification_score",
+        "extraction_score",
+        "invalid_records",
+        "missing_records",
+        "output_bytes",
+        "peak_rss_bytes",
+        "process_cpu_seconds",
+        "runtime_seconds",
+        "tmp_bytes",
+        "total_score",
+    }
+)
+_EXPERIMENT_RESULT_REQUIRED_REGRESSIONS = frozenset({"adversarial", "golden"})
+RETROSPECTIVE_RECONCILIATION_SCHEMA_VERSION = (
+    "wo12-retrospective-reconciliation-v1"
+)
+_RECONCILIATION_LEDGER_NAMES = frozenset(
+    {
+        "candidate_state_ledger",
+        "experiment_ledger",
+        "protected_access_ledger",
+        "taint_registry",
+    }
+)
+_RECONCILIATION_EVIDENCE_FILENAMES = {
+    "wo15": "WO15_GROUPED_RECOVERY_EVIDENCE.json",
+    "wo16": "WO16_GROUPED_FUSION_EVIDENCE.json",
+    "wo17": "WO17_POLICY_REVALIDATION_EVIDENCE.json",
+    "wo18": "WO18_DECISION_RECOVERY_EVIDENCE.json",
+    "wo19": "WO19_CONFIDENCE_REFIT_EVIDENCE.json",
+}
+_RECONCILIATION_EVIDENCE_WORK_ORDERS = frozenset(
+    _RECONCILIATION_EVIDENCE_FILENAMES
+)
+_RECONCILIATION_LEDGER_FILENAMES = {
+    "candidate_state_ledger": "candidate_state_ledger.jsonl",
+    "experiment_ledger": "experiment_ledger.jsonl",
+    "protected_access_ledger": "protected_access_ledger.jsonl",
+    "taint_registry": "taint_registry.jsonl",
+}
+_RECONCILIATION_DISPOSITIONS = {
+    "wo15": "rejected_single_fold_concentration",
+    "wo16": "regression_fix_pending",
+    "wo17": "historical_result_revalidation_pending",
+    "wo18": "blocked_precondition_no_promotion",
+    "wo19": "evaluated_no_promotion",
+    "wo20": "pending_runtime_evidence",
+    "wo21": "pending_adversarial_rerun",
+}
 
 
 class ExperimentControlError(ValueError):
@@ -379,6 +467,632 @@ def require_aggregate_only(value: Any) -> None:
         _validate_aggregate_scalar(normalized, child, path=path)
 
 
+def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the immutable, pre-execution experiment contract."""
+
+    if not isinstance(plan, Mapping) or set(plan) != _EXPERIMENT_PLAN_KEYS:
+        raise ExperimentControlError(
+            "experiment plan must contain exactly: "
+            + ", ".join(sorted(_EXPERIMENT_PLAN_KEYS))
+        )
+
+    string_fields = tuple(_EXPERIMENT_PLAN_KEYS - {"changed_files"})
+    if any(not isinstance(plan[name], str) for name in string_fields):
+        raise ExperimentControlError("experiment plan text and hashes must be strings")
+    hypothesis_sha256 = plan["hypothesis_sha256"].strip().lower()
+    primary_variable_sha256 = plan["primary_variable_sha256"].strip().lower()
+    parent_commit_sha = plan["parent_commit_sha"].strip().lower()
+    evidence_label = plan["evidence_label"].strip().casefold()
+    split_manifest_sha256 = plan["split_manifest_sha256"].strip().lower()
+    if not _SHA256_RE.fullmatch(hypothesis_sha256):
+        raise ExperimentControlError(
+            "hypothesis_sha256 must bind one external non-repository hypothesis"
+        )
+    if not _SHA256_RE.fullmatch(primary_variable_sha256):
+        raise ExperimentControlError(
+            "primary_variable_sha256 must bind one external primary variable"
+        )
+    if not re.fullmatch(r"[0-9a-f]{40}", parent_commit_sha):
+        raise ExperimentControlError("parent_commit_sha must be a full Git SHA")
+    if evidence_label not in _EXPERIMENT_EVIDENCE_LABELS:
+        raise ExperimentControlError("experiment evidence_label is invalid")
+    if not _SHA256_RE.fullmatch(split_manifest_sha256):
+        raise ExperimentControlError(
+            "split_manifest_sha256 must be a SHA-256 hex digest"
+        )
+
+    raw_changed_files = plan["changed_files"]
+    if not isinstance(raw_changed_files, (list, tuple)):
+        raise ExperimentControlError("changed_files must be a list of repository paths")
+    if not raw_changed_files:
+        raise ExperimentControlError("changed_files must name at least one changed file")
+    changed_files: list[str] = []
+    for raw_path in raw_changed_files:
+        if not isinstance(raw_path, str):
+            raise ExperimentControlError("changed_files entries must be strings")
+        path = raw_path.strip()
+        pure_path = PurePosixPath(path)
+        if (
+            not path
+            or path != raw_path
+            or "\\" in path
+            or pure_path.is_absolute()
+            or str(pure_path) != path
+            or any(part in {"", ".", ".."} for part in pure_path.parts)
+        ):
+            raise ExperimentControlError(
+                "changed_files entries must be normalized repository-relative paths"
+            )
+        _require_nonidentifying_control_text("changed_files entry", path)
+        changed_files.append(path)
+    if len(set(changed_files)) != len(changed_files):
+        raise ExperimentControlError("changed_files entries must be unique")
+
+    normalized = {
+        "changed_files": sorted(changed_files),
+        "evidence_label": evidence_label,
+        "hypothesis_sha256": hypothesis_sha256,
+        "parent_commit_sha": parent_commit_sha,
+        "primary_variable_sha256": primary_variable_sha256,
+        "split_manifest_sha256": split_manifest_sha256,
+    }
+    canonical_json(normalized)
+    return normalized
+
+
+def _normalize_experiment_result_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    decision: str,
+    evidence_label: str,
+) -> dict[str, Any]:
+    """Require the complete aggregate experiment-result contract."""
+
+    if not isinstance(evidence, Mapping):
+        raise ExperimentControlError("experiment result evidence must be an object")
+    require_aggregate_only(evidence)
+    normalized = json.loads(canonical_json(dict(evidence)))
+    missing_root = _EXPERIMENT_RESULT_REQUIRED_KEYS - set(normalized)
+    if missing_root:
+        raise ExperimentControlError(
+            "experiment result is missing contract keys: "
+            + ", ".join(sorted(missing_root))
+        )
+
+    for key in ("baseline_artifact_sha256", "candidate_artifact_sha256"):
+        if not isinstance(normalized[key], str) or not _SHA256_RE.fullmatch(
+            normalized[key]
+        ):
+            raise ExperimentControlError(f"{key} must be a SHA-256 hex digest")
+
+    checks = normalized["checks"]
+    if not isinstance(checks, Mapping):
+        raise ExperimentControlError("experiment result checks must be an object")
+    missing_checks = _EXPERIMENT_RESULT_REQUIRED_CHECKS - set(checks)
+    if missing_checks or any(
+        not isinstance(value, bool) for value in checks.values()
+    ):
+        raise ExperimentControlError(
+            "experiment result checks are incomplete or non-boolean"
+        )
+
+    metrics = normalized["metrics"]
+    if not isinstance(metrics, Mapping):
+        raise ExperimentControlError("experiment result metrics must be an object")
+    missing_metrics = _EXPERIMENT_RESULT_REQUIRED_METRICS - set(metrics)
+    if missing_metrics:
+        raise ExperimentControlError(
+            "experiment result is missing metrics: "
+            + ", ".join(sorted(missing_metrics))
+        )
+    for name in _EXPERIMENT_RESULT_REQUIRED_METRICS:
+        metric = metrics[name]
+        if (
+            isinstance(metric, bool)
+            or not isinstance(metric, (int, float))
+            or metric < 0
+        ):
+            raise ExperimentControlError(
+                f"experiment result metric must be non-negative: {name}"
+            )
+    score_limits = {
+        "calibration_score": 20.0,
+        "classification_score": 80.0,
+        "extraction_score": 50.0,
+        "total_score": 150.0,
+    }
+    if any(metrics[name] > maximum for name, maximum in score_limits.items()):
+        raise ExperimentControlError("experiment component score is out of range")
+    component_total = (
+        metrics["extraction_score"]
+        + metrics["classification_score"]
+        + metrics["calibration_score"]
+    )
+    if abs(metrics["total_score"] - component_total) > 1e-9:
+        raise ExperimentControlError(
+            "experiment total_score must equal its component scores"
+        )
+
+    regressions = normalized["regression_counts"]
+    if not isinstance(regressions, Mapping):
+        raise ExperimentControlError(
+            "experiment regression_counts must be an object"
+        )
+    missing_regressions = _EXPERIMENT_RESULT_REQUIRED_REGRESSIONS - set(
+        regressions
+    )
+    if missing_regressions or any(
+        isinstance(count, bool) or not isinstance(count, int) or count < 0
+        for count in regressions.values()
+    ):
+        raise ExperimentControlError(
+            "experiment regression counts are incomplete or invalid"
+        )
+
+    for key in ("confusion_counts", "field_metrics"):
+        if not isinstance(normalized[key], Mapping) or not normalized[key]:
+            raise ExperimentControlError(
+                f"experiment result {key} must contain aggregate metrics"
+            )
+
+    protected_hash = normalized.get("protected_access_record_hash")
+    if evidence_label == "protected":
+        if (
+            not isinstance(protected_hash, str)
+            or not _SHA256_RE.fullmatch(protected_hash)
+        ):
+            raise ExperimentControlError(
+                "protected results require a protected access record hash"
+            )
+    elif protected_hash is not None:
+        raise ExperimentControlError(
+            "non-protected results may not claim protected access"
+        )
+
+    if decision == "adopt":
+        if evidence_label == "public_grouped_robustness_not_unseen":
+            fold_count = normalized.get("fold_count")
+            repeat_count = normalized.get("repeat_count")
+            fold_deltas = normalized.get("fold_deltas")
+            repeat_scores = normalized.get("repeat_scores")
+            if (
+                isinstance(fold_count, bool)
+                or not isinstance(fold_count, int)
+                or fold_count < 5
+                or isinstance(repeat_count, bool)
+                or not isinstance(repeat_count, int)
+                or repeat_count < 3
+                or not isinstance(fold_deltas, list)
+                or len(fold_deltas) != fold_count * repeat_count
+                or not isinstance(repeat_scores, list)
+                or len(repeat_scores) != repeat_count
+                or any(
+                    isinstance(delta, bool)
+                    or not isinstance(delta, (int, float))
+                    or delta < 0
+                    for delta in fold_deltas
+                )
+                or any(
+                    isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or score <= 0
+                    for score in repeat_scores
+                )
+            ):
+                raise ExperimentControlError(
+                    "public-grouped adoption requires repeated non-negative fold evidence"
+                )
+            for repeat in range(repeat_count):
+                offset = repeat * fold_count
+                repeat_deltas = fold_deltas[offset : offset + fold_count]
+                observed = sum(repeat_deltas) / fold_count
+                if abs(observed - repeat_scores[repeat]) > 1e-9:
+                    raise ExperimentControlError(
+                        "repeat_scores must equal their repeated-fold means"
+                    )
+                if sum(repeat_deltas) - max(repeat_deltas) <= 1e-12:
+                    raise ExperimentControlError(
+                        "public-grouped adoption may not depend on one fold "
+                        "within any repeat"
+                    )
+        unsafe = (
+            metrics["catastrophic_false_approvals"] != 0
+            or metrics["missing_records"] != 0
+            or metrics["invalid_records"] != 0
+            or any(regressions.values())
+            or any(not value for value in checks.values())
+        )
+        if unsafe:
+            raise ExperimentControlError(
+                "an experiment with failed hard gates cannot be adopted"
+            )
+    return normalized
+
+
+def require_retrospective_reconciliation(value: Any) -> None:
+    """Validate a non-authoritative WO15-WO21 reconciliation artifact.
+
+    This deliberately separate artifact can bind historical evidence to the
+    published ledger snapshot. It can never claim preregistration, mutate a
+    published ledger, consume protected access, or authorize promotion.
+    """
+
+    root_keys = {
+        "authority",
+        "classification",
+        "evidence_files",
+        "integrity_heads",
+        "latest_governed_passing_candidate",
+        "ledger_anchors",
+        "schema_version",
+        "work_order_dispositions",
+    }
+    if not isinstance(value, Mapping) or set(value) != root_keys:
+        raise ExperimentControlError(
+            "retrospective reconciliation has an invalid root schema"
+        )
+    if (
+        value["schema_version"] != RETROSPECTIVE_RECONCILIATION_SCHEMA_VERSION
+        or value["classification"] != "retrospective_not_preregistered"
+    ):
+        raise ExperimentControlError(
+            "retrospective reconciliation classification is invalid"
+        )
+
+    required_authority = {
+        "baseline_state_changed": False,
+        "candidate_promotion_recorded": False,
+        "candidate_state_changed": False,
+        "new_protected_access_recorded": False,
+        "preregistered": False,
+        "promotion_authority": False,
+        "protected_access_consumed": False,
+        "published_ledgers_mutated": False,
+    }
+    if value["authority"] != required_authority:
+        raise ExperimentControlError(
+            "retrospective reconciliation may not claim governance authority"
+        )
+
+    integrity_heads = value["integrity_heads"]
+    if not isinstance(integrity_heads, Mapping) or set(integrity_heads) != {
+        "path",
+        "sha256",
+    }:
+        raise ExperimentControlError("integrity-heads binding is invalid")
+    if (
+        integrity_heads["path"] != "evaluation/program/integrity_heads.json"
+        or not isinstance(integrity_heads["sha256"], str)
+        or not _SHA256_RE.fullmatch(integrity_heads["sha256"])
+    ):
+        raise ExperimentControlError("integrity-heads values are invalid")
+
+    ledger_anchors = value["ledger_anchors"]
+    if (
+        not isinstance(ledger_anchors, Mapping)
+        or set(ledger_anchors) != _RECONCILIATION_LEDGER_NAMES
+    ):
+        raise ExperimentControlError(
+            "retrospective reconciliation must bind every published ledger"
+        )
+    for name, anchor in ledger_anchors.items():
+        if not isinstance(anchor, Mapping) or set(anchor) != {
+            "expected_head",
+            "expected_length",
+            "path",
+            "sha256",
+        }:
+            raise ExperimentControlError(f"{name} has an invalid ledger anchor")
+        if (
+            not isinstance(anchor["expected_head"], str)
+            or not _SHA256_RE.fullmatch(anchor["expected_head"])
+            or isinstance(anchor["expected_length"], bool)
+            or not isinstance(anchor["expected_length"], int)
+            or anchor["expected_length"] < 0
+            or anchor["path"]
+            != f"evaluation/program/{_RECONCILIATION_LEDGER_FILENAMES[name]}"
+            or not isinstance(anchor["sha256"], str)
+            or not _SHA256_RE.fullmatch(anchor["sha256"])
+        ):
+            raise ExperimentControlError(f"{name} ledger anchor is invalid")
+
+    evidence_files = value["evidence_files"]
+    if (
+        not isinstance(evidence_files, Mapping)
+        or set(evidence_files) != _RECONCILIATION_EVIDENCE_WORK_ORDERS
+    ):
+        raise ExperimentControlError(
+            "retrospective reconciliation evidence bindings are invalid"
+        )
+    for work_order, binding in evidence_files.items():
+        if not isinstance(binding, Mapping) or set(binding) != {"path", "sha256"}:
+            raise ExperimentControlError(
+                f"{work_order} reconciliation evidence binding is invalid"
+            )
+        path = binding["path"]
+        if (
+            not isinstance(path, str)
+            or path
+            != f"evaluation/{_RECONCILIATION_EVIDENCE_FILENAMES[work_order]}"
+            or PurePosixPath(path).is_absolute()
+            or str(PurePosixPath(path)) != path
+            or any(part in {"", ".", ".."} for part in PurePosixPath(path).parts)
+            or not isinstance(binding["sha256"], str)
+            or not _SHA256_RE.fullmatch(binding["sha256"])
+        ):
+            raise ExperimentControlError(
+                f"{work_order} reconciliation evidence values are invalid"
+            )
+    if value["work_order_dispositions"] != _RECONCILIATION_DISPOSITIONS:
+        raise ExperimentControlError(
+            "retrospective reconciliation dispositions are invalid"
+        )
+
+    candidate = value["latest_governed_passing_candidate"]
+    if not isinstance(candidate, Mapping) or set(candidate) != {
+        "candidate_sha256",
+        "record_hash",
+        "total_score",
+    }:
+        raise ExperimentControlError(
+            "latest governed passing candidate binding is invalid"
+        )
+    if (
+        not isinstance(candidate["candidate_sha256"], str)
+        or not _SHA256_RE.fullmatch(candidate["candidate_sha256"])
+        or not isinstance(candidate["record_hash"], str)
+        or not _SHA256_RE.fullmatch(candidate["record_hash"])
+        or isinstance(candidate["total_score"], bool)
+        or not isinstance(candidate["total_score"], (int, float))
+        or not 0.0 <= candidate["total_score"] <= 150.0
+    ):
+        raise ExperimentControlError(
+            "latest governed passing candidate values are invalid"
+        )
+    canonical_json(value)
+
+
+def build_retrospective_reconciliation(
+    *,
+    integrity_heads_path: Path | str,
+    evidence_paths: Mapping[str, Path | str],
+) -> dict[str, Any]:
+    """Verify real files and build the non-authoritative reconciliation shape."""
+
+    integrity_path = Path(integrity_heads_path)
+    try:
+        integrity_bytes = integrity_path.read_bytes()
+        integrity = json.loads(integrity_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError("integrity-heads artifact is unreadable") from exc
+    if (
+        not isinstance(integrity, Mapping)
+        or not isinstance(integrity.get("stores"), Mapping)
+        or set(integrity["stores"]) != _RECONCILIATION_LEDGER_NAMES
+    ):
+        raise IntegrityError("integrity-heads store schema is invalid")
+    try:
+        repository_root = integrity_path.resolve().parents[2]
+        integrity_relative_path = integrity_path.resolve().relative_to(
+            repository_root
+        ).as_posix()
+    except (IndexError, ValueError) as exc:
+        raise IntegrityError(
+            "integrity-heads path must be inside a repository layout"
+        ) from exc
+    if integrity_relative_path != "evaluation/program/integrity_heads.json":
+        raise IntegrityError(
+            "integrity-heads path must be evaluation/program/integrity_heads.json"
+        )
+
+    ledger_anchors: dict[str, dict[str, Any]] = {}
+    ledger_records: dict[str, tuple[dict[str, Any], ...]] = {}
+    for name, filename in _RECONCILIATION_LEDGER_FILENAMES.items():
+        anchor = integrity["stores"][name]
+        if not isinstance(anchor, Mapping):
+            raise IntegrityError(f"{name} integrity anchor is invalid")
+        ledger_path = integrity_path.parent / filename
+        try:
+            ledger_bytes = ledger_path.read_bytes()
+        except OSError as exc:
+            raise IntegrityError(f"{name} ledger is unreadable") from exc
+        if _sha256_bytes(ledger_bytes) != anchor.get("sha256"):
+            raise IntegrityError(f"{name} ledger file hash does not match")
+        store = CanonicalHashChainStore(ledger_path)
+        ledger_records[name] = store.verify(
+            expected_head=anchor.get("expected_head"),
+            expected_length=anchor.get("expected_length"),
+        )
+        ledger_anchors[name] = {
+            "expected_head": anchor.get("expected_head"),
+            "expected_length": anchor.get("expected_length"),
+            "path": ledger_path.resolve().relative_to(repository_root).as_posix(),
+            "sha256": anchor.get("sha256"),
+        }
+
+    if (
+        not isinstance(evidence_paths, Mapping)
+        or set(evidence_paths) != _RECONCILIATION_EVIDENCE_WORK_ORDERS
+    ):
+        raise ExperimentControlError(
+            "reconciliation must name the WO15-WO19 evidence files"
+        )
+    evidence_files: dict[str, dict[str, str]] = {}
+    for work_order, raw_path in evidence_paths.items():
+        path = Path(raw_path)
+        try:
+            relative_path = path.resolve().relative_to(repository_root).as_posix()
+            evidence_files[str(work_order)] = {
+                "path": relative_path,
+                "sha256": _sha256_bytes(path.read_bytes()),
+            }
+        except (OSError, ValueError) as exc:
+            raise IntegrityError(
+                f"{work_order} reconciliation evidence is unreadable or external"
+            ) from exc
+
+    passing_records = [
+        record
+        for record in ledger_records["candidate_state_ledger"]
+        if record["payload"].get("event") == "candidate_assessment"
+        and record["payload"].get("decision") == "PASSED"
+    ]
+    if not passing_records:
+        raise IntegrityError("candidate-state ledger has no passing candidate")
+    latest_passing = passing_records[-1]["payload"]
+    try:
+        latest_candidate_sha256 = latest_passing["candidate_sha256"]
+        latest_total_score = latest_passing["aggregate_evidence"]["metrics"][
+            "total_score"
+        ]
+    except (KeyError, TypeError) as exc:
+        raise IntegrityError(
+            "latest passing candidate lacks its aggregate score binding"
+        ) from exc
+
+    artifact = {
+        "authority": {
+            "baseline_state_changed": False,
+            "candidate_promotion_recorded": False,
+            "candidate_state_changed": False,
+            "new_protected_access_recorded": False,
+            "preregistered": False,
+            "promotion_authority": False,
+            "protected_access_consumed": False,
+            "published_ledgers_mutated": False,
+        },
+        "classification": "retrospective_not_preregistered",
+        "evidence_files": evidence_files,
+        "integrity_heads": {
+            "path": integrity_relative_path,
+            "sha256": _sha256_bytes(integrity_bytes),
+        },
+        "latest_governed_passing_candidate": {
+            "candidate_sha256": latest_candidate_sha256,
+            "record_hash": passing_records[-1]["record_hash"],
+            "total_score": latest_total_score,
+        },
+        "ledger_anchors": ledger_anchors,
+        "schema_version": RETROSPECTIVE_RECONCILIATION_SCHEMA_VERSION,
+        "work_order_dispositions": dict(_RECONCILIATION_DISPOSITIONS),
+    }
+    require_retrospective_reconciliation(artifact)
+    normalized = json.loads(canonical_json(artifact))
+    verify_retrospective_reconciliation(
+        normalized,
+        repository_root=repository_root,
+    )
+    return normalized
+
+
+def verify_retrospective_reconciliation(
+    value: Mapping[str, Any],
+    *,
+    repository_root: Path | str,
+) -> None:
+    """Verify every reconciliation path, digest, ledger head, and candidate pin."""
+
+    require_retrospective_reconciliation(value)
+    root = Path(repository_root).resolve()
+
+    def bound_path(relative_path: str) -> Path:
+        candidate = (root / relative_path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise IntegrityError(
+                "reconciliation binding escapes the repository"
+            ) from exc
+        return candidate
+
+    integrity_binding = value["integrity_heads"]
+    integrity_path = bound_path(integrity_binding["path"])
+    try:
+        integrity_bytes = integrity_path.read_bytes()
+        integrity = json.loads(integrity_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError("bound integrity-heads artifact is unreadable") from exc
+    if _sha256_bytes(integrity_bytes) != integrity_binding["sha256"]:
+        raise IntegrityError("bound integrity-heads artifact hash changed")
+    if (
+        not isinstance(integrity, Mapping)
+        or not isinstance(integrity.get("stores"), Mapping)
+        or set(integrity["stores"]) != _RECONCILIATION_LEDGER_NAMES
+    ):
+        raise IntegrityError("bound integrity-heads store schema is invalid")
+
+    for name, anchor in value["ledger_anchors"].items():
+        expected_anchor = {
+            "expected_head": anchor["expected_head"],
+            "expected_length": anchor["expected_length"],
+            "sha256": anchor["sha256"],
+        }
+        if integrity["stores"].get(name) != expected_anchor:
+            raise IntegrityError(
+                f"bound {name} ledger anchor contradicts integrity-heads"
+            )
+        ledger_path = bound_path(anchor["path"])
+        try:
+            ledger_bytes = ledger_path.read_bytes()
+        except OSError as exc:
+            raise IntegrityError(f"bound {name} ledger is unreadable") from exc
+        if _sha256_bytes(ledger_bytes) != anchor["sha256"]:
+            raise IntegrityError(f"bound {name} ledger file hash changed")
+        CanonicalHashChainStore(ledger_path).verify(
+            expected_head=anchor["expected_head"],
+            expected_length=anchor["expected_length"],
+        )
+
+    for work_order, binding in value["evidence_files"].items():
+        evidence_path = bound_path(binding["path"])
+        try:
+            evidence_bytes = evidence_path.read_bytes()
+        except OSError as exc:
+            raise IntegrityError(
+                f"bound {work_order} evidence is unreadable"
+            ) from exc
+        if _sha256_bytes(evidence_bytes) != binding["sha256"]:
+            raise IntegrityError(f"bound {work_order} evidence hash changed")
+
+    candidate_binding = value["latest_governed_passing_candidate"]
+    candidate_records = CanonicalHashChainStore(
+        bound_path(value["ledger_anchors"]["candidate_state_ledger"]["path"])
+    ).verify()
+    passing_candidates = [
+        record
+        for record in candidate_records
+        if record["payload"].get("event") == "candidate_assessment"
+        and record["payload"].get("decision") == "PASSED"
+    ]
+    if (
+        not passing_candidates
+        or passing_candidates[-1]["record_hash"] != candidate_binding["record_hash"]
+    ):
+        raise IntegrityError(
+            "bound candidate is not the latest governed passing candidate"
+        )
+    matching_candidates = [
+        record
+        for record in candidate_records
+        if record["record_hash"] == candidate_binding["record_hash"]
+        and record["payload"].get("event") == "candidate_assessment"
+        and record["payload"].get("decision") == "PASSED"
+    ]
+    if len(matching_candidates) != 1:
+        raise IntegrityError(
+            "bound latest governed candidate is not a passing ledger record"
+        )
+    payload = matching_candidates[0]["payload"]
+    if (
+        payload.get("candidate_sha256") != candidate_binding["candidate_sha256"]
+        or payload.get("aggregate_evidence", {}).get("metrics", {}).get(
+            "total_score"
+        )
+        != candidate_binding["total_score"]
+    ):
+        raise IntegrityError("bound latest governed candidate values changed")
+
+
 class CanonicalHashChainStore:
     """Canonical, hash-chained JSONL with locked append and head-based CAS.
 
@@ -541,16 +1255,48 @@ class CanonicalHashChainStore:
 
 
 class ExperimentLedger:
-    """Append aggregate-only experiment evidence under unique experiment IDs."""
+    """Append legacy evidence or immutable two-stage experiment contracts.
 
-    def __init__(self, path: Path | str) -> None:
+    ``record`` remains available to read and reproduce the already-published
+    legacy ledger. New experiments use ``preregister`` before execution and
+    ``record_result`` after execution. Plans and results are separate hash-chain
+    events, and a result is cryptographically bound to its exact plan record.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        protected_access_path: Path | str | None = None,
+    ) -> None:
         self.store = CanonicalHashChainStore(path)
+        self.protected_access_store = (
+            CanonicalHashChainStore(protected_access_path)
+            if protected_access_path is not None
+            else None
+        )
 
     def experiments(self) -> tuple[dict[str, Any], ...]:
+        """Return legacy one-stage experiment payloads."""
+
         return tuple(
             dict(record["payload"])
             for record in self.store.verify()
             if record["payload"].get("event") == "experiment"
+        )
+
+    def plans(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(record["payload"])
+            for record in self.store.verify()
+            if record["payload"].get("event") == "experiment_plan"
+        )
+
+    def results(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(record["payload"])
+            for record in self.store.verify()
+            if record["payload"].get("event") == "experiment_result"
         )
 
     def record(
@@ -560,9 +1306,13 @@ class ExperimentLedger:
         *,
         expected_head: str | None = None,
     ) -> dict[str, Any]:
+        """Retry an already-published legacy record without creating a new one."""
+
         experiment_id = str(experiment_id).strip()
-        if not experiment_id:
-            raise ExperimentControlError("experiment_id is required")
+        if not _SAFE_DIMENSION_RE.fullmatch(experiment_id):
+            raise ExperimentControlError(
+                "experiment_id must be a non-identifying token"
+            )
         _require_nonidentifying_control_text("experiment_id", experiment_id)
         require_aggregate_only(evidence)
         payload = {
@@ -577,15 +1327,197 @@ class ExperimentLedger:
         ) -> Mapping[str, Any] | None:
             for record in records:
                 existing = record["payload"]
-                if (
-                    existing.get("event") == "experiment"
-                    and existing.get("experiment_id") == experiment_id
-                ):
+                if existing.get("experiment_id") != experiment_id:
+                    continue
+                if existing.get("event") == "experiment":
                     if existing != requested:
                         raise ExperimentControlError(
                             f"experiment_id retry does not match original: {experiment_id}"
                         )
                     return record
+                raise ExperimentControlError(
+                    f"experiment_id is already used by a two-stage event: {experiment_id}"
+                )
+            raise ExperimentControlError(
+                "new one-stage experiment records are forbidden; preregister first"
+            )
+
+        return self.store.append_transactional(
+            payload,
+            expected_head=expected_head,
+            locked_check=check,
+        )
+
+    def preregister(
+        self,
+        experiment_id: str,
+        plan: Mapping[str, Any],
+        *,
+        expected_head: str | None = None,
+    ) -> dict[str, Any]:
+        """Append an immutable experiment plan before candidate execution."""
+
+        experiment_id = str(experiment_id).strip()
+        if not _SAFE_DIMENSION_RE.fullmatch(experiment_id):
+            raise ExperimentControlError(
+                "experiment_id must be a non-identifying token"
+            )
+        _require_nonidentifying_control_text("experiment_id", experiment_id)
+        normalized_plan = _normalize_experiment_plan(plan)
+        payload = {
+            "event": "experiment_plan",
+            "experiment_id": experiment_id,
+            "plan": normalized_plan,
+        }
+
+        def check(
+            records: tuple[dict[str, Any], ...],
+            requested: Mapping[str, Any],
+        ) -> Mapping[str, Any] | None:
+            for record in records:
+                existing = record["payload"]
+                if existing.get("experiment_id") != experiment_id:
+                    continue
+                if existing.get("event") == "experiment_plan":
+                    if existing != requested:
+                        raise ExperimentControlError(
+                            "experiment plan conflicts with immutable "
+                            f"preregistration: {experiment_id}"
+                        )
+                    return record
+                raise ExperimentControlError(
+                    f"experiment_id is already used by another event: {experiment_id}"
+                )
+            return None
+
+        return self.store.append_transactional(
+            payload,
+            expected_head=expected_head,
+            locked_check=check,
+        )
+
+    def record_result(
+        self,
+        experiment_id: str,
+        evidence: Mapping[str, Any],
+        *,
+        decision: str,
+        rationale: str,
+        expected_head: str | None = None,
+    ) -> dict[str, Any]:
+        """Append one aggregate-only outcome bound to a prior immutable plan."""
+
+        experiment_id = str(experiment_id).strip()
+        if not _SAFE_DIMENSION_RE.fullmatch(experiment_id):
+            raise ExperimentControlError(
+                "experiment_id must be a non-identifying token"
+            )
+        _require_nonidentifying_control_text("experiment_id", experiment_id)
+        normalized_decision = str(decision).strip().casefold()
+        if normalized_decision not in _EXPERIMENT_RESULT_DECISIONS:
+            raise ExperimentControlError(
+                "experiment result decision must be adopt, reject, or rollback"
+            )
+        normalized_rationale = str(rationale).strip()
+        if not _SAFE_DIMENSION_RE.fullmatch(normalized_rationale):
+            raise ExperimentControlError(
+                "experiment result rationale must be a non-identifying token"
+            )
+        _require_nonidentifying_control_text("rationale", normalized_rationale)
+
+        records = self.store.verify()
+        matching_plans = [
+            record
+            for record in records
+            if record["payload"].get("event") == "experiment_plan"
+            and record["payload"].get("experiment_id") == experiment_id
+        ]
+        if not matching_plans:
+            raise ExperimentControlError(
+                f"experiment result requires prior preregistration: {experiment_id}"
+            )
+        if len(matching_plans) != 1:
+            raise IntegrityError(
+                f"experiment has multiple preregistrations: {experiment_id}"
+            )
+        plan_record = matching_plans[0]
+        plan_record_hash = plan_record["record_hash"]
+        evidence_label = plan_record["payload"]["plan"]["evidence_label"]
+        normalized_evidence = _normalize_experiment_result_evidence(
+            evidence,
+            decision=normalized_decision,
+            evidence_label=evidence_label,
+        )
+        if evidence_label == "protected":
+            if self.protected_access_store is None:
+                raise ExperimentControlError(
+                    "protected results require the protected-access ledger"
+                )
+            protected_records = self.protected_access_store.verify()
+            ProtectedAccessBudget.validate_store_records(protected_records)
+            protected_record_hash = normalized_evidence[
+                "protected_access_record_hash"
+            ]
+            matching_accesses = [
+                record
+                for record in protected_records
+                if record["record_hash"] == protected_record_hash
+                and record["payload"].get("event") == "protected_access"
+            ]
+            if len(matching_accesses) != 1:
+                raise ExperimentControlError(
+                    "protected result does not match a recorded access"
+                )
+            access = matching_accesses[0]["payload"]
+            if (
+                access.get("candidate_sha256")
+                != normalized_evidence["candidate_artifact_sha256"]
+            ):
+                raise ExperimentControlError(
+                    "protected access candidate does not match experiment result"
+                )
+            protected_result = dict(normalized_evidence)
+            del protected_result["protected_access_record_hash"]
+            if access.get("aggregate_result") != protected_result:
+                raise ExperimentControlError(
+                    "protected result must exactly match its recorded access aggregates"
+                )
+        payload = {
+            "decision": normalized_decision,
+            "event": "experiment_result",
+            "evidence": normalized_evidence,
+            "experiment_id": experiment_id,
+            "plan_record_hash": plan_record_hash,
+            "rationale": normalized_rationale,
+        }
+
+        def check(
+            locked_records: tuple[dict[str, Any], ...],
+            requested: Mapping[str, Any],
+        ) -> Mapping[str, Any] | None:
+            del requested
+            locked_plans = [
+                record
+                for record in locked_records
+                if record["payload"].get("event") == "experiment_plan"
+                and record["payload"].get("experiment_id") == experiment_id
+            ]
+            if len(locked_plans) != 1:
+                raise ExperimentControlError(
+                    f"experiment result requires one preregistration: {experiment_id}"
+                )
+            if locked_plans[0]["record_hash"] != plan_record_hash:
+                raise IntegrityError(
+                    f"experiment plan binding changed: {experiment_id}"
+                )
+            if any(
+                record["payload"].get("event") == "experiment_result"
+                and record["payload"].get("experiment_id") == experiment_id
+                for record in locked_records
+            ):
+                raise ExperimentControlError(
+                    f"experiment result is already recorded: {experiment_id}"
+                )
             return None
 
         return self.store.append_transactional(
@@ -922,6 +1854,78 @@ class ProtectedAccessBudget:
             )
         return configurations[0]
 
+    @classmethod
+    def validate_store_records(
+        cls,
+        records: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Validate configuration and every event in a protected-access ledger."""
+
+        if not records:
+            raise IntegrityError(
+                "protected access ledger has no immutable configuration"
+            )
+        configuration = records[0]["payload"]
+        if (
+            set(configuration) != {"event", "maximum_accesses"}
+            or configuration.get("event") != cls.CONFIGURATION_EVENT
+            or isinstance(configuration.get("maximum_accesses"), bool)
+            or not isinstance(configuration.get("maximum_accesses"), int)
+            or configuration["maximum_accesses"] < 1
+        ):
+            raise IntegrityError(
+                "protected access ledger configuration is invalid"
+            )
+        maximum_accesses = configuration["maximum_accesses"]
+        cls._validate_configuration(
+            records,
+            maximum_accesses=maximum_accesses,
+        )
+
+        accesses: list[Mapping[str, Any]] = []
+        access_ids: set[str] = set()
+        for record in records[1:]:
+            payload = record["payload"]
+            if set(payload) != {
+                "access_id",
+                "aggregate_result",
+                "candidate_sha256",
+                "event",
+                "purpose",
+            } or payload.get("event") != "protected_access":
+                raise IntegrityError(
+                    "protected access ledger contains an invalid event"
+                )
+            access_id = payload["access_id"]
+            purpose = payload["purpose"]
+            candidate_sha256 = payload["candidate_sha256"]
+            if (
+                not isinstance(access_id, str)
+                or not access_id
+                or not _SAFE_DIMENSION_RE.fullmatch(access_id)
+                or not isinstance(purpose, str)
+                or not purpose
+                or _CASE_ID_RE.search(purpose)
+                or _PDF_FILENAME_RE.search(purpose)
+                or not isinstance(candidate_sha256, str)
+                or not _SHA256_RE.fullmatch(candidate_sha256)
+                or access_id in access_ids
+            ):
+                raise IntegrityError(
+                    "protected access ledger contains invalid access metadata"
+                )
+            try:
+                require_aggregate_only(payload["aggregate_result"])
+            except (ExperimentControlError, TypeError) as exc:
+                raise IntegrityError(
+                    "protected access ledger contains invalid aggregate evidence"
+                ) from exc
+            access_ids.add(access_id)
+            accesses.append(record)
+        if len(accesses) > maximum_accesses:
+            raise IntegrityError("protected access ledger exceeds its budget")
+        return maximum_accesses
+
     def _ensure_configuration(self) -> None:
         payload = {
             "event": self.CONFIGURATION_EVENT,
@@ -942,10 +1946,11 @@ class ProtectedAccessBudget:
 
     def accesses(self) -> tuple[dict[str, Any], ...]:
         records = self.store.verify()
-        self._validate_configuration(
-            records,
-            maximum_accesses=self.maximum_accesses,
-        )
+        configured_maximum = self.validate_store_records(records)
+        if configured_maximum != self.maximum_accesses:
+            raise IntegrityError(
+                "protected access budget configuration is immutable"
+            )
         return tuple(
             dict(record["payload"])
             for record in records
@@ -972,7 +1977,11 @@ class ProtectedAccessBudget:
         access_id = str(access_id).strip()
         candidate_sha256 = str(candidate_sha256).strip().lower()
         purpose = str(purpose).strip()
-        if not access_id or not purpose:
+        if (
+            not access_id
+            or not _SAFE_DIMENSION_RE.fullmatch(access_id)
+            or not purpose
+        ):
             raise ExperimentControlError("access_id and purpose are required")
         _require_nonidentifying_control_text("access_id", access_id)
         _require_nonidentifying_control_text("purpose", purpose)
