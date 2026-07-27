@@ -59,11 +59,11 @@ class MissingProcessor:
 
 class WO21CorpusTests(unittest.TestCase):
     def test_corpus_is_external_complete_and_byte_deterministic(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as first_dir:
+        with tempfile.TemporaryDirectory() as first_dir:
             first_golden, first_scenarios, first_sha = build_external_corpus(
                 Path(first_dir)
             )
-            with tempfile.TemporaryDirectory(dir="/private/tmp") as second_dir:
+            with tempfile.TemporaryDirectory() as second_dir:
                 second_golden, second_scenarios, second_sha = (
                     build_external_corpus(Path(second_dir))
                 )
@@ -109,7 +109,7 @@ class WO21CorpusTests(unittest.TestCase):
 
 class WO21EvidenceTests(unittest.TestCase):
     def build(self, processor, *, regression_filed_count=0):
-        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         with patch(
             "devtools.wo21_adversarial_audit.identity_scan",
@@ -181,7 +181,7 @@ class WO21EvidenceTests(unittest.TestCase):
             require_identity_free_evidence(overclaimed)
 
     def test_trusted_clean_docker_attestation_can_close_environment_gates(self):
-        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         with patch(
             "devtools.wo21_adversarial_audit.identity_scan",
@@ -230,7 +230,7 @@ class WO21EvidenceTests(unittest.TestCase):
         )
 
     def test_docker_attestation_without_wo20_provenance_fails_closed(self):
-        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         with patch(
             "devtools.wo21_adversarial_audit.identity_scan",
@@ -254,7 +254,7 @@ class WO21EvidenceTests(unittest.TestCase):
             )
 
     def test_external_source_revision_fails_closed_without_clean_attestation(self):
-        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         with self.assertRaisesRegex(
             WO21AuditError,
@@ -333,7 +333,7 @@ class WO21EvidenceTests(unittest.TestCase):
 
 class WO21IdentityScanTests(unittest.TestCase):
     def test_installed_scope_scans_onnx_traineddata_and_runtime_json(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             roots = (
                 root / "app",
