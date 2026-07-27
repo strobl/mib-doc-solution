@@ -950,7 +950,12 @@ def _declared_layout_taint_probe(
 def _validate_aggregate_shape(aggregate: Mapping[str, Any]) -> None:
     """Reject additions or omissions before JSON or Markdown serialization."""
 
-    require_aggregate_only(aggregate)
+    try:
+        require_aggregate_only(aggregate)
+    except ExperimentControlError as exc:
+        raise GroupedSplitEvidenceBuildError(
+            "aggregate evidence violates the governed schema"
+        ) from exc
     expected_fold_keys = {
         f"repeat_{repeat}_fold_{fold}"
         for repeat in range(1, REPEATS + 1)

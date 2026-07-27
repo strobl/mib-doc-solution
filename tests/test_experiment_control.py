@@ -1,9 +1,12 @@
 import concurrent.futures
+import copy
+import hashlib
 import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from devtools.experiment_control import (
     GENESIS_HASH,
@@ -22,6 +25,9 @@ from devtools.experiment_control import (
     RuntimeLeakageScanner,
     TaintRegistry,
     canonical_json,
+    protected_access_binding,
+    protected_access_summary,
+    require_aggregate_only,
 )
 
 
@@ -95,8 +101,206 @@ class CanonicalHashChainStoreTests(TemporaryDirectoryTestCase):
 
 
 class ExperimentLedgerTests(TemporaryDirectoryTestCase):
+    def setUp(self):
+        super().setUp()
+        (
+            self.split_manifest_path,
+            self.split_manifest_sha256,
+            self.split_fold_layout,
+        ) = self._write_split_manifest(8, name="layout-manifest.json")
+        self.input_dir = self.root / "input-pdfs"
+        self.input_dir.mkdir()
+        manifest = json.loads(
+            self.split_manifest_path.read_text(encoding="utf-8")
+        )
+        for row in manifest["cases"]:
+            (self.input_dir / f"{row['case_id']}.pdf").write_bytes(
+                b"%PDF-fixture\n" + row["case_id"].encode("ascii")
+            )
+        tree_digest = hashlib.sha256()
+        for path in sorted(
+            self.input_dir.glob("*.pdf"),
+            key=lambda item: (item.name.casefold(), item.name),
+        ):
+            name_bytes = path.name.encode("utf-8")
+            tree_digest.update(len(name_bytes).to_bytes(4, "big"))
+            tree_digest.update(name_bytes)
+            tree_digest.update(hashlib.sha256(path.read_bytes()).digest())
+        self.input_tree_sha256 = tree_digest.hexdigest()
+        self._candidate_ledgers = {}
+        self._layout_signature_patcher = mock.patch(
+            "devtools.layout_manifest_freezer.layout_signature",
+            side_effect=self._fixture_layout_signature,
+        )
+        self._rendering_metadata_patcher = mock.patch(
+            "devtools.layout_manifest_freezer._rendering_version_metadata",
+            side_effect=self._fixture_version_metadata,
+        )
+        self._layout_signature_patcher.start()
+        self._rendering_metadata_patcher.start()
+        self.addCleanup(self._layout_signature_patcher.stop)
+        self.addCleanup(self._rendering_metadata_patcher.stop)
+
+    def _write_split_manifest(self, record_count, *, name):
+        group_count = min(10, record_count)
+        cases = [
+            {
+                "case_id": f"MIB-{index + 1:06d}",
+                "layout_group": (
+                    f"page-count-{index % group_count + 1:02d}__"
+                    f"ink-bucket-{index % group_count + 1:02d}"
+                ),
+            }
+            for index in range(record_count)
+        ]
+        payload = {
+            "cases": cases,
+            "folds": 5,
+            "label_blind_construction": True,
+            "layout_signature": {
+                "first_page_grayscale_ink_bucket_width": 0.03,
+                "first_page_grayscale_ink_pixel_threshold_exclusive": 210,
+                "first_page_render_height": 166,
+                "first_page_render_width": 128,
+                "inputs": [
+                    "pdf_page_count",
+                    "first_page_rendered_pixels",
+                ],
+                "pdfium_version": "fixture-pdfium",
+                "pillow_version": "fixture-pillow",
+                "pypdfium2_version": "fixture-pypdfium2",
+                "version": "page-count-plus-first-page-ink-v1",
+            },
+            "repeats": 3,
+            "schema": "mib-wo12-layout-groups/v2",
+            "split_seed": "wo12-fixture-v2",
+        }
+        path = self.root / name
+        content = (canonical_json(payload) + "\n").encode("utf-8")
+        path.write_bytes(content)
+        groups = {}
+        for row in cases:
+            groups.setdefault(row["layout_group"], []).append(row["case_id"])
+        splits = RepeatedGroupedSplitManager(
+            seed=payload["split_seed"],
+            repeats=3,
+            folds=5,
+        ).split_groups(groups)
+        fold_layout = {
+            f"repeat_{split.repeat + 1}_fold_{split.fold + 1}": {
+                "record_count": len(split.validation_case_ids),
+                "validation_group_count": len(split.validation_groups),
+            }
+            for split in splits
+        }
+        digest = __import__("hashlib").sha256(content).hexdigest()
+        return path, digest, fold_layout
+
+    def _fixture_layout_signature(self, pdf_path):
+        case_number = int(Path(pdf_path).stem.split("-")[1])
+        group_number = (case_number - 1) % 8 + 1
+        return group_number, group_number
+
     @staticmethod
-    def plan(**overrides):
+    def _fixture_version_metadata():
+        return {
+            "pillow_version": "fixture-pillow",
+            "pdfium_version": "fixture-pdfium",
+            "pypdfium2_version": "fixture-pypdfium2",
+        }
+
+    def _passing_candidate_state(self, candidate_sha256):
+        existing = self._candidate_ledgers.get(candidate_sha256)
+        if existing is not None:
+            return existing
+        path = self.root / f"candidate-{candidate_sha256[:8]}.jsonl"
+        state = CandidateStateStore(path)
+        gate = CandidatePromotionGate(state)
+        gate.evaluate_and_record(
+            f"assessment-{candidate_sha256[:8]}",
+            candidate_id=f"candidate-{candidate_sha256[:8]}",
+            candidate_sha256=candidate_sha256,
+            baseline_verified=True,
+            leakage_finding_count=0,
+            deterministic=True,
+            false_approvals=0,
+            missing_records=0,
+            invalid_records=0,
+            regression_counts={"adversarial": 0, "golden": 0},
+            fold_consistent=True,
+            access_authorized=True,
+        )
+        result = (
+            path,
+            state.store.head,
+            gate.authorization_for(candidate_sha256),
+        )
+        self._candidate_ledgers[candidate_sha256] = result
+        return result
+
+    def _invoke_record_result(
+        self,
+        ledger,
+        experiment_id,
+        evidence,
+        *,
+        input_dir=None,
+        split_manifest_path=None,
+        **kwargs,
+    ):
+        return ledger.record_result(
+            experiment_id,
+            evidence,
+            input_dir=input_dir or self.input_dir,
+            split_manifest_path=(
+                split_manifest_path or self.split_manifest_path
+            ),
+            **kwargs,
+        )
+
+    def _record_result(
+        self,
+        ledger,
+        experiment_id,
+        evidence,
+        *,
+        split_manifest_path=None,
+        **kwargs,
+    ):
+        decision = kwargs["decision"]
+        if decision == "adopt":
+            (
+                candidate_path,
+                candidate_record_hash,
+                candidate_authorization,
+            ) = (
+                self._passing_candidate_state(
+                    evidence["candidate_artifact_sha256"]
+                )
+            )
+            if evidence.get("candidate_state_record_hash") is None:
+                evidence["candidate_state_record_hash"] = (
+                    candidate_record_hash
+                )
+            kwargs.setdefault(
+                "candidate_state_ledger_path",
+                candidate_path,
+            )
+            kwargs.setdefault(
+                "candidate_state_authorization",
+                candidate_authorization,
+            )
+        return self._invoke_record_result(
+            ledger,
+            experiment_id,
+            evidence,
+            split_manifest_path=(
+                split_manifest_path or self.split_manifest_path
+            ),
+            **kwargs,
+        )
+
+    def plan(self, **overrides):
         value = {
             "changed_files": [
                 "devtools/experiment_control.py",
@@ -106,61 +310,102 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
             "evaluator_sha256": SHA_A,
             "expected_record_count": 8,
             "hypothesis_sha256": SHA_A,
-            "input_tree_sha256": SHA_A,
+            "input_tree_sha256": self.input_tree_sha256,
             "parent_commit_sha": "c" * 40,
             "primary_variable_sha256": SHA_B,
+            "protected_access_binding_sha256": None,
             "runtime_contract_sha256": SHA_A,
-            "split_manifest_sha256": SHA_A,
+            "split_manifest_sha256": self.split_manifest_sha256,
             "truth_sha256": SHA_A,
         }
         value.update(overrides)
         return value
 
-    @staticmethod
-    def result(**overrides):
-        value = {
-            "checks": {
-                "baseline_verified": True,
-                "deterministic": True,
-                "runtime_leakage_clean": True,
-            },
-            "evaluator_sha256": SHA_A,
-            "expected_record_count": 8,
-            "input_tree_sha256": SHA_A,
-            "metrics": {
+    def fold_metrics(self, *, fold_layout=None, score_delta=1.0):
+        fold_layout = fold_layout or self.split_fold_layout
+        return {
+            fold_key: {
+                "baseline_score": 130.0,
+                "candidate_score": 130.0 + score_delta,
+                "catastrophic_false_approvals": 0,
                 "invalid_records": 0,
                 "missing_records": 0,
-                "record_count": 8,
-                "runtime_seconds": 1.0,
+                "record_count": layout["record_count"],
+                "score_delta": score_delta,
+                "validation_group_count": layout[
+                    "validation_group_count"
+                ],
+            }
+            for fold_key, layout in fold_layout.items()
+        }
+
+    def result(self, **overrides):
+        value = {
+            "baseline_artifact_sha256": SHA_A,
+            "candidate_artifact_sha256": SHA_B,
+            "candidate_state_record_hash": None,
+            "checks": {
+                "baseline_verified": True,
+                "candidate_verified": True,
+                "decision_freeze_verified": True,
+                "deterministic": True,
+                "fold_consistent": True,
+                "runtime_leakage_clean": True,
+                "runtime_limits_verified": True,
             },
+            "evaluator_sha256": SHA_A,
+            "evidence_label": "public_grouped_robustness_not_unseen",
+            "expected_record_count": 8,
+            "fold_metrics": self.fold_metrics(),
+            "input_tree_sha256": self.input_tree_sha256,
+            "metrics": {
+                "baseline_total_score": 130.0,
+                "calibration_score": 17.0,
+                "candidate_image_bytes": 1_000_000,
+                "candidate_max_model_artifact_bytes": 0,
+                "candidate_model_bytes": 0,
+                "catastrophic_false_approvals": 0,
+                "classification_score": 69.0,
+                "duplicate_records": 0,
+                "extra_records": 0,
+                "extraction_score": 45.0,
+                "invalid_records": 0,
+                "missing_records": 0,
+                "output_bytes": 2_500,
+                "peak_container_memory_bytes": 1_000_000,
+                "peak_rss_bytes": 1_000_000,
+                "process_cpu_seconds": 20.0,
+                "record_count": 8,
+                "runtime_seconds": 40.0,
+                "score_delta": 1.0,
+                "tmp_bytes": 0,
+                "total_score": 131.0,
+            },
+            "protected_access_record_hash": None,
             "runtime_contract_sha256": SHA_A,
-            "split_manifest_sha256": SHA_A,
+            "runtime_evidence_sha256": SHA_B,
+            "split_manifest_sha256": self.split_manifest_sha256,
             "truth_sha256": SHA_A,
         }
         value.update(overrides)
         return value
 
-    def test_records_aggregate_evidence_and_makes_identical_retry_idempotent(self):
+    def test_legacy_records_remain_readable_but_new_one_stage_writes_are_blocked(self):
         ledger = ExperimentLedger(self.root / "experiments.jsonl")
-        first = ledger.record(
-            "exp-001",
+        legacy = ledger.store.append(
             {
-                "total_score": 130.37,
-                "confusion_counts": {"APPROVED_TO_REVIEW": 115},
-            },
+                "event": "experiment",
+                "experiment_id": "historical-exp",
+                "evidence": {"total_score": 130.37},
+            }
         )
-        retry = ledger.record(
-            "exp-001",
-            {
-                "total_score": 130.37,
-                "confusion_counts": {"APPROVED_TO_REVIEW": 115},
-            },
-        )
-
-        self.assertEqual(first, retry)
-        self.assertEqual(ledger.experiments()[0]["experiment_id"], "exp-001")
         with self.assertRaises(ExperimentControlError):
-            ledger.record("exp-001", {"total_score": 131.0})
+            ledger.record("new-exp", {"total_score": 131.0})
+        self.assertEqual(ledger.experiments()[0], legacy["payload"])
+        self.assertEqual(ledger.store.length, 1)
+
+        with self.assertRaises(ExperimentControlError):
+            ledger.preregister("historical-exp", self.plan())
         self.assertEqual(ledger.store.length, 1)
 
     def test_preregister_then_record_result_are_distinct_and_bound(self):
@@ -170,7 +415,16 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
             "wo12-demo",
             self.plan(changed_files=list(reversed(self.plan()["changed_files"]))),
         )
-        result = ledger.record_result(
+        result = self._record_result(
+            ledger,
+            "wo12-demo",
+            self.result(),
+            decision="reject",
+            rationale="no_runtime_candidate",
+            expected_head=plan["record_hash"],
+        )
+        retry_result = self._record_result(
+            ledger,
             "wo12-demo",
             self.result(),
             decision="reject",
@@ -179,6 +433,7 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
         )
 
         self.assertEqual(plan, retry)
+        self.assertEqual(result, retry_result)
         self.assertEqual(plan["payload"]["event"], "experiment_plan")
         self.assertEqual(result["payload"]["event"], "experiment_result")
         self.assertEqual(
@@ -187,11 +442,13 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
         )
         self.assertEqual(len(ledger.plans()), 1)
         self.assertEqual(len(ledger.results()), 1)
+        self.assertEqual(ledger.store.length, 2)
 
     def test_two_stage_contract_fails_closed(self):
         ledger = ExperimentLedger(self.root / "experiments.jsonl")
         with self.assertRaises(ExperimentControlError):
-            ledger.record_result(
+            self._record_result(
+                ledger,
                 "missing-plan",
                 self.result(),
                 decision="reject",
@@ -201,7 +458,8 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
         ledger.preregister("bound-plan", self.plan())
         mismatched = self.result(input_tree_sha256=SHA_B)
         with self.assertRaises(ExperimentControlError):
-            ledger.record_result(
+            self._record_result(
+                ledger,
                 "bound-plan",
                 mismatched,
                 decision="reject",
@@ -210,29 +468,815 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
         leaked = self.result()
         leaked["metrics"]["notes"] = "MIB-000042.pdf"
         with self.assertRaises(LeakageError):
-            ledger.record_result(
+            self._record_result(
+                ledger,
                 "bound-plan",
                 leaked,
                 decision="reject",
                 rationale="identity_leakage",
             )
 
-        ledger.record_result(
+        self._record_result(
+            ledger,
             "bound-plan",
             self.result(),
             decision="reject",
             rationale="no_runtime_candidate",
         )
         with self.assertRaises(ExperimentControlError):
-            ledger.record_result(
+            self._record_result(
+                ledger,
                 "bound-plan",
                 self.result(),
                 decision="reject",
                 rationale="duplicate_result",
             )
 
-    def test_rejects_nested_case_ids_filenames_and_case_level_keys(self):
+    def test_experiment_id_is_unique_across_legacy_plan_and_result_events(self):
         ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("globally-unique", self.plan())
+        ledger.store.append(
+            {
+                "event": "experiment",
+                "experiment_id": "globally-unique",
+                "evidence": {"total_score": 1.0},
+            }
+        )
+
+        with self.assertRaises(IntegrityError):
+            ledger.preregister("globally-unique", self.plan())
+        with self.assertRaises(IntegrityError):
+            self._record_result(
+                ledger,
+                "globally-unique",
+                self.result(),
+                decision="reject",
+                rationale="legacy_collision",
+            )
+
+    def test_result_schema_rejects_opaque_vectors_and_incomplete_contracts(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("strict-result", self.plan())
+
+        attacks = []
+        missing_binding = self.result()
+        del missing_binding["candidate_artifact_sha256"]
+        attacks.append(missing_binding)
+
+        extra_vector = self.result()
+        extra_vector["fold_scores"] = [0.0] * 15
+        attacks.append(extra_vector)
+
+        opaque_metrics = self.result()
+        opaque_metrics["metrics"] = {
+            f"opaque{i:04d}": i % 2
+            for i in range(8)
+        }
+        attacks.append(opaque_metrics)
+
+        incomplete_checks = self.result()
+        incomplete_checks["checks"] = {}
+        attacks.append(incomplete_checks)
+
+        opaque_fold = self.result()
+        opaque_fold["fold_metrics"]["repeat_1_fold_1"]["opaque"] = 1
+        attacks.append(opaque_fold)
+
+        for index, evidence in enumerate(attacks):
+            with self.subTest(index=index), self.assertRaises(
+                ExperimentControlError
+            ):
+                self._record_result(
+                    ledger,
+                    "strict-result",
+                    evidence,
+                    decision="reject",
+                    rationale=f"schema_attack_{index}",
+                )
+        self.assertEqual(ledger.store.length, 1)
+
+        with self.assertRaises(LeakageError):
+            require_aggregate_only({"fold_scores": [0, 1] * 500})
+        with self.assertRaises(LeakageError):
+            require_aggregate_only(
+                {
+                    "metrics": {
+                        f"opaque{i:04d}": i % 2
+                        for i in range(1_000)
+                    }
+                }
+            )
+
+    def test_covert_aggregate_vectors_and_huge_resource_integers_are_rejected(self):
+        with self.assertRaises(LeakageError):
+            require_aggregate_only(
+                {
+                    f"opaque_{index:02d}_count": index % 2
+                    for index in range(33)
+                }
+            )
+        with self.assertRaises(LeakageError):
+            require_aggregate_only({"fold_scores": [0, 1] * 8})
+        with self.assertRaises(LeakageError):
+            require_aggregate_only(
+                {
+                    f"opaque_{index}_hash": SHA_A
+                    for index in range(4)
+                }
+            )
+        with self.assertRaises(LeakageError):
+            require_aggregate_only(
+                {
+                    "field_metrics": {
+                        f"dimension_{dimension}": {
+                            f"opaque_{metric}_count": metric % 2
+                            for metric in range(32)
+                        }
+                        for dimension in range(32)
+                    }
+                }
+            )
+
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("huge-resource", self.plan())
+        evidence = self.result()
+        evidence["metrics"]["output_bytes"] = (1 << 999) + 12_345
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "huge-resource",
+                evidence,
+                decision="reject",
+                rationale="covert_integer",
+            )
+        self.assertEqual(ledger.store.length, 1)
+
+    def test_grouped_result_requires_exact_three_by_five_complete_coverage(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("grouped-shape", self.plan())
+
+        missing_fold = self.result()
+        del missing_fold["fold_metrics"]["repeat_3_fold_5"]
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "grouped-shape",
+                missing_fold,
+                decision="reject",
+                rationale="missing_fold",
+            )
+
+        extra_fold = self.result()
+        extra_fold["fold_metrics"]["repeat_4_fold_1"] = dict(
+            extra_fold["fold_metrics"]["repeat_1_fold_1"]
+        )
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "grouped-shape",
+                extra_fold,
+                decision="reject",
+                rationale="extra_fold",
+            )
+
+        incomplete_population = self.result()
+        incomplete_population["fold_metrics"]["repeat_2_fold_1"][
+            "record_count"
+        ] -= 1
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "grouped-shape",
+                incomplete_population,
+                decision="reject",
+                rationale="incomplete_population",
+            )
+
+        wrong_group_count = self.result()
+        wrong_group_count["fold_metrics"]["repeat_1_fold_1"][
+            "validation_group_count"
+        ] += 1
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "grouped-shape",
+                wrong_group_count,
+                decision="reject",
+                rationale="fabricated_group_count",
+            )
+
+        fabricated_scores = self.result()
+        for row in fabricated_scores["fold_metrics"].values():
+            row["baseline_score"] = 0.0
+            row["candidate_score"] = 1.0
+            row["score_delta"] = 1.0
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "grouped-shape",
+                fabricated_scores,
+                decision="adopt",
+                rationale="fabricated_fold_scores",
+            )
+
+        changed_manifest = self.root / "changed-layout-manifest.json"
+        changed_manifest.write_bytes(
+            self.split_manifest_path.read_bytes() + b" "
+        )
+        with self.assertRaises(IntegrityError):
+            self._record_result(
+                ledger,
+                "grouped-shape",
+                self.result(),
+                decision="reject",
+                rationale="manifest_hash_mismatch",
+                split_manifest_path=changed_manifest,
+            )
+
+    def test_adopt_requires_a_bound_passing_candidate_state_record(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("state-bound", self.plan())
+
+        same_artifact = self.result(
+            baseline_artifact_sha256=SHA_A,
+            candidate_artifact_sha256=SHA_A,
+        )
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "state-bound",
+                same_artifact,
+                decision="adopt",
+                rationale="same_as_baseline",
+            )
+
+        missing_state = self.result(candidate_state_record_hash=SHA_A)
+        with self.assertRaises(ExperimentControlError):
+            self._invoke_record_result(
+                ledger,
+                "state-bound",
+                missing_state,
+                decision="adopt",
+                rationale="missing_state_ledger",
+            )
+
+        blocked_path = self.root / "blocked-candidate.jsonl"
+        blocked_state = CandidateStateStore(blocked_path)
+        blocked_state.assess(
+            "blocked-assessment",
+            candidate_id="blocked-candidate",
+            candidate_sha256=SHA_B,
+            decision="BLOCKED",
+            aggregate_evidence={"status": "blocked"},
+        )
+        blocked = self.result(
+            candidate_state_record_hash=blocked_state.store.head
+        )
+        with self.assertRaises(IntegrityError):
+            self._invoke_record_result(
+                ledger,
+                "state-bound",
+                blocked,
+                decision="adopt",
+                rationale="blocked_state",
+                candidate_state_ledger_path=blocked_path,
+            )
+
+        forged_path = self.root / "forged-passed-candidate.jsonl"
+        forged_store = CanonicalHashChainStore(forged_path)
+        forged_store.append(
+            {
+                "aggregate_evidence": {
+                    "access_authorized": True,
+                    "baseline_verified": True,
+                    "deterministic": True,
+                    "false_approvals": 0,
+                    "fold_consistent": True,
+                    "gate_results": {
+                        "access_authorized": True,
+                        "baseline_verified": True,
+                        "deterministic": True,
+                        "fold_consistent": True,
+                        "no_false_approvals": True,
+                        "no_invalid_records": True,
+                        "no_leakage": True,
+                        "no_missing_records": True,
+                        "regressions_cleared": True,
+                    },
+                    "hard_gate_failure_count": 0,
+                    "invalid_records": 0,
+                    "leakage_finding_count": 0,
+                    "missing_records": 0,
+                    "promotion_gate_verified": True,
+                    "regression_counts": {
+                        "adversarial": 0,
+                        "golden": 0,
+                    },
+                    "regression_waiver_count": 0,
+                },
+                "assessment_id": "forged-assessment",
+                "candidate_id": "forged-candidate",
+                "candidate_sha256": SHA_B,
+                "decision": "PASSED",
+                "event": "candidate_assessment",
+            }
+        )
+        forged = self.result(
+            candidate_state_record_hash=forged_store.head
+        )
+        with self.assertRaises(IntegrityError):
+            self._invoke_record_result(
+                ledger,
+                "state-bound",
+                forged,
+                decision="adopt",
+                rationale="forged_passed_state",
+                candidate_state_ledger_path=forged_path,
+            )
+
+        _, _, genuine_authorization = self._passing_candidate_state(SHA_A)
+        cloned_authorization = copy.copy(genuine_authorization)
+        self.assertIsNot(cloned_authorization, genuine_authorization)
+        with self.assertRaises(IntegrityError):
+            self._invoke_record_result(
+                ledger,
+                "state-bound",
+                forged,
+                decision="adopt",
+                rationale="cloned_capability",
+                candidate_state_ledger_path=forged_path,
+                candidate_state_authorization=cloned_authorization,
+            )
+
+    def test_protected_result_requires_the_exact_budgeted_access_record(self):
+        access_path = self.root / "protected-access.jsonl"
+        budget = ProtectedAccessBudget(access_path, maximum_accesses=2)
+        binding = protected_access_binding(
+            access_path,
+            maximum_accesses=2,
+        )
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister(
+            "protected-binding",
+            self.plan(
+                evidence_label="protected",
+                protected_access_binding_sha256=binding,
+            ),
+        )
+        evidence = self.result(
+            evidence_label="protected",
+        )
+        budget.record_access(
+            "protected-binding-access",
+            candidate_sha256=SHA_B,
+            aggregate_result=protected_access_summary(evidence),
+            purpose="protected_binding",
+        )
+        evidence["protected_access_record_hash"] = budget.store.head
+        recorded = self._invoke_record_result(
+            ledger,
+            "protected-binding",
+            evidence,
+            decision="reject",
+            rationale="diagnostic_only",
+            protected_access_ledger_path=access_path,
+            protected_access_authorization=budget.authorization_for(
+                "protected-binding-access"
+            ),
+        )
+        self.assertEqual(recorded["payload"]["decision"], "reject")
+
+        second_access_path = self.root / "second-protected-access.jsonl"
+        second_budget = ProtectedAccessBudget(
+            second_access_path,
+            maximum_accesses=2,
+        )
+        second = ExperimentLedger(self.root / "second-experiments.jsonl")
+        second.preregister(
+            "syntax-only-access",
+            self.plan(
+                evidence_label="protected",
+                protected_access_binding_sha256=protected_access_binding(
+                    second_access_path,
+                    maximum_accesses=2,
+                ),
+            ),
+        )
+        syntax_only = self.result(
+            evidence_label="protected",
+            protected_access_record_hash=SHA_A,
+        )
+        with self.assertRaises(ExperimentControlError):
+            self._invoke_record_result(
+                second,
+                "syntax-only-access",
+                syntax_only,
+                decision="reject",
+                rationale="missing_access_ledger",
+            )
+
+        wrong_candidate = self.result(
+            evidence_label="protected",
+        )
+        second_budget.record_access(
+            "wrong-candidate-access",
+            candidate_sha256=SHA_A,
+            aggregate_result=protected_access_summary(wrong_candidate),
+            purpose="wrong_candidate",
+        )
+        wrong_candidate["protected_access_record_hash"] = (
+            second_budget.store.head
+        )
+        with self.assertRaises(IntegrityError):
+            self._invoke_record_result(
+                second,
+                "syntax-only-access",
+                wrong_candidate,
+                decision="reject",
+                rationale="wrong_candidate",
+                protected_access_ledger_path=second_access_path,
+                protected_access_authorization=(
+                    second_budget.authorization_for(
+                        "wrong-candidate-access"
+                    )
+                ),
+            )
+
+        contradictory_path = self.root / "contradictory-access.jsonl"
+        contradictory_budget = ProtectedAccessBudget(
+            contradictory_path,
+            maximum_accesses=1,
+        )
+        contradictory = ExperimentLedger(
+            self.root / "contradictory-experiments.jsonl"
+        )
+        contradictory.preregister(
+            "contradictory-access",
+            self.plan(
+                evidence_label="protected",
+                protected_access_binding_sha256=protected_access_binding(
+                    contradictory_path,
+                    maximum_accesses=1,
+                ),
+            ),
+        )
+        contradictory_evidence = self.result(
+            evidence_label="protected"
+        )
+        contradictory_summary = protected_access_summary(
+            contradictory_evidence
+        )
+        contradictory_summary["metrics"]["total_score"] = 1.0
+        contradictory_budget.record_access(
+            "contradictory-access",
+            candidate_sha256=SHA_B,
+            aggregate_result=contradictory_summary,
+            purpose="contradictory_access",
+        )
+        contradictory_evidence["protected_access_record_hash"] = (
+            contradictory_budget.store.head
+        )
+        with self.assertRaises(IntegrityError):
+            self._invoke_record_result(
+                contradictory,
+                "contradictory-access",
+                contradictory_evidence,
+                decision="reject",
+                rationale="contradictory_result",
+                protected_access_ledger_path=contradictory_path,
+                protected_access_authorization=(
+                    contradictory_budget.authorization_for(
+                        "contradictory-access"
+                    )
+                ),
+            )
+
+    def test_older_passed_retry_reissues_capability_for_its_exact_record(self):
+        candidate_path = self.root / "retry-candidates.jsonl"
+        state = CandidateStateStore(candidate_path)
+        gate = CandidatePromotionGate(state)
+
+        def evaluate(assessment_id, candidate_sha256):
+            return gate.evaluate_and_record(
+                assessment_id,
+                candidate_id=f"candidate-{assessment_id}",
+                candidate_sha256=candidate_sha256,
+                baseline_verified=True,
+                leakage_finding_count=0,
+                deterministic=True,
+                false_approvals=0,
+                missing_records=0,
+                invalid_records=0,
+                regression_counts={"adversarial": 0, "golden": 0},
+                fold_consistent=True,
+                access_authorized=True,
+            )
+
+        first = evaluate("older-pass", SHA_B)
+        first_record_hash = state.store.head
+        evaluate("newer-pass", SHA_A)
+        self.assertEqual(evaluate("older-pass", SHA_B), first)
+
+        ledger = ExperimentLedger(self.root / "retry-experiments.jsonl")
+        ledger.preregister("older-pass-retry", self.plan())
+        evidence = self.result(
+            candidate_state_record_hash=first_record_hash,
+        )
+        recorded = self._invoke_record_result(
+            ledger,
+            "older-pass-retry",
+            evidence,
+            decision="adopt",
+            rationale="exact_retry_record",
+            candidate_state_ledger_path=candidate_path,
+            candidate_state_authorization=gate.authorization_for(SHA_B),
+        )
+        self.assertEqual(recorded["payload"]["decision"], "adopt")
+
+    def test_protected_budget_cannot_be_replaced_after_preregistration(self):
+        planned_path = self.root / "planned-protected-access.jsonl"
+        ProtectedAccessBudget(planned_path, maximum_accesses=2)
+        ledger = ExperimentLedger(self.root / "bound-experiments.jsonl")
+        ledger.preregister(
+            "budget-replacement",
+            self.plan(
+                evidence_label="protected",
+                protected_access_binding_sha256=protected_access_binding(
+                    planned_path,
+                    maximum_accesses=2,
+                ),
+            ),
+        )
+
+        replacement_path = self.root / "replacement-access.jsonl"
+        replacement = ProtectedAccessBudget(
+            replacement_path,
+            maximum_accesses=10_000_000,
+        )
+        evidence = self.result(evidence_label="protected")
+        replacement.record_access(
+            "replacement-access",
+            candidate_sha256=SHA_B,
+            aggregate_result=protected_access_summary(evidence),
+            purpose="replacement_access",
+        )
+        evidence["protected_access_record_hash"] = replacement.store.head
+
+        with self.assertRaises(IntegrityError):
+            self._invoke_record_result(
+                ledger,
+                "budget-replacement",
+                evidence,
+                decision="reject",
+                rationale="replacement_budget",
+                protected_access_ledger_path=replacement_path,
+                protected_access_authorization=(
+                    replacement.authorization_for("replacement-access")
+                ),
+            )
+
+    def test_split_manifest_groups_are_recomputed_from_the_bound_pdfs(self):
+        engineered = json.loads(
+            self.split_manifest_path.read_text(encoding="utf-8")
+        )
+        engineered["cases"][0]["layout_group"] = (
+            engineered["cases"][1]["layout_group"]
+        )
+        engineered_path = self.root / "label-engineered-manifest.json"
+        engineered_bytes = (
+            canonical_json(engineered) + "\n"
+        ).encode("utf-8")
+        engineered_path.write_bytes(engineered_bytes)
+        engineered_sha256 = hashlib.sha256(engineered_bytes).hexdigest()
+
+        ledger = ExperimentLedger(
+            self.root / "engineered-experiments.jsonl"
+        )
+        ledger.preregister(
+            "engineered-layout",
+            self.plan(split_manifest_sha256=engineered_sha256),
+        )
+        evidence = self.result(
+            split_manifest_sha256=engineered_sha256
+        )
+        with self.assertRaises(IntegrityError):
+            self._record_result(
+                ledger,
+                "engineered-layout",
+                evidence,
+                decision="reject",
+                rationale="label_engineered_groups",
+                split_manifest_path=engineered_path,
+            )
+
+    def test_preregister_detects_multiple_results_for_one_plan(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("duplicate-result-records", self.plan())
+        first = self._record_result(
+            ledger,
+            "duplicate-result-records",
+            self.result(),
+            decision="reject",
+            rationale="first_result",
+        )
+        ledger.store.append(first["payload"])
+
+        with self.assertRaises(IntegrityError):
+            ledger.preregister(
+                "duplicate-result-records",
+                self.plan(),
+            )
+
+    def test_plan_population_is_bounded_and_result_cas_detects_intervening_write(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        for count in (4, 5_001):
+            with self.subTest(count=count), self.assertRaises(
+                ExperimentControlError
+            ):
+                ledger.preregister(
+                    f"bad-population-{count}",
+                    self.plan(expected_record_count=count),
+                )
+
+        first = ledger.preregister("first-plan", self.plan())
+        ledger.preregister("intervening-plan", self.plan())
+        with self.assertRaises(CompareAndSwapError):
+            self._record_result(
+                ledger,
+                "first-plan",
+                self.result(),
+                decision="reject",
+                rationale="stale_head",
+                expected_head=first["record_hash"],
+            )
+        self.assertEqual(len(ledger.results()), 0)
+
+    def test_adopt_requires_every_gate_gain_count_and_runtime_cap(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("adoption-gates", self.plan())
+
+        failed_gate = self.result()
+        failed_gate["checks"]["runtime_limits_verified"] = False
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "adoption-gates",
+                failed_gate,
+                decision="adopt",
+                rationale="failed_gate",
+            )
+
+        wrong_count = self.result()
+        wrong_count["metrics"]["record_count"] = 7
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "adoption-gates",
+                wrong_count,
+                decision="adopt",
+                rationale="wrong_count",
+            )
+
+        unsafe = self.result()
+        unsafe["metrics"]["catastrophic_false_approvals"] = 1
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "adoption-gates",
+                unsafe,
+                decision="adopt",
+                rationale="unsafe",
+            )
+
+        slow = self.result()
+        slow["metrics"]["runtime_seconds"] = 48.01
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "adoption-gates",
+                slow,
+                decision="adopt",
+                rationale="runtime_cap",
+            )
+
+        concentrated = self.result()
+        for repeat in range(1, 4):
+            for fold in range(1, 6):
+                row = concentrated["fold_metrics"][
+                    f"repeat_{repeat}_fold_{fold}"
+                ]
+                row["candidate_score"] = (
+                    135.0 if fold == 1 else 129.0
+                )
+                row["score_delta"] = (
+                    5.0 if fold == 1 else -1.0
+                )
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "adoption-gates",
+                concentrated,
+                decision="adopt",
+                rationale="single_fold_gain",
+            )
+
+        negative_fold = self.result()
+        for repeat in range(1, 4):
+            for fold in range(1, 6):
+                row = negative_fold["fold_metrics"][
+                    f"repeat_{repeat}_fold_{fold}"
+                ]
+                delta = -0.5 if fold == 1 else 1.5
+                row["candidate_score"] = row["baseline_score"] + delta
+                row["score_delta"] = delta
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "adoption-gates",
+                negative_fold,
+                decision="adopt",
+                rationale="negative_fold",
+            )
+
+        adopted = self._record_result(
+            ledger,
+            "adoption-gates",
+            self.result(),
+            decision="adopt",
+            rationale="all_gates_passed",
+        )
+        self.assertEqual(adopted["payload"]["decision"], "adopt")
+
+    def test_adopt_enforces_the_official_four_hour_runtime_cap(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("official-runtime-cap", self.plan())
+        evidence = self.result()
+        evidence["metrics"]["runtime_seconds"] = 14_400.01
+
+        with self.assertRaises(ExperimentControlError):
+            self._record_result(
+                ledger,
+                "official-runtime-cap",
+                evidence,
+                decision="adopt",
+                rationale="over_four_hours",
+            )
+
+    def test_exact_result_retry_is_idempotent_under_concurrency(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        plan = ledger.preregister("concurrent-result", self.plan())
+
+        def write_result():
+            return self._record_result(
+                ledger,
+                "concurrent-result",
+                self.result(),
+                decision="reject",
+                rationale="concurrent_retry",
+                expected_head=plan["record_hash"],
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            records = list(executor.map(lambda _: write_result(), range(16)))
+
+        self.assertEqual(
+            {record["record_hash"] for record in records},
+            {records[0]["record_hash"]},
+        )
+        self.assertEqual(ledger.store.length, 2)
+
+    def test_concurrent_mismatched_results_append_exactly_one(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        ledger.preregister("mismatched-writers", self.plan())
+        barrier = threading.Barrier(2)
+
+        def write_result(rationale):
+            barrier.wait()
+            return self._record_result(
+                ledger,
+                "mismatched-writers",
+                self.result(),
+                decision="reject",
+                rationale=rationale,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(write_result, rationale)
+                for rationale in ("first_writer", "second_writer")
+            ]
+            outcomes = []
+            for future in futures:
+                try:
+                    outcomes.append(("ok", future.result()))
+                except ExperimentControlError as exc:
+                    outcomes.append(("error", exc))
+
+        self.assertEqual([kind for kind, _ in outcomes].count("ok"), 1)
+        self.assertEqual([kind for kind, _ in outcomes].count("error"), 1)
+        self.assertEqual(ledger.store.length, 2)
+
+    def test_rejects_nested_case_ids_filenames_and_case_level_keys(self):
         unsafe_values = (
             {"notes": ["MIB-000042 was wrong"]},
             {"artifact": "train/MIB-000042.pdf"},
@@ -241,10 +1285,9 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
         )
         for index, value in enumerate(unsafe_values):
             with self.subTest(index=index), self.assertRaises(LeakageError):
-                ledger.record(f"exp-{index}", value)
+                require_aggregate_only(value)
 
     def test_strict_schema_rejects_record_shapes_and_retains_aggregate_hashes(self):
-        ledger = ExperimentLedger(self.root / "experiments.jsonl")
         unsafe_values = (
             {"rows": [{"score": 1.0}]},
             {"samples": [{"score": 1.0}]},
@@ -255,13 +1298,14 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
             {"metrics": {"outcomes": 1}},
             {"file_sha256": SHA_A},
             {"document_id": "opaque"},
+            {"counts": {"MIB-000001": 1, "MIB-000002": 0}},
+            {"counts": {"arbitrary_token": 1}},
         )
         for index, value in enumerate(unsafe_values):
             with self.subTest(index=index), self.assertRaises(LeakageError):
-                ledger.record(f"unsafe-{index}", value)
+                require_aggregate_only(value)
 
-        ledger.record(
-            "safe",
+        require_aggregate_only(
             {
                 "artifact_sha256": SHA_A,
                 "fold_scores": [129.0, 130.0, 131.0],

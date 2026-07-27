@@ -9,11 +9,14 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import os
 import re
+import stat
 import tempfile
+import weakref
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 try:  # pragma: no cover - all supported challenge hosts are POSIX.
@@ -61,10 +64,15 @@ _AGGREGATE_SCALAR_KEYS = frozenset(
     {
         "accuracy",
         "access_authorized",
+        "baseline_score",
+        "baseline_total_score",
         "baseline_verified",
         "blank_records",
         "brier_score",
         "calibration_score",
+        "candidate_image_bytes",
+        "candidate_max_model_artifact_bytes",
+        "candidate_model_bytes",
         "candidate_score",
         "catastrophic_false_approvals",
         "classification_score",
@@ -72,66 +80,114 @@ _AGGREGATE_SCALAR_KEYS = frozenset(
         "deterministic",
         "duplicate_records",
         "error_count",
+        "expected_record_count",
         "extra_records",
         "extraction_score",
         "false_approvals",
+        "fold_count",
         "fold_consistent",
         "fraction",
+        "group_count",
         "hard_gate_failure_count",
+        "input_pdf_count",
         "invalid_records",
+        "largest_group_count",
+        "layout_group_count",
         "leakage_clean",
         "leakage_finding_count",
+        "matching_layout_taint_group_count",
+        "matching_layout_taint_record_count",
         "mean_brier",
         "mean",
         "median",
         "min",
         "max",
         "missing_records",
+        "output_bytes",
+        "peak_container_memory_bytes",
         "peak_rss_bytes",
+        "positive_target_count",
         "record_count",
         "regression_waiver_count",
         "repeat_count",
         "precision",
+        "process_cpu_seconds",
+        "promotion_gate_verified",
         "recall",
         "rate",
         "runtime_seconds",
         "score",
         "score_delta",
+        "singleton_group_count",
+        "smallest_group_count",
+        "split_count",
         "stddev",
+        "synthetic_exclusion_group_count",
+        "synthetic_exclusion_record_count",
+        "taint_event_count",
         "total_count",
         "total_score",
+        "training_case_count",
+        "tmp_bytes",
+        "tuning_group_count",
+        "tuning_record_count",
         "value",
+        "validation_group_assignment_count",
+        "validation_group_count",
+        "validation_record_assignment_count",
+        "validation_record_count",
         "variance",
         "warning_count",
+        "whole_public_cohort_taint_token_event_count",
     }
 )
-_AGGREGATE_SCALAR_SUFFIXES = (
-    "_accuracy",
-    "_authorized",
-    "_brier",
-    "_bytes",
-    "_clean",
-    "_consistent",
-    "_count",
-    "_delta",
-    "_deterministic",
-    "_fraction",
-    "_gap",
-    "_loss",
-    "_max",
-    "_mean",
-    "_median",
-    "_min",
-    "_percentage",
-    "_rate",
-    "_score",
-    "_seconds",
-    "_stddev",
-    "_total",
-    "_variance",
-    "_verified",
+_AGGREGATE_HASH_KEYS = frozenset(
+    {
+        "artifact_sha256",
+        "baseline_artifact_sha256",
+        "baseline_manifest_sha256",
+        "candidate_artifact_sha256",
+        "candidate_sha256",
+        "candidate_state_record_hash",
+        "dataset_archive_sha256",
+        "dimension_source_sha256",
+        "evaluator_sha256",
+        "expected_input_tree_sha256",
+        "expected_layout_manifest_sha256",
+        "expected_taint_registry_sha256",
+        "expected_tool_source_sha256",
+        "file_sha256",
+        "frozen_baseline_manifest_sha256",
+        "hypothesis_sha256",
+        "input_tree_sha256",
+        "layout_manifest_sha256",
+        "manifest_sha256",
+        "plan_record_hash",
+        "predictions_sha256",
+        "primary_variable_sha256",
+        "protected_access_record_hash",
+        "record_hash",
+        "runtime_contract_sha256",
+        "runtime_evidence_sha256",
+        "runtime_graph_sha256",
+        "source_sha256",
+        "split_manifest_sha256",
+        "submission_sha256",
+        "taint_registry_head_sha256",
+        "taint_registry_sha256",
+        "tool_source_sha256",
+        "trace_tool_sha256",
+        "truth_sha256",
+    }
 )
-_AGGREGATE_HASH_SUFFIXES = ("_sha256", "_sha", "_hash")
+_AGGREGATE_REVISION_KEYS = frozenset(
+    {
+        "baseline_commit_sha",
+        "checkout_revision_sha",
+        "parent_commit_sha",
+        "source_revision_sha",
+    }
+)
 _AGGREGATE_CONTAINER_KEYS = frozenset(
     {
         "checks",
@@ -154,6 +210,74 @@ _AGGREGATE_NESTED_METRIC_CONTAINERS = frozenset(
         "field_metrics",
         "fold_metrics",
         "per_field_metrics",
+    }
+)
+_AGGREGATE_FIELD_DIMENSIONS = frozenset(
+    {
+        "adjudication",
+        "applicant_name",
+        "arrival_date",
+        "confidence",
+        "declared_purpose",
+        "fee_status",
+        "home_world",
+        "risk",
+        "risk_flags",
+        "species_code",
+        "sponsor_id",
+        "visa_class",
+    }
+)
+_AGGREGATE_CLASS_DIMENSIONS = frozenset(
+    {
+        "approved",
+        "denied",
+        "needs_review",
+        "negative",
+        "positive",
+        "unknown",
+    }
+)
+_AGGREGATE_CONFUSION_DIMENSIONS = frozenset(
+    f"{truth}_to_{prediction}"
+    for truth in ("approved", "denied", "needs_review")
+    for prediction in ("approved", "denied", "needs_review")
+)
+_AGGREGATE_CHECK_DIMENSIONS = frozenset(
+    {
+        "baseline_verified",
+        "candidate_verified",
+        "decision_freeze_verified",
+        "deterministic",
+        "fold_consistent",
+        "group_exclusive",
+        "input_population_matches_manifest",
+        "input_tree_digest_verified",
+        "leakage_clean",
+        "manifest_canonical_freezer_output",
+        "manifest_declares_label_blind_construction",
+        "manifest_digest_verified",
+        "no_unseen_or_protected_claim",
+        "population_coverage_once_per_repeat",
+        "public_robustness_not_unseen",
+        "runtime_leakage_clean",
+        "runtime_limits_verified",
+        "source_revision_verified",
+        "split_deterministic",
+        "synthetic_exclusion_mechanics_verified",
+        "tool_source_verified",
+        "whole_public_cohort_taint_token_present",
+    }
+)
+_AGGREGATE_REGRESSION_DIMENSIONS = frozenset(
+    {
+        "adversarial",
+        "confidence",
+        "decision",
+        "extraction",
+        "golden",
+        "runtime",
+        "schema",
     }
 )
 _AGGREGATE_SEQUENCE_KEYS = frozenset(
@@ -199,6 +323,7 @@ _EXPERIMENT_PLAN_KEYS = frozenset(
         "input_tree_sha256",
         "parent_commit_sha",
         "primary_variable_sha256",
+        "protected_access_binding_sha256",
         "runtime_contract_sha256",
         "split_manifest_sha256",
         "truth_sha256",
@@ -223,6 +348,177 @@ _EXPERIMENT_EVIDENCE_LABELS = frozenset(
     }
 )
 _EXPERIMENT_RESULT_DECISIONS = frozenset({"adopt", "reject", "rollback"})
+_EXPERIMENT_RESULT_KEYS = frozenset(
+    {
+        "baseline_artifact_sha256",
+        "candidate_artifact_sha256",
+        "candidate_state_record_hash",
+        "checks",
+        "evaluator_sha256",
+        "evidence_label",
+        "expected_record_count",
+        "fold_metrics",
+        "input_tree_sha256",
+        "metrics",
+        "protected_access_record_hash",
+        "runtime_contract_sha256",
+        "runtime_evidence_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    }
+)
+_EXPERIMENT_RESULT_CHECKS = frozenset(
+    {
+        "baseline_verified",
+        "candidate_verified",
+        "decision_freeze_verified",
+        "deterministic",
+        "fold_consistent",
+        "runtime_leakage_clean",
+        "runtime_limits_verified",
+    }
+)
+_EXPERIMENT_RESULT_METRICS = frozenset(
+    {
+        "baseline_total_score",
+        "calibration_score",
+        "candidate_image_bytes",
+        "candidate_max_model_artifact_bytes",
+        "candidate_model_bytes",
+        "catastrophic_false_approvals",
+        "classification_score",
+        "duplicate_records",
+        "extra_records",
+        "extraction_score",
+        "invalid_records",
+        "missing_records",
+        "output_bytes",
+        "peak_container_memory_bytes",
+        "peak_rss_bytes",
+        "process_cpu_seconds",
+        "record_count",
+        "runtime_seconds",
+        "score_delta",
+        "tmp_bytes",
+        "total_score",
+    }
+)
+_EXPERIMENT_RESULT_INTEGER_METRICS = frozenset(
+    {
+        "candidate_image_bytes",
+        "candidate_max_model_artifact_bytes",
+        "candidate_model_bytes",
+        "catastrophic_false_approvals",
+        "duplicate_records",
+        "extra_records",
+        "invalid_records",
+        "missing_records",
+        "output_bytes",
+        "peak_container_memory_bytes",
+        "peak_rss_bytes",
+        "record_count",
+        "tmp_bytes",
+    }
+)
+_EXPERIMENT_FOLD_KEYS = frozenset(
+    f"repeat_{repeat}_fold_{fold}"
+    for repeat in range(1, 4)
+    for fold in range(1, 6)
+)
+_EXPERIMENT_FOLD_METRICS = frozenset(
+    {
+        "baseline_score",
+        "candidate_score",
+        "catastrophic_false_approvals",
+        "invalid_records",
+        "missing_records",
+        "record_count",
+        "score_delta",
+        "validation_group_count",
+    }
+)
+_WO12_MANIFEST_ROOT_KEYS = frozenset(
+    {
+        "cases",
+        "folds",
+        "label_blind_construction",
+        "layout_signature",
+        "repeats",
+        "schema",
+        "split_seed",
+    }
+)
+_WO12_LAYOUT_SIGNATURE_KEYS = frozenset(
+    {
+        "first_page_grayscale_ink_bucket_width",
+        "first_page_grayscale_ink_pixel_threshold_exclusive",
+        "first_page_render_height",
+        "first_page_render_width",
+        "inputs",
+        "pillow_version",
+        "pdfium_version",
+        "pypdfium2_version",
+        "version",
+    }
+)
+_WO12_CASE_ID_RE = re.compile(r"MIB-[0-9]{6}")
+_WO12_LAYOUT_GROUP_RE = re.compile(
+    r"page-count-[0-9]{2,}__ink-bucket-[0-9]{2,}"
+)
+_CANDIDATE_ASSESSMENT_KEYS = frozenset(
+    {
+        "aggregate_evidence",
+        "assessment_id",
+        "candidate_id",
+        "candidate_sha256",
+        "decision",
+        "event",
+    }
+)
+_PROMOTION_GATE_RESULT_KEYS = frozenset(
+    {
+        "access_authorized",
+        "baseline_verified",
+        "deterministic",
+        "fold_consistent",
+        "no_false_approvals",
+        "no_invalid_records",
+        "no_leakage",
+        "no_missing_records",
+        "regressions_cleared",
+    }
+)
+_PROTECTED_ACCESS_KEYS = frozenset(
+    {
+        "access_id",
+        "aggregate_result",
+        "candidate_sha256",
+        "event",
+        "purpose",
+    }
+)
+_MAX_AGGREGATE_ROOT_ENTRIES = 32
+_MAX_AGGREGATE_CONTAINER_ENTRIES = 32
+_MAX_AGGREGATE_NESTED_METRICS = 32
+_MAX_AGGREGATE_SEQUENCE_VALUES = 15
+_MAX_AGGREGATE_SCALAR_VALUES = 192
+_MAX_AGGREGATE_ABSOLUTE_VALUE = 1_000_000_000_000.0
+_MAX_AGGREGATE_COUNT = 10_000_000
+_MAX_AGGREGATE_BYTES = 1024**4
+_MAX_AGGREGATE_SECONDS = 31.0 * 24.0 * 60.0 * 60.0
+_MAX_SPLIT_MANIFEST_BYTES = 4 * 1024**2
+_MAX_EXPERIMENT_RECORD_COUNT = 5_000
+_MAX_RUNTIME_SECONDS = 4.0 * 60.0 * 60.0
+_MAX_RUNTIME_SECONDS_PER_RECORD = 6.0
+_MAX_PROCESS_CPU_SECONDS = 120_000.0
+_MAX_IMAGE_BYTES = 4 * 1024**3
+_MAX_MODEL_BYTES = 1024**3
+_MAX_MODEL_ARTIFACT_BYTES = 250 * 1024**2
+_MAX_OUTPUT_BYTES = 25 * 1024**2
+_MAX_MEMORY_BYTES = 8 * 1024**3
+_MAX_TMP_BYTES = 2 * 1024**3
+_MAX_RESOURCE_REPRESENTATION_BYTES = 1024**4
+_MAX_RESOURCE_REPRESENTATION_SECONDS = 31.0 * 24.0 * 60.0 * 60.0
 
 
 class ExperimentControlError(ValueError):
@@ -274,7 +570,9 @@ def _record_hash(sequence: int, previous_hash: str, payload: Mapping[str, Any]) 
 
 
 def _require_sha256(name: str, value: Any) -> str:
-    normalized = str(value).strip().lower()
+    if not isinstance(value, str):
+        raise ExperimentControlError(f"{name} must be a SHA-256 hex digest")
+    normalized = value.strip().lower()
     if not _SHA256_RE.fullmatch(normalized):
         raise ExperimentControlError(f"{name} must be a SHA-256 hex digest")
     return normalized
@@ -298,14 +596,20 @@ def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         )
     changed_files: list[str] = []
     for raw_path in raw_changed_files:
-        path = str(raw_path).strip()
+        if not isinstance(raw_path, str):
+            raise ExperimentControlError(
+                "experiment plan changed_files entries must be strings"
+            )
+        path = raw_path.strip()
+        pure_path = PurePosixPath(path)
         _require_nonidentifying_control_text("changed_files", path)
-        parts = path.split("/")
         if (
             not path
-            or path.startswith("/")
+            or path != raw_path
             or "\\" in path
-            or any(part in {"", ".", ".."} for part in parts)
+            or pure_path.is_absolute()
+            or str(pure_path) != path
+            or any(part in {"", ".", ".."} for part in pure_path.parts)
         ):
             raise ExperimentControlError(
                 "experiment plan changed_files must be relative POSIX paths"
@@ -316,7 +620,11 @@ def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             "experiment plan changed_files must not contain duplicates"
         )
 
-    evidence_label = str(plan["evidence_label"]).strip()
+    if not isinstance(plan["evidence_label"], str):
+        raise ExperimentControlError(
+            "experiment plan evidence_label must be a string"
+        )
+    evidence_label = plan["evidence_label"].strip().casefold()
     if evidence_label not in _EXPERIMENT_EVIDENCE_LABELS:
         raise ExperimentControlError(
             "experiment plan evidence_label is not governed"
@@ -325,12 +633,16 @@ def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     if (
         isinstance(expected_record_count, bool)
         or not isinstance(expected_record_count, int)
-        or expected_record_count < 1
+        or not 5 <= expected_record_count <= _MAX_EXPERIMENT_RECORD_COUNT
     ):
         raise ExperimentControlError(
-            "experiment plan expected_record_count must be positive"
+            "experiment plan expected_record_count must be between 5 and 5000"
         )
-    parent_commit_sha = str(plan["parent_commit_sha"]).strip().lower()
+    if not isinstance(plan["parent_commit_sha"], str):
+        raise ExperimentControlError(
+            "experiment plan parent_commit_sha must be a Git SHA"
+        )
+    parent_commit_sha = plan["parent_commit_sha"].strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", parent_commit_sha):
         raise ExperimentControlError(
             "experiment plan parent_commit_sha must be a Git SHA"
@@ -344,45 +656,312 @@ def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     }
     for key in sorted(_EXPERIMENT_PLAN_SHA256_KEYS):
         normalized[key] = _require_sha256(key, plan[key])
+    protected_binding = plan["protected_access_binding_sha256"]
+    if evidence_label == "protected":
+        normalized["protected_access_binding_sha256"] = _require_sha256(
+            "protected_access_binding_sha256",
+            protected_binding,
+        )
+    elif protected_binding is not None:
+        raise ExperimentControlError(
+            "only protected plans may bind a protected access budget"
+        )
+    else:
+        normalized["protected_access_binding_sha256"] = None
     return normalized
+
+
+def _read_external_split_manifest(path: Path | str) -> bytes:
+    """Read one bounded, regular manifest snapshot outside the repository."""
+
+    raw_path = Path(path)
+    if not raw_path.is_absolute():
+        raise IntegrityError("split manifest path must be absolute")
+    try:
+        resolved = raw_path.resolve(strict=True)
+        repository_root = Path(__file__).resolve().parents[1]
+        if resolved == repository_root or repository_root in resolved.parents:
+            raise IntegrityError(
+                "split manifest must remain outside the repository"
+            )
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(raw_path, flags)
+    except IntegrityError:
+        raise
+    except OSError as exc:
+        raise IntegrityError("split manifest is not a readable regular file") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > _MAX_SPLIT_MANIFEST_BYTES
+        ):
+            raise IntegrityError("split manifest is not a bounded regular file")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise IntegrityError("split manifest changed while being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise IntegrityError("split manifest changed while being read")
+        after = os.fstat(descriptor)
+        current = raw_path.stat()
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        if identity_before != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or (before.st_dev, before.st_ino) != (
+            current.st_dev,
+            current.st_ino,
+        ):
+            raise IntegrityError("split manifest changed while being read")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise IntegrityError("split manifest could not be read atomically") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _verify_experiment_split_manifest(
+    path: Path | str,
+    *,
+    input_dir: Path | str,
+    expected_input_tree_sha256: str,
+    expected_sha256: str,
+    expected_record_count: int,
+) -> dict[str, dict[str, int]]:
+    """Bind exact 3x5 aggregate rows to a canonical external WO-12 manifest."""
+
+    content = _read_external_split_manifest(path)
+    if _sha256_bytes(content) != _require_sha256(
+        "split_manifest_sha256", expected_sha256
+    ):
+        raise IntegrityError(
+            "split manifest does not match the preregistered SHA-256"
+        )
+    try:
+        raw = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError(
+            "split manifest must be canonical UTF-8 JSON"
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != _WO12_MANIFEST_ROOT_KEYS
+        or content != (canonical_json(raw) + "\n").encode("utf-8")
+    ):
+        raise IntegrityError(
+            "split manifest does not match canonical WO-12 v2 schema"
+        )
+    split_seed = raw["split_seed"]
+    if (
+        raw["schema"] != "mib-wo12-layout-groups/v2"
+        or raw["repeats"] != 3
+        or raw["folds"] != 5
+        or raw["label_blind_construction"] is not True
+        or not isinstance(split_seed, str)
+        or not split_seed
+        or split_seed != split_seed.strip()
+        or len(split_seed) > 256
+    ):
+        raise IntegrityError("split manifest has an invalid WO-12 contract")
+
+    signature = raw["layout_signature"]
+    expected_signature = {
+        "first_page_grayscale_ink_bucket_width": 0.03,
+        "first_page_grayscale_ink_pixel_threshold_exclusive": 210,
+        "first_page_render_height": 166,
+        "first_page_render_width": 128,
+        "inputs": ["pdf_page_count", "first_page_rendered_pixels"],
+        "version": "page-count-plus-first-page-ink-v1",
+    }
+    if (
+        not isinstance(signature, dict)
+        or set(signature) != _WO12_LAYOUT_SIGNATURE_KEYS
+        or any(signature.get(key) != value for key, value in expected_signature.items())
+        or any(
+            not isinstance(signature.get(key), str)
+            or not signature[key].strip()
+            or len(signature[key]) > 128
+            for key in (
+                "pillow_version",
+                "pdfium_version",
+                "pypdfium2_version",
+            )
+        )
+    ):
+        raise IntegrityError(
+            "split manifest has invalid label-blind signature metadata"
+        )
+
+    rows = raw["cases"]
+    if (
+        not isinstance(rows, list)
+        or len(rows) != expected_record_count
+        or any(
+            not isinstance(row, dict)
+            or set(row) != {"case_id", "layout_group"}
+            or not isinstance(row["case_id"], str)
+            or _WO12_CASE_ID_RE.fullmatch(row["case_id"]) is None
+            or not isinstance(row["layout_group"], str)
+            or len(row["layout_group"]) > 80
+            or _WO12_LAYOUT_GROUP_RE.fullmatch(row["layout_group"]) is None
+            for row in rows
+        )
+        or [row["case_id"] for row in rows]
+        != sorted(row["case_id"] for row in rows)
+    ):
+        raise IntegrityError("split manifest case rows are invalid")
+
+    groups: dict[str, list[str]] = {}
+    seen_case_ids: set[str] = set()
+    for row in rows:
+        case_id = row["case_id"]
+        if case_id in seen_case_ids:
+            raise IntegrityError(
+                "split manifest case identities must occur exactly once"
+            )
+        seen_case_ids.add(case_id)
+        groups.setdefault(row["layout_group"], []).append(case_id)
+    if len(groups) < 5:
+        raise IntegrityError(
+            "split manifest must contain at least five layout groups"
+        )
+
+    try:
+        splits = RepeatedGroupedSplitManager(
+            seed=split_seed,
+            repeats=3,
+            folds=5,
+        ).split_groups(groups)
+    except ExperimentControlError as exc:
+        raise IntegrityError("split manifest cannot produce the governed layout") from exc
+    expected_folds: dict[str, dict[str, int]] = {}
+    repeat_assignments: list[tuple[tuple[str, int], ...]] = []
+    all_groups = set(groups)
+    for repeat in range(3):
+        repeat_splits = tuple(
+            split for split in splits if split.repeat == repeat
+        )
+        if len(repeat_splits) != 5:
+            raise IntegrityError("split manifest did not produce exact 3x5 folds")
+        covered_groups: set[str] = set()
+        covered_cases: set[str] = set()
+        assignment: list[tuple[str, int]] = []
+        for split in repeat_splits:
+            validation_groups = set(split.validation_groups)
+            validation_cases = set(split.validation_case_ids)
+            if (
+                validation_groups & set(split.tuning_groups)
+                or validation_cases & set(split.tuning_case_ids)
+                or covered_groups & validation_groups
+                or covered_cases & validation_cases
+            ):
+                raise IntegrityError(
+                    "split manifest violates whole-group exclusivity"
+                )
+            covered_groups.update(validation_groups)
+            covered_cases.update(validation_cases)
+            assignment.extend(
+                (group_id, split.fold) for group_id in validation_groups
+            )
+            expected_folds[
+                f"repeat_{repeat + 1}_fold_{split.fold + 1}"
+            ] = {
+                "record_count": len(validation_cases),
+                "validation_group_count": len(validation_groups),
+            }
+        if covered_groups != all_groups or covered_cases != seen_case_ids:
+            raise IntegrityError(
+                "split manifest does not cover the full population per repeat"
+            )
+        repeat_assignments.append(tuple(sorted(assignment)))
+    if len(set(repeat_assignments)) != 3:
+        raise IntegrityError(
+            "split manifest repeats must produce distinct group assignments"
+        )
+    if set(expected_folds) != _EXPERIMENT_FOLD_KEYS:
+        raise IntegrityError("split manifest did not produce exact 3x5 folds")
+
+    try:
+        from devtools import grouped_split_evidence
+
+        snapshot = grouped_split_evidence._strict_freezer_manifest(
+            path,
+            expected_sha256=expected_sha256,
+        )
+        actual_input_tree_sha256 = (
+            grouped_split_evidence._verify_input_tree_and_recomputed_manifest(
+                input_dir,
+                snapshot,
+                expected_sha256=expected_input_tree_sha256,
+            )
+        )
+    except Exception as exc:
+        if isinstance(exc, IntegrityError):
+            raise
+        raise IntegrityError(
+            "split manifest is not derived from the bound label-blind PDF tree"
+        ) from exc
+    if actual_input_tree_sha256 != _require_sha256(
+        "input_tree_sha256", expected_input_tree_sha256
+    ):
+        raise IntegrityError(
+            "recomputed split input tree does not match its plan"
+        )
+    return expected_folds
 
 
 def _normalize_experiment_result(
     evidence: Mapping[str, Any],
     *,
     plan: Mapping[str, Any],
+    decision: str,
+    expected_folds: Mapping[str, Mapping[str, int]],
 ) -> dict[str, Any]:
-    """Validate aggregate evidence and bind it to its immutable plan."""
+    """Validate one exact, bounded 3x5 result bound to its immutable plan."""
 
     if not isinstance(evidence, Mapping):
         raise ExperimentControlError("experiment result evidence is required")
     require_aggregate_only(evidence)
     normalized = json.loads(canonical_json(dict(evidence)))
-    required = {
-        "checks",
-        "evaluator_sha256",
-        "expected_record_count",
-        "input_tree_sha256",
-        "metrics",
-        "runtime_contract_sha256",
-        "split_manifest_sha256",
-        "truth_sha256",
-    }
-    if not required.issubset(normalized):
+    if set(normalized) != _EXPERIMENT_RESULT_KEYS:
         raise ExperimentControlError(
-            "experiment result is missing governed bindings or aggregates"
+            "experiment result must contain the exact governed result schema"
         )
-    if not isinstance(normalized["checks"], dict) or not isinstance(
-        normalized["metrics"], dict
+
+    evidence_label = normalized["evidence_label"]
+    if (
+        not isinstance(evidence_label, str)
+        or evidence_label != plan["evidence_label"]
     ):
         raise ExperimentControlError(
-            "experiment result checks and metrics must be objects"
+            "experiment result evidence_label does not match its plan"
         )
-    for key, value in normalized["checks"].items():
-        if not isinstance(value, bool):
-            raise ExperimentControlError(
-                f"experiment result check must be boolean: {key}"
-            )
+    for key in (
+        "baseline_artifact_sha256",
+        "candidate_artifact_sha256",
+        "evaluator_sha256",
+        "input_tree_sha256",
+        "runtime_contract_sha256",
+        "runtime_evidence_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    ):
+        normalized[key] = _require_sha256(key, normalized[key])
     for key in (
         "evaluator_sha256",
         "input_tree_sha256",
@@ -390,15 +969,361 @@ def _normalize_experiment_result(
         "split_manifest_sha256",
         "truth_sha256",
     ):
-        normalized[key] = _require_sha256(key, normalized[key])
         if normalized[key] != plan[key]:
             raise ExperimentControlError(
                 f"experiment result {key} does not match its plan"
             )
-    if normalized["expected_record_count"] != plan["expected_record_count"]:
+    protected_access_record_hash = normalized["protected_access_record_hash"]
+    if evidence_label == "protected":
+        normalized["protected_access_record_hash"] = _require_sha256(
+            "protected_access_record_hash",
+            protected_access_record_hash,
+        )
+    elif protected_access_record_hash is not None:
+        raise ExperimentControlError(
+            "non-protected results may not claim protected access"
+        )
+    candidate_state_record_hash = normalized["candidate_state_record_hash"]
+    if decision == "adopt":
+        normalized["candidate_state_record_hash"] = _require_sha256(
+            "candidate_state_record_hash",
+            candidate_state_record_hash,
+        )
+        if (
+            normalized["candidate_artifact_sha256"]
+            == normalized["baseline_artifact_sha256"]
+        ):
+            raise ExperimentControlError(
+                "an adopted candidate must differ from the frozen baseline"
+            )
+    elif candidate_state_record_hash is not None:
+        raise ExperimentControlError(
+            "non-adopted results may not claim candidate promotion state"
+        )
+
+    expected_record_count = normalized["expected_record_count"]
+    if (
+        isinstance(expected_record_count, bool)
+        or not isinstance(expected_record_count, int)
+        or expected_record_count != plan["expected_record_count"]
+    ):
         raise ExperimentControlError(
             "experiment result record count does not match its plan"
         )
+
+    checks = normalized["checks"]
+    if (
+        not isinstance(checks, Mapping)
+        or set(checks) != _EXPERIMENT_RESULT_CHECKS
+        or any(not isinstance(value, bool) for value in checks.values())
+    ):
+        raise ExperimentControlError(
+            "experiment result checks must contain the exact boolean gate schema"
+        )
+
+    metrics = normalized["metrics"]
+    if not isinstance(metrics, Mapping) or set(metrics) != _EXPERIMENT_RESULT_METRICS:
+        raise ExperimentControlError(
+            "experiment result metrics must contain the exact metric schema"
+        )
+    for name in _EXPERIMENT_RESULT_METRICS:
+        value = metrics[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or (
+                name not in {"score_delta"}
+                and float(value) < 0.0
+            )
+            or (
+                name in _EXPERIMENT_RESULT_INTEGER_METRICS
+                and not isinstance(value, int)
+            )
+        ):
+            raise ExperimentControlError(
+                f"experiment result metric is invalid: {name}"
+            )
+    if any(
+        int(metrics[name]) > expected_record_count
+        for name in (
+            "catastrophic_false_approvals",
+            "duplicate_records",
+            "extra_records",
+            "invalid_records",
+            "missing_records",
+            "record_count",
+        )
+    ):
+        raise ExperimentControlError(
+            "experiment result record metrics exceed the planned population"
+        )
+    score_limits = {
+        "baseline_total_score": 150.0,
+        "calibration_score": 20.0,
+        "classification_score": 80.0,
+        "extraction_score": 50.0,
+        "total_score": 150.0,
+    }
+    if any(float(metrics[name]) > limit for name, limit in score_limits.items()):
+        raise ExperimentControlError("experiment result score is out of range")
+    byte_metrics = (
+        "candidate_image_bytes",
+        "candidate_max_model_artifact_bytes",
+        "candidate_model_bytes",
+        "output_bytes",
+        "peak_container_memory_bytes",
+        "peak_rss_bytes",
+        "tmp_bytes",
+    )
+    if any(
+        int(metrics[name]) > _MAX_RESOURCE_REPRESENTATION_BYTES
+        for name in byte_metrics
+    ) or any(
+        float(metrics[name]) > _MAX_RESOURCE_REPRESENTATION_SECONDS
+        for name in ("process_cpu_seconds", "runtime_seconds")
+    ):
+        raise ExperimentControlError(
+            "experiment resource metric exceeds its representation cap"
+        )
+    component_total = (
+        float(metrics["extraction_score"])
+        + float(metrics["classification_score"])
+        + float(metrics["calibration_score"])
+    )
+    if not math.isclose(
+        float(metrics["total_score"]),
+        component_total,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ExperimentControlError(
+            "experiment total_score must equal its component scores"
+        )
+    expected_delta = (
+        float(metrics["total_score"])
+        - float(metrics["baseline_total_score"])
+    )
+    if not math.isclose(
+        float(metrics["score_delta"]),
+        expected_delta,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ExperimentControlError(
+            "experiment score_delta must equal candidate minus baseline"
+        )
+
+    fold_metrics = normalized["fold_metrics"]
+    if not isinstance(fold_metrics, Mapping) or set(fold_metrics) != _EXPERIMENT_FOLD_KEYS:
+        raise ExperimentControlError(
+            "experiment result must contain exactly three repeats of five folds"
+        )
+    if set(expected_folds) != _EXPERIMENT_FOLD_KEYS:
+        raise IntegrityError("verified split layout is not exact 3x5 evidence")
+    repeat_deltas: list[float] = []
+    for repeat in range(1, 4):
+        repeat_rows: list[Mapping[str, Any]] = []
+        for fold in range(1, 6):
+            fold_key = f"repeat_{repeat}_fold_{fold}"
+            fold_row = fold_metrics[fold_key]
+            if (
+                not isinstance(fold_row, Mapping)
+                or set(fold_row) != _EXPERIMENT_FOLD_METRICS
+            ):
+                raise ExperimentControlError(
+                    f"experiment fold has an invalid schema: {fold_key}"
+                )
+            for name in ("baseline_score", "candidate_score", "score_delta"):
+                value = fold_row[name]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                ):
+                    raise ExperimentControlError(
+                        f"experiment fold metric is invalid: {fold_key}.{name}"
+                    )
+            if not (
+                0.0 <= float(fold_row["baseline_score"]) <= 150.0
+                and 0.0 <= float(fold_row["candidate_score"]) <= 150.0
+            ):
+                raise ExperimentControlError(
+                    f"experiment fold score is out of range: {fold_key}"
+                )
+            if not math.isclose(
+                float(fold_row["score_delta"]),
+                float(fold_row["candidate_score"])
+                - float(fold_row["baseline_score"]),
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise ExperimentControlError(
+                    f"experiment fold score_delta is inconsistent: {fold_key}"
+                )
+            for name in (
+                "catastrophic_false_approvals",
+                "invalid_records",
+                "missing_records",
+                "record_count",
+                "validation_group_count",
+            ):
+                value = fold_row[name]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value
+                    < (
+                        1
+                        if name in {"record_count", "validation_group_count"}
+                        else 0
+                    )
+                ):
+                    raise ExperimentControlError(
+                        f"experiment fold count is invalid: {fold_key}.{name}"
+                    )
+            if any(
+                int(fold_row[name]) != int(expected_folds[fold_key][name])
+                for name in ("record_count", "validation_group_count")
+            ):
+                raise ExperimentControlError(
+                    f"experiment fold population does not match the frozen "
+                    f"layout: {fold_key}"
+                )
+            if any(
+                int(fold_row[name]) > int(fold_row["record_count"])
+                for name in (
+                    "catastrophic_false_approvals",
+                    "invalid_records",
+                    "missing_records",
+                )
+            ):
+                raise ExperimentControlError(
+                    f"experiment fold failures exceed its population: {fold_key}"
+                )
+            repeat_rows.append(fold_row)
+        if sum(int(row["record_count"]) for row in repeat_rows) != expected_record_count:
+            raise ExperimentControlError(
+                f"experiment repeat {repeat} does not cover the planned population"
+            )
+        weighted_baseline = sum(
+            float(row["baseline_score"]) * int(row["record_count"])
+            for row in repeat_rows
+        ) / expected_record_count
+        weighted_candidate = sum(
+            float(row["candidate_score"]) * int(row["record_count"])
+            for row in repeat_rows
+        ) / expected_record_count
+        if not math.isclose(
+            weighted_baseline,
+            float(metrics["baseline_total_score"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ) or not math.isclose(
+            weighted_candidate,
+            float(metrics["total_score"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ExperimentControlError(
+                "each repeat's weighted baseline and candidate scores must "
+                "equal their aggregate totals"
+            )
+        weighted_delta = sum(
+            float(row["score_delta"]) * int(row["record_count"])
+            for row in repeat_rows
+        )
+        repeat_deltas.append(weighted_delta / expected_record_count)
+    if any(
+        not math.isclose(
+            delta,
+            float(metrics["score_delta"]),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        for delta in repeat_deltas
+    ):
+        raise ExperimentControlError(
+            "each repeat's weighted fold delta must equal aggregate score_delta"
+        )
+    if (
+        int(metrics["candidate_max_model_artifact_bytes"])
+        > int(metrics["candidate_model_bytes"])
+    ):
+        raise ExperimentControlError(
+            "largest model artifact cannot exceed total model bytes"
+        )
+
+    if decision == "adopt":
+        hard_gate_failed = (
+            not all(checks.values())
+            or int(metrics["record_count"]) != expected_record_count
+            or int(metrics["catastrophic_false_approvals"]) != 0
+            or int(metrics["duplicate_records"]) != 0
+            or int(metrics["extra_records"]) != 0
+            or int(metrics["invalid_records"]) != 0
+            or int(metrics["missing_records"]) != 0
+            or float(metrics["score_delta"]) <= 0.0
+            or int(metrics["candidate_image_bytes"]) <= 0
+            or int(metrics["candidate_image_bytes"]) > _MAX_IMAGE_BYTES
+            or int(metrics["candidate_model_bytes"]) > _MAX_MODEL_BYTES
+            or int(metrics["candidate_max_model_artifact_bytes"])
+            > _MAX_MODEL_ARTIFACT_BYTES
+            or int(metrics["output_bytes"]) <= 0
+            or int(metrics["output_bytes"]) > _MAX_OUTPUT_BYTES
+            or int(metrics["peak_container_memory_bytes"]) <= 0
+            or int(metrics["peak_container_memory_bytes"]) > _MAX_MEMORY_BYTES
+            or int(metrics["peak_rss_bytes"]) <= 0
+            or int(metrics["peak_rss_bytes"]) > _MAX_MEMORY_BYTES
+            or float(metrics["process_cpu_seconds"]) <= 0.0
+            or float(metrics["process_cpu_seconds"]) > _MAX_PROCESS_CPU_SECONDS
+            or float(metrics["runtime_seconds"]) <= 0.0
+            or float(metrics["runtime_seconds"]) > _MAX_RUNTIME_SECONDS
+            or float(metrics["runtime_seconds"]) / expected_record_count
+            > _MAX_RUNTIME_SECONDS_PER_RECORD
+            or int(metrics["tmp_bytes"]) > _MAX_TMP_BYTES
+            or any(delta <= 1e-12 for delta in repeat_deltas)
+            or any(
+                float(row["score_delta"]) < -1e-12
+                for row in fold_metrics.values()
+            )
+        )
+        if not hard_gate_failed:
+            for repeat in range(1, 4):
+                rows = [
+                    fold_metrics[f"repeat_{repeat}_fold_{fold}"]
+                    for fold in range(1, 6)
+                ]
+                weighted_sum = sum(
+                    float(row["score_delta"]) * int(row["record_count"])
+                    for row in rows
+                )
+                total_weight = sum(int(row["record_count"]) for row in rows)
+                if any(
+                    (
+                        weighted_sum
+                        - float(row["score_delta"]) * int(row["record_count"])
+                    )
+                    / (total_weight - int(row["record_count"]))
+                    <= 1e-12
+                    for row in rows
+                ):
+                    hard_gate_failed = True
+                    break
+        if not hard_gate_failed and any(
+            int(row[name]) != 0
+            for row in fold_metrics.values()
+            for name in (
+                "catastrophic_false_approvals",
+                "invalid_records",
+                "missing_records",
+            )
+        ):
+            hard_gate_failed = True
+        if hard_gate_failed:
+            raise ExperimentControlError(
+                "an experiment with failed hard gates cannot be adopted"
+            )
     return normalized
 
 
@@ -415,6 +1340,45 @@ def _validate_aggregate_scalar(key: str, value: Any, *, path: str) -> None:
     if isinstance(value, bool):
         return
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            numeric_value = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise LeakageError(
+                f"protected evidence is not aggregate-only at {path}: "
+                "numeric metric is not finitely representable"
+            ) from exc
+        if (
+            not math.isfinite(numeric_value)
+            or abs(numeric_value) > _MAX_AGGREGATE_ABSOLUTE_VALUE
+        ):
+            _raise_aggregate_schema(
+                path, "numeric metric exceeds its finite representation cap"
+            )
+        if key == "count" or key.endswith("_count"):
+            if (
+                not isinstance(value, int)
+                or value < 0
+                or value > _MAX_AGGREGATE_COUNT
+            ):
+                _raise_aggregate_schema(
+                    path, "count metrics must be bounded non-negative integers"
+                )
+        if key.endswith("_bytes"):
+            if (
+                not isinstance(value, int)
+                or value < 0
+                or value > _MAX_AGGREGATE_BYTES
+            ):
+                _raise_aggregate_schema(
+                    path, "resource bytes must be bounded non-negative integers"
+                )
+        if key.endswith("_seconds") and (
+            numeric_value < 0.0
+            or numeric_value > _MAX_AGGREGATE_SECONDS
+        ):
+            _raise_aggregate_schema(
+                path, "resource seconds must be bounded and non-negative"
+            )
         canonical_json(value)
         return
     if value is None:
@@ -422,9 +1386,11 @@ def _validate_aggregate_scalar(key: str, value: Any, *, path: str) -> None:
     if isinstance(value, str):
         if _CASE_ID_RE.search(value) or _PDF_FILENAME_RE.search(value.strip()):
             _raise_aggregate_schema(path, "case or filename identity is forbidden")
-        if key.endswith(_AGGREGATE_HASH_SUFFIXES):
+        if key in _AGGREGATE_HASH_KEYS | _AGGREGATE_REVISION_KEYS:
             digest_pattern = (
-                _SHA256_RE if key.endswith("_sha256") else _COMMIT_OR_SHA256_RE
+                _COMMIT_OR_SHA256_RE
+                if key in _AGGREGATE_REVISION_KEYS
+                else _SHA256_RE
             )
             if not digest_pattern.fullmatch(value):
                 _raise_aggregate_schema(
@@ -440,20 +1406,51 @@ def _is_aggregate_scalar_key(key: str) -> bool:
     return (
         key in _AGGREGATE_SCALAR_KEYS
         or key in _AGGREGATE_STRING_KEYS
-        or key.endswith(_AGGREGATE_SCALAR_SUFFIXES)
-        or key.endswith(_AGGREGATE_HASH_SUFFIXES)
+        or key in _AGGREGATE_HASH_KEYS
+        or key in _AGGREGATE_REVISION_KEYS
     )
+
+
+def _aggregate_scalar_value_count(value: Any) -> int:
+    if isinstance(value, Mapping):
+        return sum(_aggregate_scalar_value_count(child) for child in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_aggregate_scalar_value_count(child) for child in value)
+    return 1
 
 
 def _validate_dimension_name(key: str, *, path: str) -> None:
     if not _SAFE_DIMENSION_RE.fullmatch(key):
         _raise_aggregate_schema(path, "invalid aggregate dimension")
     if (
+        _CASE_ID_RE.search(key)
+        or _PDF_FILENAME_RE.search(key)
+        or
         _FILE_HASH_LOOKUP_NAME_RE.search(key)
         or _IDENTITY_DIMENSION_RE.search(key)
         or key.casefold().endswith(("_id", "_ids"))
     ):
         _raise_aggregate_schema(path, "identity and per-file dimensions are forbidden")
+
+
+def _dimension_is_semantic(container_key: str, key: str) -> bool:
+    if container_key in {"counts", "metrics", "score_components"}:
+        return key in _AGGREGATE_SCALAR_KEYS
+    if container_key == "checks":
+        return key in _AGGREGATE_CHECK_DIMENSIONS
+    if container_key == "confusion_counts":
+        return key in _AGGREGATE_CONFUSION_DIMENSIONS
+    if container_key == "gate_results":
+        return key in _PROMOTION_GATE_RESULT_KEYS
+    if container_key in {"regression_counts", "regression_waivers"}:
+        return key in _AGGREGATE_REGRESSION_DIMENSIONS
+    if container_key == "fold_metrics":
+        return key in _EXPERIMENT_FOLD_KEYS
+    if container_key == "class_metrics":
+        return key in _AGGREGATE_CLASS_DIMENSIONS
+    if container_key in {"field_metrics", "per_field_metrics"}:
+        return key in _AGGREGATE_FIELD_DIMENSIONS
+    return False
 
 
 def _validate_aggregate_container(
@@ -464,15 +1461,26 @@ def _validate_aggregate_container(
 ) -> None:
     if not isinstance(value, Mapping):
         _raise_aggregate_schema(path, "aggregate metric container must be an object")
+    if len(value) > _MAX_AGGREGATE_CONTAINER_ENTRIES:
+        _raise_aggregate_schema(path, "aggregate metric container is too large")
     for raw_key, child in value.items():
         key = str(raw_key).strip()
         normalized = key.casefold()
         child_path = f"{path}.{key}"
         _validate_dimension_name(key, path=child_path)
+        if not _dimension_is_semantic(container_key, normalized):
+            _raise_aggregate_schema(
+                child_path,
+                "dimension is not in the semantic aggregate schema",
+            )
         if container_key in _AGGREGATE_NESTED_METRIC_CONTAINERS:
             if not isinstance(child, Mapping):
                 _raise_aggregate_schema(
                     child_path, "nested metric dimensions must contain metric objects"
+                )
+            if len(child) > _MAX_AGGREGATE_NESTED_METRICS:
+                _raise_aggregate_schema(
+                    child_path, "nested metric container is too large"
                 )
             for raw_metric_key, metric_value in child.items():
                 metric_key = str(raw_metric_key).strip()
@@ -514,6 +1522,12 @@ def require_aggregate_only(value: Any) -> None:
 
     if not isinstance(value, Mapping):
         _raise_aggregate_schema("$", "root must be an aggregate object")
+    if len(value) > _MAX_AGGREGATE_ROOT_ENTRIES:
+        _raise_aggregate_schema("$", "aggregate root contains too many entries")
+    if _aggregate_scalar_value_count(value) > _MAX_AGGREGATE_SCALAR_VALUES:
+        _raise_aggregate_schema(
+            "$", "aggregate evidence contains too many scalar values"
+        )
     for raw_key, child in value.items():
         key = str(raw_key).strip()
         normalized = key.casefold()
@@ -535,7 +1549,12 @@ def require_aggregate_only(value: Any) -> None:
                 for item in child
             ):
                 _raise_aggregate_schema(path, "fold vectors may contain numbers only")
-            canonical_json(list(child))
+            if not child or len(child) > _MAX_AGGREGATE_SEQUENCE_VALUES:
+                _raise_aggregate_schema(
+                    path, "fold vectors must be non-empty and bounded"
+                )
+            for item in child:
+                _validate_aggregate_scalar(normalized, item, path=path)
             continue
         if not _is_aggregate_scalar_key(normalized):
             _raise_aggregate_schema(path, "key is not in the aggregate evidence schema")
@@ -703,6 +1722,292 @@ class CanonicalHashChainStore:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+class _CandidateStateAuthorization:
+    """Opaque, identity-checked one-process adoption capability."""
+
+    __slots__ = ("__weakref__",)
+
+
+_CANDIDATE_STATE_AUTHORIZATIONS: weakref.WeakKeyDictionary[
+    _CandidateStateAuthorization,
+    tuple[str, str, str],
+] = weakref.WeakKeyDictionary()
+
+
+class _ProtectedAccessAuthorization:
+    """Opaque, identity-checked one-process protected-access capability."""
+
+    __slots__ = ("__weakref__",)
+
+
+_PROTECTED_ACCESS_AUTHORIZATIONS: weakref.WeakKeyDictionary[
+    _ProtectedAccessAuthorization,
+    tuple[str, int, str, str, str],
+] = weakref.WeakKeyDictionary()
+
+
+def _verify_candidate_state_record(
+    ledger_path: Path | str,
+    *,
+    authorization: object,
+    record_hash: str,
+    candidate_sha256: str,
+) -> None:
+    """Verify the exact PASSED promotion-gate record used for adoption."""
+
+    normalized_hash = _require_sha256(
+        "candidate_state_record_hash", record_hash
+    )
+    try:
+        resolved_ledger_path = str(Path(ledger_path).resolve(strict=True))
+    except (OSError, RuntimeError) as exc:
+        raise IntegrityError(
+            "candidate state ledger path could not be resolved"
+        ) from exc
+    bound = (
+        _CANDIDATE_STATE_AUTHORIZATIONS.get(authorization)
+        if isinstance(authorization, _CandidateStateAuthorization)
+        else None
+    )
+    if bound != (
+        candidate_sha256,
+        resolved_ledger_path,
+        normalized_hash,
+    ):
+        raise IntegrityError(
+            "candidate adoption lacks a live CandidatePromotionGate capability"
+        )
+    records = CanonicalHashChainStore(ledger_path).verify()
+    matching = [
+        record for record in records if record["record_hash"] == normalized_hash
+    ]
+    if len(matching) != 1:
+        raise IntegrityError(
+            "candidate state record hash is not present exactly once"
+        )
+    payload = matching[0]["payload"]
+    if (
+        set(payload) != _CANDIDATE_ASSESSMENT_KEYS
+        or payload.get("event") != "candidate_assessment"
+        or payload.get("decision") != "PASSED"
+        or payload.get("candidate_sha256") != candidate_sha256
+        or not isinstance(payload.get("assessment_id"), str)
+        or not _SAFE_DIMENSION_RE.fullmatch(payload["assessment_id"])
+        or not isinstance(payload.get("candidate_id"), str)
+        or not _SAFE_DIMENSION_RE.fullmatch(payload["candidate_id"])
+    ):
+        raise IntegrityError(
+            "candidate state record is not a bound PASSED assessment"
+        )
+    aggregate_evidence = payload["aggregate_evidence"]
+    if not isinstance(aggregate_evidence, Mapping):
+        raise IntegrityError(
+            "candidate state record lacks aggregate promotion evidence"
+        )
+    try:
+        require_aggregate_only(aggregate_evidence)
+    except LeakageError as exc:
+        raise IntegrityError(
+            "candidate state promotion evidence is not aggregate-only"
+        ) from exc
+    gate_results = aggregate_evidence.get("gate_results")
+    if (
+        aggregate_evidence.get("promotion_gate_verified") is not True
+        or not isinstance(gate_results, Mapping)
+        or set(gate_results) != _PROMOTION_GATE_RESULT_KEYS
+        or any(value is not True for value in gate_results.values())
+        or any(
+            aggregate_evidence.get(name) is not True
+            for name in (
+                "access_authorized",
+                "baseline_verified",
+                "deterministic",
+                "fold_consistent",
+            )
+        )
+        or any(
+            aggregate_evidence.get(name) != 0
+            for name in (
+                "false_approvals",
+                "hard_gate_failure_count",
+                "invalid_records",
+                "leakage_finding_count",
+                "missing_records",
+                "regression_waiver_count",
+            )
+        )
+    ):
+        raise IntegrityError(
+            "candidate state record did not pass every promotion gate"
+        )
+    regression_counts = aggregate_evidence.get("regression_counts")
+    if (
+        not isinstance(regression_counts, Mapping)
+        or regression_counts.get("golden") != 0
+        or regression_counts.get("adversarial") != 0
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value != 0
+            for value in regression_counts.values()
+        )
+    ):
+        raise IntegrityError(
+            "candidate state record must clear golden and adversarial regressions"
+        )
+
+
+def _verify_protected_access_record(
+    ledger_path: Path | str,
+    *,
+    authorization: object,
+    expected_binding_sha256: str,
+    record_hash: str,
+    candidate_sha256: str,
+    expected_aggregate_result: Mapping[str, Any],
+) -> None:
+    """Verify one exact budgeted protected access for the candidate digest."""
+
+    normalized_hash = _require_sha256(
+        "protected_access_record_hash", record_hash
+    )
+    normalized_binding = _require_sha256(
+        "protected_access_binding_sha256",
+        expected_binding_sha256,
+    )
+    try:
+        resolved_ledger_path = str(Path(ledger_path).resolve(strict=True))
+    except (OSError, RuntimeError) as exc:
+        raise IntegrityError(
+            "protected access ledger path could not be resolved"
+        ) from exc
+    records = CanonicalHashChainStore(ledger_path).verify()
+    if not records:
+        raise IntegrityError("protected access ledger is empty")
+    configuration = records[0]["payload"]
+    maximum_accesses = configuration.get("maximum_accesses")
+    if (
+        configuration.get("event")
+        != ProtectedAccessBudget.CONFIGURATION_EVENT
+        or set(configuration) != {"event", "maximum_accesses"}
+        or isinstance(maximum_accesses, bool)
+        or not isinstance(maximum_accesses, int)
+        or not 1 <= maximum_accesses <= _MAX_AGGREGATE_COUNT
+    ):
+        raise IntegrityError(
+            "protected access ledger configuration is invalid"
+        )
+    actual_binding = protected_access_binding(
+        ledger_path,
+        maximum_accesses=maximum_accesses,
+    )
+    bound = (
+        _PROTECTED_ACCESS_AUTHORIZATIONS.get(authorization)
+        if isinstance(authorization, _ProtectedAccessAuthorization)
+        else None
+    )
+    if bound != (
+        resolved_ledger_path,
+        maximum_accesses,
+        actual_binding,
+        normalized_hash,
+        candidate_sha256,
+    ) or actual_binding != normalized_binding:
+        raise IntegrityError(
+            "protected result lacks its preregistered live budget capability"
+        )
+    access_records = records[1:]
+    if len(access_records) > maximum_accesses:
+        raise IntegrityError("protected access ledger exceeds its budget")
+    for record in access_records:
+        payload = record["payload"]
+        if (
+            set(payload) != _PROTECTED_ACCESS_KEYS
+            or payload.get("event") != "protected_access"
+            or not isinstance(payload.get("access_id"), str)
+            or not _SAFE_DIMENSION_RE.fullmatch(payload["access_id"])
+            or not isinstance(payload.get("purpose"), str)
+            or not _SAFE_DIMENSION_RE.fullmatch(payload["purpose"])
+            or not isinstance(payload.get("candidate_sha256"), str)
+            or _SHA256_RE.fullmatch(payload["candidate_sha256"]) is None
+            or not isinstance(payload.get("aggregate_result"), Mapping)
+        ):
+            raise IntegrityError("protected access ledger record is invalid")
+        try:
+            require_aggregate_only(payload["aggregate_result"])
+        except LeakageError as exc:
+            raise IntegrityError(
+                "protected access record is not aggregate-only"
+            ) from exc
+    matching = [
+        record
+        for record in access_records
+        if record["record_hash"] == normalized_hash
+    ]
+    if (
+        len(matching) != 1
+        or matching[0]["payload"]["candidate_sha256"] != candidate_sha256
+        or matching[0]["payload"]["aggregate_result"]
+        != dict(expected_aggregate_result)
+    ):
+        raise IntegrityError(
+            "protected access record is not bound to the candidate result"
+        )
+
+
+def protected_access_summary(
+    experiment_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact aggregate projection authorized by protected access."""
+
+    if not isinstance(experiment_evidence, Mapping):
+        raise ExperimentControlError(
+            "protected experiment evidence must be an object"
+        )
+    metrics = experiment_evidence.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ExperimentControlError(
+            "protected experiment evidence lacks metrics"
+        )
+    metric_keys = (
+        "baseline_total_score",
+        "calibration_score",
+        "catastrophic_false_approvals",
+        "classification_score",
+        "duplicate_records",
+        "extra_records",
+        "extraction_score",
+        "invalid_records",
+        "missing_records",
+        "record_count",
+        "score_delta",
+        "total_score",
+    )
+    try:
+        summary = {
+            "baseline_artifact_sha256": experiment_evidence[
+                "baseline_artifact_sha256"
+            ],
+            "candidate_artifact_sha256": experiment_evidence[
+                "candidate_artifact_sha256"
+            ],
+            "evidence_label": experiment_evidence["evidence_label"],
+            "metrics": {key: metrics[key] for key in metric_keys},
+            "runtime_evidence_sha256": experiment_evidence[
+                "runtime_evidence_sha256"
+            ],
+            "split_manifest_sha256": experiment_evidence[
+                "split_manifest_sha256"
+            ],
+        }
+    except KeyError as exc:
+        raise ExperimentControlError(
+            "protected experiment evidence is incomplete"
+        ) from exc
+    require_aggregate_only(summary)
+    return json.loads(canonical_json(summary))
+
+
 class ExperimentLedger:
     """Append aggregate-only evidence under immutable two-stage contracts."""
 
@@ -737,38 +2042,10 @@ class ExperimentLedger:
         *,
         expected_head: str | None = None,
     ) -> dict[str, Any]:
-        experiment_id = str(experiment_id).strip()
-        if not experiment_id:
-            raise ExperimentControlError("experiment_id is required")
-        _require_nonidentifying_control_text("experiment_id", experiment_id)
-        require_aggregate_only(evidence)
-        payload = {
-            "event": "experiment",
-            "experiment_id": experiment_id,
-            "evidence": dict(evidence),
-        }
-
-        def check(
-            records: tuple[dict[str, Any], ...],
-            requested: Mapping[str, Any],
-        ) -> Mapping[str, Any] | None:
-            for record in records:
-                existing = record["payload"]
-                if (
-                    existing.get("event") == "experiment"
-                    and existing.get("experiment_id") == experiment_id
-                ):
-                    if existing != requested:
-                        raise ExperimentControlError(
-                            f"experiment_id retry does not match original: {experiment_id}"
-                        )
-                    return record
-            return None
-
-        return self.store.append_transactional(
-            payload,
-            expected_head=expected_head,
-            locked_check=check,
+        del experiment_id, evidence, expected_head
+        raise ExperimentControlError(
+            "legacy one-stage experiment writes are disabled; "
+            "use preregister() and record_result()"
         )
 
     def preregister(
@@ -797,25 +2074,55 @@ class ExperimentLedger:
             records: tuple[dict[str, Any], ...],
             requested: Mapping[str, Any],
         ) -> Mapping[str, Any] | None:
-            for record in records:
-                existing = record["payload"]
-                if existing.get("experiment_id") != experiment_id:
-                    continue
-                if existing.get("event") != "experiment_plan":
-                    raise ExperimentControlError(
-                        f"experiment_id is already used: {experiment_id}"
-                    )
-                if existing != requested:
+            matching = [
+                record
+                for record in records
+                if record["payload"].get("experiment_id") == experiment_id
+            ]
+            plans = [
+                record
+                for record in matching
+                if record["payload"].get("event") == "experiment_plan"
+            ]
+            results = [
+                record
+                for record in matching
+                if record["payload"].get("event") == "experiment_result"
+            ]
+            unexpected = [
+                record
+                for record in matching
+                if record["payload"].get("event")
+                not in {"experiment_plan", "experiment_result"}
+            ]
+            if unexpected or len(plans) > 1 or len(results) > 1:
+                raise IntegrityError(
+                    f"experiment_id is not globally unique: {experiment_id}"
+                )
+            if plans:
+                if plans[0]["payload"] != requested:
                     raise ExperimentControlError(
                         "experiment plan conflicts with immutable "
                         f"preregistration: {experiment_id}"
                     )
-                return record
+                return plans[0]
+            if matching:
+                raise IntegrityError(
+                    f"experiment result exists without its plan: {experiment_id}"
+                )
+            if (
+                expected_head is not None
+                and self.store._head(records) != expected_head
+            ):
+                raise CompareAndSwapError(
+                    "experiment plan CAS failed: "
+                    f"expected {expected_head}, got {self.store._head(records)}"
+                )
             return None
 
         return self.store.append_transactional(
             payload,
-            expected_head=expected_head,
+            expected_head=None,
             locked_check=check,
         )
 
@@ -826,6 +2133,12 @@ class ExperimentLedger:
         *,
         decision: str,
         rationale: str,
+        input_dir: Path | str,
+        split_manifest_path: Path | str,
+        candidate_state_ledger_path: Path | str | None = None,
+        candidate_state_authorization: object | None = None,
+        protected_access_ledger_path: Path | str | None = None,
+        protected_access_authorization: object | None = None,
         expected_head: str | None = None,
     ) -> dict[str, Any]:
         """Persist one aggregate result bound to a prior immutable plan."""
@@ -860,10 +2173,70 @@ class ExperimentLedger:
                 "experiment result requires exactly one prior plan"
             )
         plan_record = plans[0]
+        plan = plan_record["payload"]["plan"]
+        expected_folds = _verify_experiment_split_manifest(
+            split_manifest_path,
+            input_dir=input_dir,
+            expected_input_tree_sha256=plan["input_tree_sha256"],
+            expected_sha256=plan["split_manifest_sha256"],
+            expected_record_count=plan["expected_record_count"],
+        )
         normalized_evidence = _normalize_experiment_result(
             evidence,
-            plan=plan_record["payload"]["plan"],
+            plan=plan,
+            decision=normalized_decision,
+            expected_folds=expected_folds,
         )
+        if normalized_decision == "adopt":
+            if candidate_state_ledger_path is None:
+                raise ExperimentControlError(
+                    "adoption requires a candidate state ledger path"
+                )
+            _verify_candidate_state_record(
+                candidate_state_ledger_path,
+                authorization=candidate_state_authorization,
+                record_hash=normalized_evidence[
+                    "candidate_state_record_hash"
+                ],
+                candidate_sha256=normalized_evidence[
+                    "candidate_artifact_sha256"
+                ],
+            )
+        elif (
+            candidate_state_ledger_path is not None
+            or candidate_state_authorization is not None
+        ):
+            raise ExperimentControlError(
+                "candidate state authorization is valid only for adoption"
+            )
+        if normalized_evidence["evidence_label"] == "protected":
+            if protected_access_ledger_path is None:
+                raise ExperimentControlError(
+                    "protected evidence requires an access ledger path"
+                )
+            _verify_protected_access_record(
+                protected_access_ledger_path,
+                authorization=protected_access_authorization,
+                expected_binding_sha256=plan[
+                    "protected_access_binding_sha256"
+                ],
+                record_hash=normalized_evidence[
+                    "protected_access_record_hash"
+                ],
+                candidate_sha256=normalized_evidence[
+                    "candidate_artifact_sha256"
+                ],
+                expected_aggregate_result=protected_access_summary(
+                    normalized_evidence
+                ),
+            )
+        elif (
+            protected_access_ledger_path is not None
+            or protected_access_authorization is not None
+        ):
+            raise ExperimentControlError(
+                "protected access authorization requires protected evidence"
+            )
         payload = {
             "decision": normalized_decision,
             "event": "experiment_result",
@@ -877,33 +2250,59 @@ class ExperimentLedger:
             locked_records: tuple[dict[str, Any], ...],
             requested: Mapping[str, Any],
         ) -> Mapping[str, Any] | None:
-            locked_plans = [
+            matching = [
                 record
                 for record in locked_records
+                if record["payload"].get("experiment_id") == experiment_id
+            ]
+            locked_plans = [
+                record
+                for record in matching
                 if record["payload"].get("event") == "experiment_plan"
-                and record["payload"].get("experiment_id") == experiment_id
+            ]
+            locked_results = [
+                record
+                for record in matching
+                if record["payload"].get("event") == "experiment_result"
+            ]
+            unexpected = [
+                record
+                for record in matching
+                if record["payload"].get("event")
+                not in {"experiment_plan", "experiment_result"}
             ]
             if (
                 len(locked_plans) != 1
                 or locked_plans[0]["record_hash"]
                 != requested["plan_record_hash"]
+                or unexpected
             ):
                 raise IntegrityError(
                     f"experiment plan binding changed: {experiment_id}"
                 )
-            if any(
-                record["payload"].get("event") == "experiment_result"
-                and record["payload"].get("experiment_id") == experiment_id
-                for record in locked_records
+            if len(locked_results) > 1:
+                raise IntegrityError(
+                    f"experiment has multiple results: {experiment_id}"
+                )
+            if locked_results:
+                if locked_results[0]["payload"] != requested:
+                    raise ExperimentControlError(
+                        f"experiment result conflicts with recorded result: {experiment_id}"
+                    )
+                return locked_results[0]
+            if (
+                expected_head is not None
+                and self.store._head(locked_records) != expected_head
             ):
-                raise ExperimentControlError(
-                    f"experiment result is already recorded: {experiment_id}"
+                raise CompareAndSwapError(
+                    "experiment result CAS failed: "
+                    f"expected {expected_head}, got {self.store._head(locked_records)}"
                 )
             return None
 
         return self.store.append_transactional(
             payload,
-            expected_head=expected_head,
+            expected_head=None,
             locked_check=check,
         )
 
@@ -1200,6 +2599,9 @@ class ProtectedAccessBudget:
             raise ExperimentControlError("maximum_accesses must be positive")
         self.store = CanonicalHashChainStore(path)
         self.maximum_accesses = maximum_accesses
+        self._issued_authorizations: dict[
+            str, _ProtectedAccessAuthorization
+        ] = {}
         self._ensure_configuration()
 
     @classmethod
@@ -1325,13 +2727,69 @@ class ProtectedAccessBudget:
                 raise BudgetExhaustedError("protected access budget is exhausted")
             return None
 
-        return dict(
-            self.store.append_transactional(
-                requested,
-                expected_head=expected_head,
-                locked_check=check,
-            )["payload"]
+        record = self.store.append_transactional(
+            requested,
+            expected_head=expected_head,
+            locked_check=check,
         )
+        authorization = _ProtectedAccessAuthorization()
+        resolved_path = str(self.store.path.resolve(strict=True))
+        binding = protected_access_binding(
+            self.store.path,
+            maximum_accesses=self.maximum_accesses,
+        )
+        _PROTECTED_ACCESS_AUTHORIZATIONS[authorization] = (
+            resolved_path,
+            self.maximum_accesses,
+            binding,
+            record["record_hash"],
+            candidate_sha256,
+        )
+        self._issued_authorizations[access_id] = authorization
+        return dict(record["payload"])
+
+    def authorization_for(self, access_id: str) -> object:
+        """Return the live capability issued with one recorded access."""
+
+        normalized = str(access_id).strip()
+        authorization = self._issued_authorizations.get(normalized)
+        if authorization is None:
+            raise ExperimentControlError(
+                "no live protected access authorization exists for this access"
+            )
+        return authorization
+
+
+def protected_access_binding(
+    ledger_path: Path | str,
+    *,
+    maximum_accesses: int,
+) -> str:
+    """Bind an immutable protected budget to its exact canonical path."""
+
+    try:
+        resolved_path = str(Path(ledger_path).resolve(strict=True))
+    except (OSError, RuntimeError) as exc:
+        raise IntegrityError(
+            "protected access ledger path could not be resolved"
+        ) from exc
+    records = CanonicalHashChainStore(ledger_path).verify()
+    configuration = ProtectedAccessBudget._validate_configuration(
+        records,
+        maximum_accesses=maximum_accesses,
+    )
+    if configuration is None:
+        raise IntegrityError(
+            "protected access ledger lacks its configuration"
+        )
+    payload = {
+        "configuration_record_hash": configuration["record_hash"],
+        "ledger_path": resolved_path,
+        "maximum_accesses": maximum_accesses,
+    }
+    return hashlib.sha256(
+        canonical_json(payload).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -1784,6 +3242,9 @@ class CandidatePromotionGate:
     ) -> None:
         self.state = state
         self.protected_budget = protected_budget
+        self._issued_authorizations: dict[
+            str, _CandidateStateAuthorization
+        ] = {}
 
     @staticmethod
     def _count(name: str, value: Any) -> int:
@@ -1935,7 +3396,7 @@ class CandidatePromotionGate:
             }
         )
         require_aggregate_only(evidence)
-        return self.state._persist_assessment(
+        persisted = self.state._persist_assessment(
             assessment_id,
             candidate_id=candidate_id,
             candidate_sha256=candidate_sha256,
@@ -1944,3 +3405,44 @@ class CandidatePromotionGate:
             expected_head=expected_head,
             authority=_PROMOTION_GATE_AUTHORITY,
         )
+        if persisted["decision"] == "PASSED":
+            matching_records = [
+                record
+                for record in self.state.store.verify()
+                if record["payload"] == persisted
+                and record["payload"].get("assessment_id")
+                == str(assessment_id).strip()
+            ]
+            if len(matching_records) != 1:
+                raise IntegrityError(
+                    "PASSED assessment could not be bound to its exact record"
+                )
+            try:
+                resolved_path = str(
+                    self.state.store.path.resolve(strict=True)
+                )
+            except (OSError, RuntimeError) as exc:
+                raise IntegrityError(
+                    "candidate state ledger could not be bound"
+                ) from exc
+            authorization = _CandidateStateAuthorization()
+            _CANDIDATE_STATE_AUTHORIZATIONS[authorization] = (
+                candidate_sha256,
+                resolved_path,
+                matching_records[0]["record_hash"],
+            )
+            self._issued_authorizations[candidate_sha256] = authorization
+        return persisted
+
+    def authorization_for(self, candidate_sha256: str) -> object:
+        """Return the live capability issued by this gate for one PASSED digest."""
+
+        normalized = _require_sha256(
+            "candidate_sha256", candidate_sha256
+        )
+        authorization = self._issued_authorizations.get(normalized)
+        if authorization is None:
+            raise ExperimentControlError(
+                "no live PASSED authorization exists for this candidate"
+            )
+        return authorization

@@ -29,7 +29,7 @@ contracts:
 | Control | Enforced property |
 | --- | --- |
 | `CanonicalHashChainStore` | Canonical JSONL, sequence and previous-head hash, locked append, compare-and-swap, and retained-head truncation detection |
-| `ExperimentLedger` | Unique experiment IDs and strict allowlist-based aggregate-only evidence; case IDs, PDF filenames, row/sample/outcome collections, predictions, and case-score payloads are rejected |
+| `ExperimentLedger` | Immutable two-stage `preregister` → `record_result` contracts, globally unique experiment IDs, exact bounded aggregate schemas, transactional idempotency, and fail-closed adoption gates; new legacy one-stage writes are disabled |
 | `FrozenBaselineManifest` | Create-once path, byte-size, and SHA-256 pins; changed artifacts or a changed requested manifest fail verification |
 | `TaintRegistry` | Append-only exposure events; tainted groups cannot be untainted |
 | `RepeatedGroupedSplitManager` | Deterministic repeated K-fold assignment with whole layout/template groups kept together and tainted groups excluded |
@@ -69,9 +69,17 @@ committed and never cross into runtime.
 
 ## Experiment contract
 
-Before executing a candidate, record one hypothesis and one primary variable
-unless the experiment is explicitly factorial. The aggregate ledger evidence
-must contain:
+Before executing a candidate, append and commit its immutable plan with
+`ExperimentLedger.preregister`. The plan binds one hypothesis, one primary
+variable, the parent revision, changed files, evidence class, population,
+evaluator, truth, input tree, runtime contract, and frozen split manifest.
+Protected plans additionally bind the canonical access ledger and immutable
+budget configuration by digest. No result may be recorded without exactly one
+prior plan, and an experiment ID cannot be reused across legacy, plan, or
+result events.
+
+After execution, `ExperimentLedger.record_result` accepts one exact retry-safe
+result. The result is bound to the plan record hash and must contain:
 
 - experiment ID and hypothesis;
 - parent commit SHA and exact changed files;
@@ -90,6 +98,33 @@ must contain:
 Individual protected-case outcomes must not enter the experiment ledger.
 Diagnosis that reveals a protected case or group appends a taint event before
 that evidence can be used for tuning.
+
+The result schema is deliberately fixed and bounded. Recording a result
+requires the external canonical WO-12 layout manifest: the ledger verifies its
+pre-registered hash, recomputes the page-count/ink layout groups from the
+bound PDF tree, rebuilds the deterministic assignments, proves whole-group
+exclusivity, complete population coverage, distinct repeat assignments, and
+exact per-fold record/group counts, then discards all case identities. It
+rejects opaque metric keys, oversized containers, arbitrary outcome vectors,
+incomplete fold coverage, inconsistent score arithmetic, and population
+drift.
+
+`adopt` additionally requires a different candidate artifact and the exact
+hash-chain record of a `PASSED` `CandidatePromotionGate` assessment for that
+artifact plus the live, one-process authorization capability issued by that
+gate. A hand-written record with the right payload cannot substitute for the
+gate. The assessment must contain every successful gate and zero golden or
+adversarial regressions. Protected evidence also requires the exact budgeted
+access-ledger record for the same candidate digest, the live identity-checked
+access capability, and the pre-registered binding of the ledger's canonical
+path and immutable access limit. Its aggregate result must exactly match the
+experiment evidence; a syntactically valid hash or replacement ledger is
+insufficient. All 15 fold deltas must be non-negative, every repeat and every
+leave-one-fold-out comparison must remain positive, safety and validity
+failures must be zero, output must be complete and deterministic, the runtime
+scan must be clean, and image/model/memory/tmp/output/runtime limits must pass.
+The absolute runtime cap is four hours. Failed evidence may be retained as
+`reject` or `rollback`, but it cannot be promoted.
 
 ## Grouped robustness protocol
 
@@ -170,7 +205,10 @@ python3 -m unittest tests.test_experiment_control -v
 ```
 
 It covers hash tampering, partial and retained-prefix truncation, stale
-compare-and-swap writers, duplicate experiments, nested identity leakage,
+compare-and-swap writers, global experiment-ID collisions, exact concurrent
+result retries, mismatched concurrent writers, encoded case vectors, exact
+3×5 coverage and score arithmetic, non-negative fold and leave-one-fold-out
+adoption rules, four-hour runtime enforcement, nested identity leakage,
 permanent taint, manifest mutation, deterministic group isolation, access
 retry/exhaustion, concurrent budget enforcement, source and artifact leakage,
 filename/digest maps, narrow allowlists, non-bypassable promotion, and
