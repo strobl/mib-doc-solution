@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from devtools.experiment_control import require_aggregate_only
 from devtools.grouped_fusion_gate import (
@@ -130,7 +133,9 @@ class GroupedFusionGateTests(unittest.TestCase):
         )
         self.assertEqual(aggregate["status"], "passed")
         self.assertEqual(aggregate["repeat_count"], 3)
-        self.assertEqual(aggregate["fold_count"], 15)
+        self.assertEqual(aggregate["fold_count"], 5)
+        self.assertEqual(aggregate["evaluated_fold_count"], 15)
+        self.assertEqual(len(aggregate["fold_weights"]), 15)
         self.assertEqual(aggregate["provenance_coverage_fraction"], 1.0)
         self.assertEqual(
             aggregate["new_catastrophic_false_approval_count"], 0
@@ -166,7 +171,7 @@ class GroupedFusionGateTests(unittest.TestCase):
             reversed_result.to_aggregate_evidence(),
         )
 
-    def test_single_positive_fold_per_repeat_passes_with_warning(self):
+    def test_single_positive_fold_per_repeat_fails_leave_best_gate(self):
         sparse = (
             (1.0, 0.0, 0.0, 0.0, 0.0),
             (0.0, 1.0, 0.0, 0.0, 0.0),
@@ -177,7 +182,11 @@ class GroupedFusionGateTests(unittest.TestCase):
             _evidence(folds=_folds(sparse))
         )
 
-        self.assertTrue(decision.passed)
+        self.assertFalse(decision.passed)
+        self.assertEqual(
+            decision.blocking_reasons, ("leave_best_fold_out_positive",)
+        )
+        self.assertFalse(decision.to_aggregate_evidence()["fold_consistent"])
         self.assertEqual(decision.repeat_positive_fold_counts, (1, 1, 1))
         self.assertEqual(
             decision.repeat_leave_best_fold_out_deltas, (0.0, 0.0, 0.0)
@@ -232,22 +241,23 @@ class GroupedFusionGateTests(unittest.TestCase):
                 self.assertFalse(decision.passed)
                 self.assertIn(expected_gate, decision.blocking_reasons)
 
-    def test_negative_folds_are_disclosed_but_weighted_positive_repeats_pass(self):
+    def test_negative_folds_block_even_when_weighted_repeats_are_positive(self):
         mixed = (
-            (4.0, -0.10, -0.10, 0.0, 0.0),
-            (-0.10, 4.0, -0.10, 0.0, 0.0),
-            (-0.10, -0.10, 4.0, 0.0, 0.0),
+            (1.0, 0.5, 0.2, -0.10, 0.1),
+            (0.5, 1.0, -0.10, 0.2, 0.1),
+            (0.2, -0.10, 1.0, 0.5, 0.1),
         )
 
         decision = GroupedFusionGate().evaluate(
             _evidence(folds=_folds(mixed))
         )
 
-        self.assertTrue(decision.passed)
-        self.assertEqual(decision.blocking_reasons, ())
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.blocking_reasons, ("no_negative_folds",))
+        self.assertFalse(decision.to_aggregate_evidence()["fold_consistent"])
         checks = dict(decision.diagnostic_results)
         self.assertFalse(checks["no_negative_folds"])
-        self.assertFalse(checks["fold_majority_positive"])
+        self.assertTrue(checks["fold_majority_positive"])
         self.assertTrue(decision.concentration_warning)
 
     def test_completeness_safety_and_fusion_audit_rules_are_hard(self):
@@ -397,6 +407,54 @@ class GroupedFusionGateTests(unittest.TestCase):
             GroupedFusionEvidenceError, "exactly three repeats"
         ):
             GroupedFusionGate().evaluate(missing)
+
+    def test_committed_wo16_strict_reclassification_is_exact(self):
+        root = Path(__file__).resolve().parents[1]
+        reclassification = json.loads(
+            (
+                root
+                / "evaluation/WO16_STRICT_GATE_RECLASSIFICATION.json"
+            ).read_text(encoding="utf-8")
+        )
+        source_binding = reclassification["source_evidence"]
+        source_path = root / source_binding["path"]
+        source_bytes = source_path.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(source_bytes).hexdigest(),
+            source_binding["sha256"],
+        )
+        gate_binding = reclassification["strict_gate_source"]
+        gate_bytes = (root / gate_binding["path"]).read_bytes()
+        self.assertEqual(
+            hashlib.sha256(gate_bytes).hexdigest(),
+            gate_binding["sha256"],
+        )
+
+        source = json.loads(source_bytes)
+        fold_deltas = source["fold_deltas"]
+        observed = reclassification["observed"]
+        self.assertEqual(observed["evaluated_fold_count"], len(fold_deltas))
+        self.assertEqual(
+            observed["negative_fold_count"],
+            sum(delta < 0 for delta in fold_deltas),
+        )
+        self.assertEqual(
+            observed["positive_fold_count"],
+            sum(delta > 0 for delta in fold_deltas),
+        )
+        self.assertEqual(
+            observed["zero_fold_count"],
+            sum(delta == 0 for delta in fold_deltas),
+        )
+        self.assertEqual(
+            reclassification["classification"],
+            "historical_candidate_rejected_negative_folds",
+        )
+        self.assertEqual(
+            reclassification["outcome"]["blocking_reasons"],
+            ["no_negative_folds"],
+        )
+        self.assertEqual(reclassification["outcome"]["status"], "blocked")
 
 
 if __name__ == "__main__":

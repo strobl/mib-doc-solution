@@ -363,7 +363,9 @@ class GroupedFusionEvidenceBuilderTests(unittest.TestCase):
             LEGACY_SOURCE_SHA,
         )
         self.assertEqual(aggregate["repeat_count"], 3)
-        self.assertEqual(aggregate["fold_count"], 15)
+        self.assertEqual(aggregate["fold_count"], 5)
+        self.assertEqual(aggregate["evaluated_fold_count"], 15)
+        self.assertEqual(len(aggregate["fold_weights"]), 15)
         self.assertEqual(aggregate["input_pdf_count"], len(self.case_ids))
         self.assertEqual(aggregate["input_tree_sha256"], INPUT_TREE_SHA256)
         self.assertRegex(

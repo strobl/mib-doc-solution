@@ -11,8 +11,12 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -160,6 +164,7 @@ _AGGREGATE_SEQUENCE_KEYS = frozenset(
     {
         "fold_deltas",
         "fold_scores",
+        "fold_weights",
         "repeat_scores",
     }
 )
@@ -193,10 +198,15 @@ _EXPERIMENT_PLAN_KEYS = frozenset(
     {
         "changed_files",
         "evidence_label",
+        "evaluator_sha256",
+        "expected_record_count",
         "hypothesis_sha256",
+        "input_tree_sha256",
         "parent_commit_sha",
         "primary_variable_sha256",
+        "runtime_contract_sha256",
         "split_manifest_sha256",
+        "truth_sha256",
     }
 )
 _EXPERIMENT_EVIDENCE_LABELS = frozenset(
@@ -209,9 +219,16 @@ _EXPERIMENT_RESULT_REQUIRED_KEYS = frozenset(
         "candidate_artifact_sha256",
         "checks",
         "confusion_counts",
+        "evaluator_sha256",
+        "expected_record_count",
         "field_metrics",
+        "input_tree_sha256",
         "metrics",
         "regression_counts",
+        "runtime_contract_sha256",
+        "runtime_evidence_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
     }
 )
 _EXPERIMENT_RESULT_REQUIRED_CHECKS = frozenset(
@@ -219,6 +236,7 @@ _EXPERIMENT_RESULT_REQUIRED_CHECKS = frozenset(
         "decision_freeze_verified",
         "deterministic",
         "fold_consistent",
+        "runtime_limits_verified",
         "runtime_leakage_clean",
     }
 )
@@ -226,6 +244,7 @@ _EXPERIMENT_RESULT_REQUIRED_METRICS = frozenset(
     {
         "calibration_score",
         "candidate_image_bytes",
+        "candidate_max_model_artifact_bytes",
         "candidate_model_bytes",
         "catastrophic_false_approvals",
         "classification_score",
@@ -233,14 +252,26 @@ _EXPERIMENT_RESULT_REQUIRED_METRICS = frozenset(
         "invalid_records",
         "missing_records",
         "output_bytes",
+        "peak_container_memory_bytes",
         "peak_rss_bytes",
         "process_cpu_seconds",
+        "record_count",
         "runtime_seconds",
         "tmp_bytes",
         "total_score",
     }
 )
 _EXPERIMENT_RESULT_REQUIRED_REGRESSIONS = frozenset({"adversarial", "golden"})
+_PROMOTION_POPULATION_KEYS = frozenset(
+    {
+        "evaluator_sha256",
+        "expected_record_count",
+        "input_tree_sha256",
+        "runtime_contract_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    }
+)
 RETROSPECTIVE_RECONCILIATION_SCHEMA_VERSION = (
     "wo12-retrospective-reconciliation-v1"
 )
@@ -270,7 +301,7 @@ _RECONCILIATION_LEDGER_FILENAMES = {
 }
 _RECONCILIATION_DISPOSITIONS = {
     "wo15": "rejected_single_fold_concentration",
-    "wo16": "regression_fix_pending",
+    "wo16": "historical_candidate_rejected_negative_folds",
     "wo17": "historical_result_revalidation_pending",
     "wo18": "blocked_precondition_no_promotion",
     "wo19": "evaluated_no_promotion",
@@ -476,14 +507,34 @@ def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             + ", ".join(sorted(_EXPERIMENT_PLAN_KEYS))
         )
 
-    string_fields = tuple(_EXPERIMENT_PLAN_KEYS - {"changed_files"})
+    string_fields = tuple(
+        _EXPERIMENT_PLAN_KEYS - {"changed_files", "expected_record_count"}
+    )
     if any(not isinstance(plan[name], str) for name in string_fields):
         raise ExperimentControlError("experiment plan text and hashes must be strings")
+    expected_record_count = plan["expected_record_count"]
+    if (
+        isinstance(expected_record_count, bool)
+        or not isinstance(expected_record_count, int)
+        or expected_record_count < 1
+    ):
+        raise ExperimentControlError(
+            "expected_record_count must be a positive integer"
+        )
     hypothesis_sha256 = plan["hypothesis_sha256"].strip().lower()
     primary_variable_sha256 = plan["primary_variable_sha256"].strip().lower()
     parent_commit_sha = plan["parent_commit_sha"].strip().lower()
     evidence_label = plan["evidence_label"].strip().casefold()
-    split_manifest_sha256 = plan["split_manifest_sha256"].strip().lower()
+    bound_hashes = {
+        name: plan[name].strip().lower()
+        for name in (
+            "evaluator_sha256",
+            "input_tree_sha256",
+            "runtime_contract_sha256",
+            "split_manifest_sha256",
+            "truth_sha256",
+        )
+    }
     if not _SHA256_RE.fullmatch(hypothesis_sha256):
         raise ExperimentControlError(
             "hypothesis_sha256 must bind one external non-repository hypothesis"
@@ -496,10 +547,11 @@ def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         raise ExperimentControlError("parent_commit_sha must be a full Git SHA")
     if evidence_label not in _EXPERIMENT_EVIDENCE_LABELS:
         raise ExperimentControlError("experiment evidence_label is invalid")
-    if not _SHA256_RE.fullmatch(split_manifest_sha256):
-        raise ExperimentControlError(
-            "split_manifest_sha256 must be a SHA-256 hex digest"
-        )
+    for name, value in bound_hashes.items():
+        if not _SHA256_RE.fullmatch(value):
+            raise ExperimentControlError(
+                f"{name} must be a SHA-256 hex digest"
+            )
 
     raw_changed_files = plan["changed_files"]
     if not isinstance(raw_changed_files, (list, tuple)):
@@ -531,13 +583,57 @@ def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     normalized = {
         "changed_files": sorted(changed_files),
         "evidence_label": evidence_label,
+        "expected_record_count": expected_record_count,
         "hypothesis_sha256": hypothesis_sha256,
         "parent_commit_sha": parent_commit_sha,
         "primary_variable_sha256": primary_variable_sha256,
-        "split_manifest_sha256": split_manifest_sha256,
+        **bound_hashes,
     }
     canonical_json(normalized)
     return normalized
+
+
+def _normalize_promotion_population(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize the immutable population used for milestone comparisons."""
+
+    if not isinstance(value, Mapping) or set(value) != _PROMOTION_POPULATION_KEYS:
+        raise ExperimentControlError(
+            "promotion_population must contain the exact protected population tuple"
+        )
+    normalized: dict[str, Any] = {}
+    for name in sorted(_PROMOTION_POPULATION_KEYS - {"expected_record_count"}):
+        digest = value[name]
+        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+            raise ExperimentControlError(
+                f"promotion_population {name} must be a SHA-256 digest"
+            )
+        normalized[name] = digest.lower()
+    expected_record_count = value["expected_record_count"]
+    if (
+        isinstance(expected_record_count, bool)
+        or not isinstance(expected_record_count, int)
+        or expected_record_count < 1
+    ):
+        raise ExperimentControlError(
+            "promotion_population expected_record_count must be positive"
+        )
+    normalized["expected_record_count"] = expected_record_count
+    canonical_json(normalized)
+    return normalized
+
+
+def _promotion_population_from(
+    value: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return a normalized population tuple when all fields are present."""
+
+    if not _PROMOTION_POPULATION_KEYS.issubset(value):
+        return None
+    return _normalize_promotion_population(
+        {name: value[name] for name in _PROMOTION_POPULATION_KEYS}
+    )
 
 
 def _normalize_experiment_result_evidence(
@@ -559,11 +655,30 @@ def _normalize_experiment_result_evidence(
             + ", ".join(sorted(missing_root))
         )
 
-    for key in ("baseline_artifact_sha256", "candidate_artifact_sha256"):
+    for key in (
+        "baseline_artifact_sha256",
+        "candidate_artifact_sha256",
+        "evaluator_sha256",
+        "input_tree_sha256",
+        "runtime_contract_sha256",
+        "runtime_evidence_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    ):
         if not isinstance(normalized[key], str) or not _SHA256_RE.fullmatch(
             normalized[key]
         ):
             raise ExperimentControlError(f"{key} must be a SHA-256 hex digest")
+
+    expected_record_count = normalized["expected_record_count"]
+    if (
+        isinstance(expected_record_count, bool)
+        or not isinstance(expected_record_count, int)
+        or expected_record_count < 1
+    ):
+        raise ExperimentControlError(
+            "expected_record_count must be a positive integer"
+        )
 
     checks = normalized["checks"]
     if not isinstance(checks, Mapping):
@@ -585,12 +700,26 @@ def _normalize_experiment_result_evidence(
             "experiment result is missing metrics: "
             + ", ".join(sorted(missing_metrics))
         )
+    integer_metrics = {
+        "candidate_image_bytes",
+        "candidate_max_model_artifact_bytes",
+        "candidate_model_bytes",
+        "catastrophic_false_approvals",
+        "invalid_records",
+        "missing_records",
+        "output_bytes",
+        "peak_container_memory_bytes",
+        "peak_rss_bytes",
+        "record_count",
+        "tmp_bytes",
+    }
     for name in _EXPERIMENT_RESULT_REQUIRED_METRICS:
         metric = metrics[name]
         if (
             isinstance(metric, bool)
             or not isinstance(metric, (int, float))
             or metric < 0
+            or (name in integer_metrics and not isinstance(metric, int))
         ):
             raise ExperimentControlError(
                 f"experiment result metric must be non-negative: {name}"
@@ -650,20 +779,26 @@ def _normalize_experiment_result_evidence(
         )
 
     if decision == "adopt":
-        if evidence_label == "public_grouped_robustness_not_unseen":
+        if evidence_label in {
+            "protected",
+            "public_grouped_robustness_not_unseen",
+        }:
             fold_count = normalized.get("fold_count")
             repeat_count = normalized.get("repeat_count")
             fold_deltas = normalized.get("fold_deltas")
+            fold_weights = normalized.get("fold_weights")
             repeat_scores = normalized.get("repeat_scores")
             if (
                 isinstance(fold_count, bool)
                 or not isinstance(fold_count, int)
-                or fold_count < 5
+                or fold_count != 5
                 or isinstance(repeat_count, bool)
                 or not isinstance(repeat_count, int)
-                or repeat_count < 3
+                or repeat_count != 3
                 or not isinstance(fold_deltas, list)
                 or len(fold_deltas) != fold_count * repeat_count
+                or not isinstance(fold_weights, list)
+                or len(fold_weights) != fold_count * repeat_count
                 or not isinstance(repeat_scores, list)
                 or len(repeat_scores) != repeat_count
                 or any(
@@ -671,6 +806,12 @@ def _normalize_experiment_result_evidence(
                     or not isinstance(delta, (int, float))
                     or delta < 0
                     for delta in fold_deltas
+                )
+                or any(
+                    isinstance(weight, bool)
+                    or not isinstance(weight, int)
+                    or weight <= 0
+                    for weight in fold_weights
                 )
                 or any(
                     isinstance(score, bool)
@@ -685,20 +826,55 @@ def _normalize_experiment_result_evidence(
             for repeat in range(repeat_count):
                 offset = repeat * fold_count
                 repeat_deltas = fold_deltas[offset : offset + fold_count]
-                observed = sum(repeat_deltas) / fold_count
+                repeat_weights = fold_weights[offset : offset + fold_count]
+                if sum(repeat_weights) != metrics["record_count"]:
+                    raise ExperimentControlError(
+                        "each repeat's fold weights must cover record_count"
+                    )
+                weighted_sum = sum(
+                    delta * weight
+                    for delta, weight in zip(repeat_deltas, repeat_weights)
+                )
+                total_weight = sum(repeat_weights)
+                observed = weighted_sum / total_weight
                 if abs(observed - repeat_scores[repeat]) > 1e-9:
                     raise ExperimentControlError(
-                        "repeat_scores must equal their repeated-fold means"
+                        "repeat_scores must equal their weighted repeated-fold means"
                     )
-                if sum(repeat_deltas) - max(repeat_deltas) <= 1e-12:
+                leave_one_out = [
+                    (weighted_sum - delta * weight) / (total_weight - weight)
+                    for delta, weight in zip(repeat_deltas, repeat_weights)
+                ]
+                if min(leave_one_out) <= 1e-12:
                     raise ExperimentControlError(
                         "public-grouped adoption may not depend on one fold "
                         "within any repeat"
                     )
         unsafe = (
             metrics["catastrophic_false_approvals"] != 0
+            or metrics["record_count"] <= 0
+            or metrics["record_count"] != expected_record_count
             or metrics["missing_records"] != 0
             or metrics["invalid_records"] != 0
+            or metrics["candidate_image_bytes"] <= 0
+            or metrics["candidate_image_bytes"] > 4 * 1024**3
+            or metrics["candidate_model_bytes"] > 1024**3
+            or metrics["candidate_max_model_artifact_bytes"] > 250 * 1024**2
+            or metrics["output_bytes"] <= 0
+            or metrics["output_bytes"] > 25 * 1024**2
+            or metrics["peak_container_memory_bytes"] <= 0
+            or metrics["peak_container_memory_bytes"] > 8 * 1024**3
+            or metrics["peak_rss_bytes"] <= 0
+            or metrics["peak_rss_bytes"] > 8 * 1024**3
+            or metrics["tmp_bytes"] > 2 * 1024**3
+            or metrics["runtime_seconds"] <= 0
+            or metrics["runtime_seconds"] > 30_000
+            or (
+                metrics["record_count"] > 0
+                and metrics["runtime_seconds"] / metrics["record_count"] > 6
+            )
+            or metrics["process_cpu_seconds"] <= 0
+            or metrics["process_cpu_seconds"] > 120_000
             or any(regressions.values())
             or any(not value for value in checks.values())
         )
@@ -1254,6 +1430,652 @@ class CanonicalHashChainStore:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _normalize_program_integrity_stores(
+    stores: Mapping[str, CanonicalHashChainStore],
+) -> dict[str, CanonicalHashChainStore]:
+    if not isinstance(stores, Mapping) or set(stores) != _RECONCILIATION_LEDGER_NAMES:
+        raise ExperimentControlError(
+            "program integrity checkpoint requires all four governed stores"
+        )
+    normalized: dict[str, CanonicalHashChainStore] = {}
+    resolved_paths: set[Path] = set()
+    for name in sorted(_RECONCILIATION_LEDGER_NAMES):
+        store = stores[name]
+        if not isinstance(store, CanonicalHashChainStore):
+            raise ExperimentControlError(
+                f"{name} must be a CanonicalHashChainStore"
+            )
+        resolved_path = store.path.resolve()
+        if resolved_path in resolved_paths:
+            raise ExperimentControlError(
+                "program integrity stores must use distinct ledger paths"
+            )
+        resolved_paths.add(resolved_path)
+        normalized[name] = store
+    return normalized
+
+
+def _program_store_snapshot(
+    store: CanonicalHashChainStore,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    try:
+        raw = store.path.read_bytes() if store.path.exists() else b""
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise IntegrityError(
+            f"governed ledger is unreadable: {store.path}"
+        ) from exc
+    records = store._parse(text)
+    return (
+        {
+            "expected_head": store._head(records),
+            "expected_length": len(records),
+            "sha256": _sha256_bytes(raw),
+        },
+        records,
+    )
+
+
+def _validate_program_integrity_checkpoint(value: Any) -> dict[str, Any]:
+    legacy_root_keys = {
+        "baseline_manifest_sha256",
+        "runtime_leakage_finding_count",
+        "stores",
+    }
+    current_root_keys = legacy_root_keys | {"promotion_population"}
+    if (
+        not isinstance(value, Mapping)
+        or set(value) not in (legacy_root_keys, current_root_keys)
+    ):
+        raise IntegrityError("program integrity checkpoint root schema is invalid")
+    baseline_sha256 = value["baseline_manifest_sha256"]
+    finding_count = value["runtime_leakage_finding_count"]
+    stores = value["stores"]
+    if (
+        not isinstance(baseline_sha256, str)
+        or not _SHA256_RE.fullmatch(baseline_sha256)
+        or isinstance(finding_count, bool)
+        or not isinstance(finding_count, int)
+        or finding_count < 0
+        or not isinstance(stores, Mapping)
+        or set(stores) != _RECONCILIATION_LEDGER_NAMES
+    ):
+        raise IntegrityError("program integrity checkpoint values are invalid")
+    if "promotion_population" in value:
+        try:
+            _normalize_promotion_population(value["promotion_population"])
+        except ExperimentControlError as exc:
+            raise IntegrityError(
+                "program integrity checkpoint promotion population is invalid"
+            ) from exc
+    anchor_shapes: set[frozenset[str]] = set()
+    for name in sorted(_RECONCILIATION_LEDGER_NAMES):
+        anchor = stores[name]
+        legacy_keys = {
+            "expected_head",
+            "expected_length",
+            "sha256",
+        }
+        current_keys = legacy_keys | {"path"}
+        if (
+            not isinstance(anchor, Mapping)
+            or (
+                set(anchor) != legacy_keys
+                and set(anchor) != current_keys
+            )
+        ):
+            raise IntegrityError(f"{name} checkpoint anchor schema is invalid")
+        anchor_shapes.add(frozenset(anchor))
+        if (
+            not isinstance(anchor["expected_head"], str)
+            or not _SHA256_RE.fullmatch(anchor["expected_head"])
+            or isinstance(anchor["expected_length"], bool)
+            or not isinstance(anchor["expected_length"], int)
+            or anchor["expected_length"] < 0
+            or not isinstance(anchor["sha256"], str)
+            or not _SHA256_RE.fullmatch(anchor["sha256"])
+        ):
+            raise IntegrityError(f"{name} checkpoint anchor values are invalid")
+        if "path" in anchor:
+            raw_path = anchor["path"]
+            pure_path = PurePosixPath(raw_path) if isinstance(raw_path, str) else None
+            if (
+                pure_path is None
+                or not raw_path
+                or "\\" in raw_path
+                or pure_path.is_absolute()
+                or str(pure_path) != raw_path
+                or any(part in {"", "."} for part in pure_path.parts)
+            ):
+                raise IntegrityError(f"{name} checkpoint path is invalid")
+    if len(anchor_shapes) != 1:
+        raise IntegrityError(
+            "program integrity checkpoint may not mix legacy and path-bound anchors"
+        )
+    return json.loads(canonical_json(dict(value)))
+
+
+def build_program_integrity_checkpoint(
+    *,
+    stores: Mapping[str, CanonicalHashChainStore],
+    baseline_manifest_sha256: str,
+    checkpoint_directory: Path | str,
+    runtime_leakage_finding_count: int,
+    promotion_population: Mapping[str, Any] | None = None,
+) -> tuple[bytes, str]:
+    """Build one canonical exact snapshot without publishing it as trusted.
+
+    The returned digest becomes authoritative only after an external system
+    such as Git or the Factory publishes it as the single current checkpoint.
+    """
+
+    normalized_stores = _normalize_program_integrity_stores(stores)
+    checkpoint_root = Path(checkpoint_directory).resolve()
+    anchors: dict[str, dict[str, Any]] = {}
+    for name, store in normalized_stores.items():
+        anchor = _program_store_snapshot(store)[0]
+        anchor["path"] = Path(
+            os.path.relpath(store.path.resolve(), checkpoint_root)
+        ).as_posix()
+        anchors[name] = anchor
+    checkpoint = {
+        "baseline_manifest_sha256": str(
+            baseline_manifest_sha256
+        ).strip().lower(),
+        "runtime_leakage_finding_count": runtime_leakage_finding_count,
+        "stores": anchors,
+    }
+    if promotion_population is not None:
+        checkpoint["promotion_population"] = _normalize_promotion_population(
+            promotion_population
+        )
+    normalized = _validate_program_integrity_checkpoint(checkpoint)
+    raw = (canonical_json(normalized) + "\n").encode("utf-8")
+    return raw, _sha256_bytes(raw)
+
+
+@dataclass(frozen=True)
+class ProgramIntegritySuccessor:
+    """Unpublished checkpoint produced after one verified governed mutation."""
+
+    previous_checkpoint_sha256: str
+    checkpoint_bytes: bytes
+    checkpoint_sha256: str
+    mutated_store: str
+    record_hash: str
+    mutated: bool
+
+
+@dataclass(frozen=True)
+class PublishedCheckpointReference:
+    """One current checkpoint reference returned by Git/Factory authority."""
+
+    path: Path | str
+    sha256: str
+
+
+_CHECKPOINT_AUTHORITY = object()
+_PROGRAM_LOCK_REGISTRY_GUARD = threading.Lock()
+_PROGRAM_LOCK_REGISTRY: dict[str, threading.RLock] = {}
+_PROGRAM_LOCK_STATE = threading.local()
+
+
+def _program_thread_lock(lock_path: Path) -> threading.RLock:
+    key = str(lock_path.resolve())
+    with _PROGRAM_LOCK_REGISTRY_GUARD:
+        lock = _PROGRAM_LOCK_REGISTRY.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROGRAM_LOCK_REGISTRY[key] = lock
+        return lock
+
+
+class CheckpointAuthorityResolver:
+    """Resolve the sole current checkpoint through an external authority.
+
+    The callback must query an authenticated Git/Factory control plane. It must
+    not derive a digest from the mutable ledgers that the caller is asking to
+    change.
+    """
+
+    def __init__(
+        self,
+        resolve_current: Callable[[], PublishedCheckpointReference],
+        *,
+        trusted_checkpoint_root: Path | str,
+    ) -> None:
+        if not callable(resolve_current):
+            raise ExperimentControlError(
+                "checkpoint authority resolver must be callable"
+            )
+        self._resolve_current = resolve_current
+        self._trusted_root = Path(trusted_checkpoint_root).resolve()
+
+    def resolve(
+        self,
+        *,
+        stores: Mapping[str, CanonicalHashChainStore],
+    ) -> ProgramIntegrityCheckpoint:
+        reference = self._resolve_current()
+        if not isinstance(reference, PublishedCheckpointReference):
+            raise IntegrityError(
+                "checkpoint authority returned an invalid current reference"
+            )
+        checkpoint_path = Path(reference.path).resolve()
+        try:
+            checkpoint_path.relative_to(self._trusted_root)
+        except ValueError as exc:
+            raise IntegrityError(
+                "checkpoint authority escaped its trusted checkpoint root"
+            ) from exc
+        checkpoint = ProgramIntegrityCheckpoint(
+            checkpoint_path,
+            expected_sha256=reference.sha256,
+            stores=stores,
+            _authority=_CHECKPOINT_AUTHORITY,
+        )
+        checkpoint.verify()
+        return checkpoint
+
+    @staticmethod
+    def validate_successor(
+        current: ProgramIntegrityCheckpoint,
+        successor: ProgramIntegritySuccessor,
+    ) -> None:
+        """Validate the transition before an external authority publishes it."""
+
+        current._require_authority()
+        if not isinstance(successor, ProgramIntegritySuccessor):
+            raise IntegrityError(
+                "checkpoint successor has an invalid transition envelope"
+            )
+        with current.locked():
+            try:
+                expected = current.successor(
+                    mutated_store=successor.mutated_store,
+                    record_hash=successor.record_hash,
+                )
+            except ExperimentControlError as exc:
+                raise IntegrityError(
+                    "checkpoint successor is not the exact current transition"
+                ) from exc
+            actual_transition = (
+                successor.previous_checkpoint_sha256,
+                successor.checkpoint_bytes,
+                successor.checkpoint_sha256,
+                successor.mutated_store,
+                successor.record_hash,
+                successor.mutated,
+            )
+            expected_transition = (
+                expected.previous_checkpoint_sha256,
+                expected.checkpoint_bytes,
+                expected.checkpoint_sha256,
+                expected.mutated_store,
+                expected.record_hash,
+                expected.mutated,
+            )
+            if actual_transition != expected_transition:
+                raise IntegrityError(
+                    "checkpoint successor is not the exact recomputed transition"
+                )
+
+
+@dataclass(frozen=True, eq=False)
+class GovernedMutationReceipt(Mapping[str, Any]):
+    """Prior API mapping plus its unpublished exact successor checkpoint."""
+
+    value: dict[str, Any]
+    record_hash: str
+    integrity: ProgramIntegritySuccessor
+
+    def __getitem__(self, key: str) -> Any:
+        return self.value[key]
+
+    def __iter__(self):
+        return iter(self.value)
+
+    def __len__(self) -> int:
+        return len(self.value)
+
+    @property
+    def assessment(self) -> dict[str, Any]:
+        return self.value
+
+    @property
+    def assessment_record_hash(self) -> str:
+        return self.record_hash
+
+    @property
+    def next_checkpoint_bytes(self) -> bytes:
+        return self.integrity.checkpoint_bytes
+
+    @property
+    def next_checkpoint_sha256(self) -> str:
+        return self.integrity.checkpoint_sha256
+
+    @property
+    def previous_checkpoint_sha256(self) -> str:
+        return self.integrity.previous_checkpoint_sha256
+
+    @property
+    def mutated(self) -> bool:
+        return self.integrity.mutated
+
+
+class ProgramIntegrityCheckpoint:
+    """An exact four-ledger checkpoint whose digest is supplied externally."""
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        expected_sha256: str,
+        stores: Mapping[str, CanonicalHashChainStore],
+        _authority: object | None = None,
+    ) -> None:
+        normalized_digest = str(expected_sha256).strip().lower()
+        if not _SHA256_RE.fullmatch(normalized_digest):
+            raise ExperimentControlError(
+                "expected checkpoint SHA-256 must be a full digest"
+            )
+        self.path = Path(path)
+        self.expected_sha256 = normalized_digest
+        self._stores = _normalize_program_integrity_stores(stores)
+        self._authority = _authority
+
+    @property
+    def stores(self) -> Mapping[str, CanonicalHashChainStore]:
+        return dict(self._stores)
+
+    @property
+    def authority_verified(self) -> bool:
+        return self._authority is _CHECKPOINT_AUTHORITY
+
+    def _require_authority(self) -> None:
+        if not self.authority_verified:
+            raise IntegrityError(
+                "governed mutation requires the authority-resolved current checkpoint"
+            )
+
+    @contextmanager
+    def locked(self):
+        """Hold the program-wide mutation lock, re-entrantly in one thread."""
+
+        self._require_authority()
+        lock_path = self.path.parent / ".program-integrity.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        key = str(lock_path.resolve())
+        thread_lock = _program_thread_lock(lock_path)
+        with thread_lock:
+            depths = getattr(_PROGRAM_LOCK_STATE, "depths", None)
+            if depths is None:
+                depths = {}
+                _PROGRAM_LOCK_STATE.depths = depths
+            entry = depths.get(key)
+            if entry is not None:
+                entry["depth"] += 1
+                try:
+                    yield
+                finally:
+                    entry["depth"] -= 1
+                return
+
+            flags = os.O_RDWR | os.O_CREAT
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(lock_path, flags, 0o600)
+            except OSError as exc:
+                raise IntegrityError(
+                    "program-integrity lock cannot be opened safely"
+                ) from exc
+            handle = os.fdopen(descriptor, "a+", encoding="utf-8")
+
+            def require_same_regular_lock() -> None:
+                descriptor_stat = os.fstat(handle.fileno())
+                try:
+                    path_stat = os.stat(lock_path, follow_symlinks=False)
+                except OSError as exc:
+                    raise IntegrityError(
+                        "program-integrity lock path was replaced"
+                    ) from exc
+                if (
+                    not stat.S_ISREG(descriptor_stat.st_mode)
+                    or not stat.S_ISREG(path_stat.st_mode)
+                    or descriptor_stat.st_nlink != 1
+                    or path_stat.st_nlink != 1
+                    or descriptor_stat.st_dev != path_stat.st_dev
+                    or descriptor_stat.st_ino != path_stat.st_ino
+                    or (
+                        hasattr(os, "geteuid")
+                        and descriptor_stat.st_uid != os.geteuid()
+                    )
+                ):
+                    raise IntegrityError(
+                        "program-integrity lock is not one owned regular file"
+                    )
+
+            try:
+                require_same_regular_lock()
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                require_same_regular_lock()
+            except BaseException:
+                handle.close()
+                raise
+            depths[key] = {"depth": 1, "handle": handle}
+            try:
+                yield
+            finally:
+                try:
+                    require_same_regular_lock()
+                finally:
+                    del depths[key]
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    handle.close()
+
+    def _load(self) -> tuple[dict[str, Any], bytes]:
+        try:
+            raw = self.path.read_bytes()
+        except OSError as exc:
+            raise IntegrityError("program integrity checkpoint is unreadable") from exc
+        if _sha256_bytes(raw) != self.expected_sha256:
+            raise IntegrityError(
+                "program integrity checkpoint does not match the externally pinned digest"
+            )
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise IntegrityError("program integrity checkpoint is invalid JSON") from exc
+        normalized = _validate_program_integrity_checkpoint(value)
+        if raw != (canonical_json(normalized) + "\n").encode("utf-8"):
+            raise IntegrityError("program integrity checkpoint is not canonical JSON")
+        for name, anchor in normalized["stores"].items():
+            relative_path = anchor.get(
+                "path", _RECONCILIATION_LEDGER_FILENAMES[name]
+            )
+            expected_path = (self.path.parent / relative_path).resolve()
+            if self._stores[name].path.resolve() != expected_path:
+                raise IntegrityError(
+                    f"{name} path does not match the externally pinned checkpoint"
+                )
+        return normalized, raw
+
+    def assert_store(
+        self,
+        name: str,
+        store: CanonicalHashChainStore,
+    ) -> None:
+        if name not in self._stores:
+            raise ExperimentControlError(f"unknown governed store: {name}")
+        if not isinstance(store, CanonicalHashChainStore) or (
+            self._stores[name].path.resolve() != store.path.resolve()
+        ):
+            raise IntegrityError(
+                f"{name} does not match the externally checkpointed store"
+            )
+
+    def verify(
+        self,
+        *,
+        required_stores: Mapping[str, CanonicalHashChainStore] | None = None,
+    ) -> dict[str, Any]:
+        if required_stores is not None:
+            for name, store in required_stores.items():
+                self.assert_store(name, store)
+        checkpoint, _ = self._load()
+        for name, store in self._stores.items():
+            actual, _ = _program_store_snapshot(store)
+            expected = {
+                key: value
+                for key, value in checkpoint["stores"][name].items()
+                if key != "path"
+            }
+            if actual != expected:
+                raise IntegrityError(
+                    f"{name} does not match the externally pinned current checkpoint"
+                )
+        return checkpoint
+
+    def expected_head(
+        self,
+        name: str,
+        store: CanonicalHashChainStore,
+        *,
+        caller_expected_head: str | None = None,
+    ) -> str:
+        self.assert_store(name, store)
+        checkpoint = self.verify()
+        checkpoint_head = checkpoint["stores"][name]["expected_head"]
+        if (
+            caller_expected_head is not None
+            and caller_expected_head != checkpoint_head
+        ):
+            raise CompareAndSwapError(
+                f"{name} expected head contradicts the current checkpoint"
+            )
+        return str(checkpoint_head)
+
+    def successor(
+        self,
+        *,
+        mutated_store: str,
+        record_hash: str,
+    ) -> ProgramIntegritySuccessor:
+        """Validate exactly zero/one target append and build its next snapshot."""
+
+        with self.locked():
+            return self._successor_locked(
+                mutated_store=mutated_store,
+                record_hash=record_hash,
+            )
+
+    def _successor_locked(
+        self,
+        *,
+        mutated_store: str,
+        record_hash: str,
+    ) -> ProgramIntegritySuccessor:
+        if mutated_store not in self._stores:
+            raise ExperimentControlError(
+                f"unknown governed store: {mutated_store}"
+            )
+        normalized_record_hash = str(record_hash).strip().lower()
+        if not _SHA256_RE.fullmatch(normalized_record_hash):
+            raise ExperimentControlError(
+                "governed mutation record hash must be a SHA-256 digest"
+            )
+        previous, previous_raw = self._load()
+        next_anchors: dict[str, dict[str, Any]] = {}
+        mutated = False
+        for name, store in self._stores.items():
+            actual, records = _program_store_snapshot(store)
+            before = previous["stores"][name]
+            before_values = {
+                key: value for key, value in before.items() if key != "path"
+            }
+            if name != mutated_store:
+                if actual != before_values:
+                    raise IntegrityError(
+                        f"{name} changed during a different governed mutation"
+                    )
+            elif actual == before_values:
+                if not any(
+                    record["record_hash"] == normalized_record_hash
+                    for record in records
+                ):
+                    raise IntegrityError(
+                        "idempotent governed mutation record is not checkpointed"
+                    )
+            else:
+                if (
+                    actual["expected_length"] != before["expected_length"] + 1
+                    or not records
+                    or records[-1]["record_hash"] != normalized_record_hash
+                    or records[-1]["previous_hash"] != before["expected_head"]
+                    or actual["expected_head"] != normalized_record_hash
+                ):
+                    raise IntegrityError(
+                        "governed mutation must append exactly one target record"
+                    )
+                mutated = True
+            actual["path"] = before.get(
+                "path",
+                Path(
+                    os.path.relpath(
+                        store.path.resolve(),
+                        self.path.parent.resolve(),
+                    )
+                ).as_posix(),
+            )
+            next_anchors[name] = actual
+        successor = {
+            "baseline_manifest_sha256": previous[
+                "baseline_manifest_sha256"
+            ],
+            "runtime_leakage_finding_count": previous[
+                "runtime_leakage_finding_count"
+            ],
+            "stores": next_anchors,
+        }
+        if "promotion_population" in previous:
+            successor["promotion_population"] = previous[
+                "promotion_population"
+            ]
+        normalized = _validate_program_integrity_checkpoint(successor)
+        raw = (canonical_json(normalized) + "\n").encode("utf-8")
+        if not mutated and raw != previous_raw:
+            raise IntegrityError("idempotent checkpoint transition changed bytes")
+        return ProgramIntegritySuccessor(
+            previous_checkpoint_sha256=self.expected_sha256,
+            checkpoint_bytes=raw,
+            checkpoint_sha256=_sha256_bytes(raw),
+            mutated_store=mutated_store,
+            record_hash=normalized_record_hash,
+            mutated=mutated,
+        )
+
+
+def _governed_mutation(method):
+    """Serialize one supported mutation across the complete program snapshot."""
+
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        if "integrity_checkpoint" not in kwargs:
+            return method(*args, **kwargs)
+        checkpoint = kwargs["integrity_checkpoint"]
+        if not isinstance(checkpoint, ProgramIntegrityCheckpoint):
+            raise ExperimentControlError(
+                "integrity_checkpoint must be a ProgramIntegrityCheckpoint"
+            )
+        with checkpoint.locked():
+            return method(*args, **kwargs)
+
+    return wrapped
+
+
 class ExperimentLedger:
     """Append legacy evidence or immutable two-stage experiment contracts.
 
@@ -1348,13 +2170,15 @@ class ExperimentLedger:
             locked_check=check,
         )
 
+    @_governed_mutation
     def preregister(
         self,
         experiment_id: str,
         plan: Mapping[str, Any],
         *,
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
         expected_head: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> GovernedMutationReceipt:
         """Append an immutable experiment plan before candidate execution."""
 
         experiment_id = str(experiment_id).strip()
@@ -1369,6 +2193,11 @@ class ExperimentLedger:
             "experiment_id": experiment_id,
             "plan": normalized_plan,
         }
+        integrity_checkpoint.expected_head(
+            "experiment_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
 
         def check(
             records: tuple[dict[str, Any], ...],
@@ -1390,12 +2219,26 @@ class ExperimentLedger:
                 )
             return None
 
-        return self.store.append_transactional(
+        checkpoint_head = integrity_checkpoint.expected_head(
+            "experiment_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
+        record = self.store.append_transactional(
             payload,
-            expected_head=expected_head,
+            expected_head=checkpoint_head,
             locked_check=check,
         )
+        return GovernedMutationReceipt(
+            value=dict(record),
+            record_hash=record["record_hash"],
+            integrity=integrity_checkpoint.successor(
+                mutated_store="experiment_ledger",
+                record_hash=record["record_hash"],
+            ),
+        )
 
+    @_governed_mutation
     def record_result(
         self,
         experiment_id: str,
@@ -1403,8 +2246,9 @@ class ExperimentLedger:
         *,
         decision: str,
         rationale: str,
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
         expected_head: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> GovernedMutationReceipt:
         """Append one aggregate-only outcome bound to a prior immutable plan."""
 
         experiment_id = str(experiment_id).strip()
@@ -1425,6 +2269,11 @@ class ExperimentLedger:
             )
         _require_nonidentifying_control_text("rationale", normalized_rationale)
 
+        integrity_checkpoint.expected_head(
+            "experiment_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
         records = self.store.verify()
         matching_plans = [
             record
@@ -1448,11 +2297,36 @@ class ExperimentLedger:
             decision=normalized_decision,
             evidence_label=evidence_label,
         )
+        for binding in (
+            "evaluator_sha256",
+            "input_tree_sha256",
+            "runtime_contract_sha256",
+            "split_manifest_sha256",
+            "truth_sha256",
+        ):
+            if (
+                normalized_evidence[binding]
+                != plan_record["payload"]["plan"][binding]
+            ):
+                raise ExperimentControlError(
+                    f"experiment result {binding} does not match its plan"
+                )
+        if (
+            normalized_evidence["expected_record_count"]
+            != plan_record["payload"]["plan"]["expected_record_count"]
+        ):
+            raise ExperimentControlError(
+                "experiment result expected_record_count does not match its plan"
+            )
         if evidence_label == "protected":
             if self.protected_access_store is None:
                 raise ExperimentControlError(
                     "protected results require the protected-access ledger"
                 )
+            integrity_checkpoint.assert_store(
+                "protected_access_ledger",
+                self.protected_access_store,
+            )
             protected_records = self.protected_access_store.verify()
             ProtectedAccessBudget.validate_store_records(protected_records)
             protected_record_hash = normalized_evidence[
@@ -1476,9 +2350,31 @@ class ExperimentLedger:
                 raise ExperimentControlError(
                     "protected access candidate does not match experiment result"
                 )
+            if access.get("experiment_plan_record_hash") != plan_record_hash:
+                raise ExperimentControlError(
+                    "protected access does not match experiment plan"
+                )
+            access_experiment_head = access.get(
+                "experiment_ledger_head_sha256"
+            )
+            access_head_records = [
+                record
+                for record in records
+                if record["record_hash"] == access_experiment_head
+            ]
+            if (
+                len(access_head_records) != 1
+                or plan_record["sequence"]
+                > access_head_records[0]["sequence"]
+            ):
+                raise ExperimentControlError(
+                    "protected access predates experiment preregistration"
+                )
             protected_result = dict(normalized_evidence)
             del protected_result["protected_access_record_hash"]
-            if access.get("aggregate_result") != protected_result:
+            if canonical_json(access.get("aggregate_result")) != canonical_json(
+                protected_result
+            ):
                 raise ExperimentControlError(
                     "protected result must exactly match its recorded access aggregates"
                 )
@@ -1520,10 +2416,23 @@ class ExperimentLedger:
                 )
             return None
 
-        return self.store.append_transactional(
+        checkpoint_head = integrity_checkpoint.expected_head(
+            "experiment_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
+        record = self.store.append_transactional(
             payload,
-            expected_head=expected_head,
+            expected_head=checkpoint_head,
             locked_check=check,
+        )
+        return GovernedMutationReceipt(
+            value=dict(record),
+            record_hash=record["record_hash"],
+            integrity=integrity_checkpoint.successor(
+                mutated_store="experiment_ledger",
+                record_hash=record["record_hash"],
+            ),
         )
 
 
@@ -1543,14 +2452,16 @@ class TaintRegistry:
             if event.get("event") == "taint"
         )
 
+    @_governed_mutation
     def taint(
         self,
         group_id: str,
         *,
         reason: str,
         source: str,
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
         expected_head: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> GovernedMutationReceipt:
         group_id = str(group_id).strip()
         reason = str(reason).strip()
         source = str(source).strip()
@@ -1562,7 +2473,20 @@ class TaintRegistry:
             "reason": reason,
             "source": source,
         }
-        return self.store.append(payload, expected_head=expected_head)
+        checkpoint_head = integrity_checkpoint.expected_head(
+            "taint_registry",
+            self.store,
+            caller_expected_head=expected_head,
+        )
+        record = self.store.append(payload, expected_head=checkpoint_head)
+        return GovernedMutationReceipt(
+            value=dict(record),
+            record_hash=record["record_hash"],
+            integrity=integrity_checkpoint.successor(
+                mutated_store="taint_registry",
+                record_hash=record["record_hash"],
+            ),
+        )
 
     def untaint(self, group_id: str) -> None:
         del group_id
@@ -1810,7 +2734,13 @@ class ProtectedAccessBudget:
 
     CONFIGURATION_EVENT = "protected_budget_configuration"
 
-    def __init__(self, path: Path | str, *, maximum_accesses: int) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        maximum_accesses: int,
+        integrity_checkpoint: ProgramIntegrityCheckpoint | None = None,
+    ) -> None:
         if (
             isinstance(maximum_accesses, bool)
             or not isinstance(maximum_accesses, int)
@@ -1819,7 +2749,14 @@ class ProtectedAccessBudget:
             raise ExperimentControlError("maximum_accesses must be positive")
         self.store = CanonicalHashChainStore(path)
         self.maximum_accesses = maximum_accesses
-        self._ensure_configuration()
+        self.initialization_receipt = self._ensure_configuration(
+            integrity_checkpoint=integrity_checkpoint
+        )
+        self.initialization_integrity = (
+            self.initialization_receipt.integrity
+            if self.initialization_receipt is not None
+            else None
+        )
 
     @classmethod
     def _validate_configuration(
@@ -1886,13 +2823,32 @@ class ProtectedAccessBudget:
         access_ids: set[str] = set()
         for record in records[1:]:
             payload = record["payload"]
-            if set(payload) != {
+            legacy_keys = {
                 "access_id",
                 "aggregate_result",
                 "candidate_sha256",
                 "event",
                 "purpose",
-            } or payload.get("event") != "protected_access":
+            }
+            bound_keys = legacy_keys | {
+                "experiment_ledger_head_sha256",
+                "experiment_plan_record_hash",
+            }
+            payload_keys = frozenset(payload)
+            legacy_baseline = (
+                payload_keys == frozenset(legacy_keys)
+                and record["sequence"] == 2
+                and payload.get("access_id") == "baseline-establishment-v1"
+            )
+            if (
+                payload_keys
+                not in {frozenset(legacy_keys), frozenset(bound_keys)}
+                or (
+                    payload_keys == frozenset(legacy_keys)
+                    and not legacy_baseline
+                )
+                or payload.get("event") != "protected_access"
+            ):
                 raise IntegrityError(
                     "protected access ledger contains an invalid event"
                 )
@@ -1910,6 +2866,28 @@ class ProtectedAccessBudget:
                 or not isinstance(candidate_sha256, str)
                 or not _SHA256_RE.fullmatch(candidate_sha256)
                 or access_id in access_ids
+                or (
+                    "experiment_plan_record_hash" in payload
+                    and (
+                        not isinstance(
+                            payload["experiment_plan_record_hash"], str
+                        )
+                        or not _SHA256_RE.fullmatch(
+                            payload["experiment_plan_record_hash"]
+                        )
+                    )
+                )
+                or (
+                    "experiment_ledger_head_sha256" in payload
+                    and (
+                        not isinstance(
+                            payload["experiment_ledger_head_sha256"], str
+                        )
+                        or not _SHA256_RE.fullmatch(
+                            payload["experiment_ledger_head_sha256"]
+                        )
+                    )
+                )
             ):
                 raise IntegrityError(
                     "protected access ledger contains invalid access metadata"
@@ -1926,23 +2904,56 @@ class ProtectedAccessBudget:
             raise IntegrityError("protected access ledger exceeds its budget")
         return maximum_accesses
 
-    def _ensure_configuration(self) -> None:
+    def _ensure_configuration(
+        self,
+        *,
+        integrity_checkpoint: ProgramIntegrityCheckpoint | None,
+    ) -> GovernedMutationReceipt | None:
         payload = {
             "event": self.CONFIGURATION_EVENT,
             "maximum_accesses": self.maximum_accesses,
         }
-
-        def check(
-            records: tuple[dict[str, Any], ...],
-            requested: Mapping[str, Any],
-        ) -> Mapping[str, Any] | None:
-            del requested
-            return self._validate_configuration(
-                records,
-                maximum_accesses=self.maximum_accesses,
+        existing_records = self.store.verify()
+        existing = self._validate_configuration(
+            existing_records,
+            maximum_accesses=self.maximum_accesses,
+        )
+        if existing is not None:
+            return None
+        if integrity_checkpoint is None:
+            raise ExperimentControlError(
+                "initializing a protected access budget requires "
+                "the externally pinned current checkpoint"
+            )
+        with integrity_checkpoint.locked():
+            checkpoint_head = integrity_checkpoint.expected_head(
+                "protected_access_ledger",
+                self.store,
             )
 
-        self.store.append_transactional(payload, locked_check=check)
+            def check(
+                records: tuple[dict[str, Any], ...],
+                requested: Mapping[str, Any],
+            ) -> Mapping[str, Any] | None:
+                del requested
+                return self._validate_configuration(
+                    records,
+                    maximum_accesses=self.maximum_accesses,
+                )
+
+            record = self.store.append_transactional(
+                payload,
+                expected_head=checkpoint_head,
+                locked_check=check,
+            )
+            return GovernedMutationReceipt(
+                value=dict(record),
+                record_hash=record["record_hash"],
+                integrity=integrity_checkpoint.successor(
+                    mutated_store="protected_access_ledger",
+                    record_hash=record["record_hash"],
+                ),
+            )
 
     def accesses(self) -> tuple[dict[str, Any], ...]:
         records = self.store.verify()
@@ -1965,17 +2976,24 @@ class ProtectedAccessBudget:
     def remaining(self) -> int:
         return self.maximum_accesses - self.used
 
+    @_governed_mutation
     def record_access(
         self,
         access_id: str,
         *,
         candidate_sha256: str,
         aggregate_result: Mapping[str, Any],
+        experiment_ledger: ExperimentLedger,
+        experiment_plan_record_hash: str,
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
         purpose: str,
         expected_head: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> GovernedMutationReceipt:
         access_id = str(access_id).strip()
         candidate_sha256 = str(candidate_sha256).strip().lower()
+        experiment_plan_record_hash = str(
+            experiment_plan_record_hash
+        ).strip().lower()
         purpose = str(purpose).strip()
         if (
             not access_id
@@ -1987,12 +3005,45 @@ class ProtectedAccessBudget:
         _require_nonidentifying_control_text("purpose", purpose)
         if not re.fullmatch(r"[0-9a-f]{64}", candidate_sha256):
             raise ExperimentControlError("candidate_sha256 must be a SHA-256 hex digest")
+        if not _SHA256_RE.fullmatch(experiment_plan_record_hash):
+            raise ExperimentControlError(
+                "experiment_plan_record_hash must be a SHA-256 hex digest"
+            )
+        if not isinstance(experiment_ledger, ExperimentLedger):
+            raise ExperimentControlError(
+                "experiment_ledger must be an ExperimentLedger"
+            )
+        integrity_checkpoint.assert_store(
+            "experiment_ledger",
+            experiment_ledger.store,
+        )
+        integrity_checkpoint.expected_head(
+            "protected_access_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
+        experiment_records = experiment_ledger.store.verify()
+        matching_plans = [
+            record
+            for record in experiment_records
+            if record["record_hash"] == experiment_plan_record_hash
+            and record["payload"].get("event") == "experiment_plan"
+        ]
+        if len(matching_plans) != 1:
+            raise ExperimentControlError(
+                "protected access requires an existing experiment plan"
+            )
+        experiment_ledger_head_sha256 = experiment_ledger.store._head(
+            experiment_records
+        )
         require_aggregate_only(aggregate_result)
         requested = {
             "event": "protected_access",
             "access_id": access_id,
             "candidate_sha256": candidate_sha256,
             "aggregate_result": dict(aggregate_result),
+            "experiment_ledger_head_sha256": experiment_ledger_head_sha256,
+            "experiment_plan_record_hash": experiment_plan_record_hash,
             "purpose": purpose,
         }
 
@@ -2012,7 +3063,9 @@ class ProtectedAccessBudget:
             for record in accesses:
                 existing = record["payload"]
                 if existing.get("access_id") == access_id:
-                    if existing != normalized_request:
+                    if canonical_json(existing) != canonical_json(
+                        normalized_request
+                    ):
                         raise ExperimentControlError(
                             f"access_id retry does not match original request: {access_id}"
                         )
@@ -2021,12 +3074,23 @@ class ProtectedAccessBudget:
                 raise BudgetExhaustedError("protected access budget is exhausted")
             return None
 
-        return dict(
-            self.store.append_transactional(
-                requested,
-                expected_head=expected_head,
-                locked_check=check,
-            )["payload"]
+        checkpoint_head = integrity_checkpoint.expected_head(
+            "protected_access_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
+        record = self.store.append_transactional(
+            requested,
+            expected_head=checkpoint_head,
+            locked_check=check,
+        )
+        return GovernedMutationReceipt(
+            value=dict(record["payload"]),
+            record_hash=record["record_hash"],
+            integrity=integrity_checkpoint.successor(
+                mutated_store="protected_access_ledger",
+                record_hash=record["record_hash"],
+            ),
         )
 
 
@@ -2359,6 +3423,12 @@ class RuntimeLeakageScanner:
 
 
 _PROMOTION_GATE_AUTHORITY = object()
+_PROMOTION_MILESTONE_THRESHOLDS = {
+    "milestone-136": 136.0,
+    "milestone-142": 142.0,
+    "milestone-146": 146.0,
+    "milestone-148": 148.0,
+}
 
 
 class CandidateStateStore:
@@ -2376,12 +3446,27 @@ class CandidateStateStore:
             if record["payload"].get("event") == "candidate_assessment"
         )
 
-    def latest_passing(self) -> dict[str, Any] | None:
-        for assessment in reversed(self.assessments()):
-            if assessment.get("decision") == "PASSED":
-                return assessment
+    def latest_passing(
+        self,
+        *,
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
+    ) -> dict[str, Any] | None:
+        """Return only state finalized by the externally current checkpoint."""
+
+        if not isinstance(integrity_checkpoint, ProgramIntegrityCheckpoint):
+            raise ExperimentControlError(
+                "integrity_checkpoint must be a ProgramIntegrityCheckpoint"
+            )
+        with integrity_checkpoint.locked():
+            integrity_checkpoint.verify(
+                required_stores={"candidate_state_ledger": self.store}
+            )
+            for assessment in reversed(self.assessments()):
+                if assessment.get("decision") == "PASSED":
+                    return assessment
         return None
 
+    @_governed_mutation
     def assess(
         self,
         assessment_id: str,
@@ -2390,23 +3475,33 @@ class CandidateStateStore:
         candidate_sha256: str,
         decision: str,
         aggregate_evidence: Mapping[str, Any],
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
         expected_head: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> GovernedMutationReceipt:
         if str(decision).strip().upper() == "PASSED":
             raise ExperimentControlError(
                 "PASSED can only be persisted by CandidatePromotionGate"
             )
-        return self._persist_assessment(
+        record = self._persist_assessment_record(
             assessment_id,
             candidate_id=candidate_id,
             candidate_sha256=candidate_sha256,
             decision=decision,
             aggregate_evidence=aggregate_evidence,
+            integrity_checkpoint=integrity_checkpoint,
             expected_head=expected_head,
             authority=None,
         )
+        return GovernedMutationReceipt(
+            value=dict(record["payload"]),
+            record_hash=record["record_hash"],
+            integrity=integrity_checkpoint.successor(
+                mutated_store="candidate_state_ledger",
+                record_hash=record["record_hash"],
+            ),
+        )
 
-    def _persist_assessment(
+    def _persist_assessment_record(
         self,
         assessment_id: str,
         *,
@@ -2414,6 +3509,7 @@ class CandidateStateStore:
         candidate_sha256: str,
         decision: str,
         aggregate_evidence: Mapping[str, Any],
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
         expected_head: str | None,
         authority: object | None,
     ) -> dict[str, Any]:
@@ -2442,6 +3538,11 @@ class CandidateStateStore:
             "decision": decision,
             "aggregate_evidence": dict(aggregate_evidence),
         }
+        integrity_checkpoint.expected_head(
+            "candidate_state_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
 
         def check(
             records: tuple[dict[str, Any], ...],
@@ -2453,190 +3554,551 @@ class CandidateStateStore:
                     existing.get("event") == "candidate_assessment"
                     and existing.get("assessment_id") == assessment_id
                 ):
-                    if existing != requested:
+                    if canonical_json(existing) != canonical_json(requested):
                         raise ExperimentControlError(
                             f"assessment retry does not match original: {assessment_id}"
                         )
                     return record
             return None
 
-        return dict(
-            self.store.append_transactional(
-                payload,
-                expected_head=expected_head,
-                locked_check=check,
-            )["payload"]
+        checkpoint_head = integrity_checkpoint.expected_head(
+            "candidate_state_ledger",
+            self.store,
+            caller_expected_head=expected_head,
+        )
+        return self.store.append_transactional(
+            payload,
+            expected_head=checkpoint_head,
+            locked_check=check,
         )
 
 
 class CandidatePromotionGate:
-    """Evaluate every hard gate and atomically persist the resulting decision."""
+    """Promote only a protected, plan-bound, milestone-qualified result."""
 
     def __init__(
         self,
         state: CandidateStateStore,
         *,
-        protected_budget: ProtectedAccessBudget | None = None,
+        experiment_ledger: ExperimentLedger,
+        taint_registry: TaintRegistry,
     ) -> None:
         self.state = state
-        self.protected_budget = protected_budget
+        self.experiment_ledger = experiment_ledger
+        self.taint_registry = taint_registry
 
-    @staticmethod
-    def _count(name: str, value: Any) -> int:
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ExperimentControlError(f"{name} must be a non-negative integer")
-        return value
+    def _verified_result(
+        self,
+        record_hash: str,
+    ) -> tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        str,
+    ]:
+        normalized_hash = str(record_hash).strip().lower()
+        if not _SHA256_RE.fullmatch(normalized_hash):
+            raise ExperimentControlError(
+                "experiment_result_record_hash must be a SHA-256 hex digest"
+            )
+        records = self.experiment_ledger.store.verify()
+        matches = [
+            record for record in records if record["record_hash"] == normalized_hash
+        ]
+        if len(matches) != 1:
+            raise ExperimentControlError(
+                "promotion requires one bound experiment-result record"
+            )
+        result_record = matches[0]
+        result = result_record["payload"]
+        if set(result) != {
+            "decision",
+            "event",
+            "evidence",
+            "experiment_id",
+            "plan_record_hash",
+            "rationale",
+        } or result.get("event") != "experiment_result":
+            raise ExperimentControlError(
+                "promotion record is not a canonical experiment result"
+            )
+        experiment_id = result.get("experiment_id")
+        rationale = result.get("rationale")
+        decision = result.get("decision")
+        if (
+            not isinstance(experiment_id, str)
+            or not _SAFE_DIMENSION_RE.fullmatch(experiment_id)
+            or not isinstance(rationale, str)
+            or not _SAFE_DIMENSION_RE.fullmatch(rationale)
+            or decision not in _EXPERIMENT_RESULT_DECISIONS
+        ):
+            raise ExperimentControlError(
+                "promotion experiment-result metadata is invalid"
+            )
+        _require_nonidentifying_control_text("experiment_id", experiment_id)
+        _require_nonidentifying_control_text("rationale", rationale)
 
-    @staticmethod
-    def _flag(name: str, value: Any) -> bool:
-        if not isinstance(value, bool):
-            raise ExperimentControlError(f"{name} must be a boolean")
-        return value
+        plan_hash = result.get("plan_record_hash")
+        if not isinstance(plan_hash, str) or not _SHA256_RE.fullmatch(plan_hash):
+            raise ExperimentControlError(
+                "promotion experiment result has no valid plan binding"
+            )
+        experiment_plans = [
+            record
+            for record in records
+            if record["payload"].get("event") == "experiment_plan"
+            and record["payload"].get("experiment_id") == experiment_id
+        ]
+        experiment_results = [
+            record
+            for record in records
+            if record["payload"].get("event") == "experiment_result"
+            and record["payload"].get("experiment_id") == experiment_id
+        ]
+        if (
+            len(experiment_plans) != 1
+            or len(experiment_results) != 1
+            or experiment_results[0]["record_hash"] != result_record["record_hash"]
+        ):
+            raise ExperimentControlError(
+                "promotion requires exactly one plan and one result per experiment"
+            )
+        plan_record = experiment_plans[0]
+        if (
+            plan_record["record_hash"] != plan_hash
+            or plan_record["sequence"] >= result_record["sequence"]
+        ):
+            raise ExperimentControlError(
+                "promotion result does not bind one earlier experiment plan"
+            )
+        plan_payload = plan_record["payload"]
+        if set(plan_payload) != {"event", "experiment_id", "plan"} or (
+            plan_payload.get("event") != "experiment_plan"
+            or plan_payload.get("experiment_id") != experiment_id
+        ):
+            raise ExperimentControlError(
+                "promotion result and experiment plan do not match"
+            )
+        normalized_plan = _normalize_experiment_plan(plan_payload["plan"])
+        if canonical_json(normalized_plan) != canonical_json(plan_payload["plan"]):
+            raise IntegrityError("promotion experiment plan is not canonical")
+        evidence_label = normalized_plan["evidence_label"]
+        normalized_evidence = _normalize_experiment_result_evidence(
+            result["evidence"],
+            decision=decision,
+            evidence_label=evidence_label,
+        )
+        if canonical_json(normalized_evidence) != canonical_json(
+            result["evidence"]
+        ):
+            raise IntegrityError("promotion experiment result is not canonical")
+        return (
+            result_record,
+            plan_record,
+            normalized_evidence,
+            normalized_plan,
+            self.experiment_ledger.store._head(records),
+        )
 
+    def _verified_protected_access(
+        self,
+        evidence: Mapping[str, Any],
+        *,
+        candidate_sha256: str,
+        plan_record: Mapping[str, Any],
+        result_record: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        store = self.experiment_ledger.protected_access_store
+        if store is None:
+            raise ExperimentControlError(
+                "promotion requires the protected-access ledger"
+            )
+        records = store.verify()
+        ProtectedAccessBudget.validate_store_records(records)
+        access_hash = evidence.get("protected_access_record_hash")
+        if not isinstance(access_hash, str) or not _SHA256_RE.fullmatch(access_hash):
+            raise ExperimentControlError(
+                "promotion result has no protected-access binding"
+            )
+        matches = [
+            record
+            for record in records
+            if record["record_hash"] == access_hash
+            and record["payload"].get("event") == "protected_access"
+        ]
+        if len(matches) != 1:
+            raise ExperimentControlError(
+                "promotion result does not bind one protected access"
+            )
+        access_record = matches[0]
+        access = access_record["payload"]
+        if access.get("candidate_sha256") != candidate_sha256:
+            raise ExperimentControlError(
+                "protected access candidate does not match promotion candidate"
+            )
+        if (
+            access.get("experiment_plan_record_hash")
+            != plan_record["record_hash"]
+        ):
+            raise ExperimentControlError(
+                "protected access does not match promotion experiment plan"
+            )
+        experiment_records = self.experiment_ledger.store.verify()
+        access_head_matches = [
+            record
+            for record in experiment_records
+            if record["record_hash"]
+            == access.get("experiment_ledger_head_sha256")
+        ]
+        if (
+            len(access_head_matches) != 1
+            or plan_record["sequence"] > access_head_matches[0]["sequence"]
+            or access_head_matches[0]["sequence"] >= result_record["sequence"]
+        ):
+            raise ExperimentControlError(
+                "protected access must follow preregistration and precede the result"
+            )
+        protected_aggregate = dict(evidence)
+        del protected_aggregate["protected_access_record_hash"]
+        if canonical_json(access.get("aggregate_result")) != canonical_json(
+            protected_aggregate
+        ):
+            raise ExperimentControlError(
+                "promotion result does not exactly match protected aggregates"
+            )
+        return access_record, store._head(records)
+
+    @_governed_mutation
     def evaluate_and_record(
         self,
         assessment_id: str,
         *,
         candidate_id: str,
         candidate_sha256: str,
-        baseline_verified: bool,
-        leakage_finding_count: int,
-        deterministic: bool,
-        false_approvals: int,
-        missing_records: int,
-        invalid_records: int,
-        regression_counts: Mapping[str, int],
-        fold_consistent: bool,
-        access_id: str | None = None,
-        access_authorized: bool | None = None,
-        regression_waivers: Mapping[str, str] | None = None,
-        aggregate_evidence: Mapping[str, Any] | None = None,
+        experiment_result_record_hash: str,
+        integrity_checkpoint: ProgramIntegrityCheckpoint,
         expected_head: str | None = None,
-    ) -> dict[str, Any]:
-        """Persist PASSED only if all required gates actually evaluate true.
+    ) -> GovernedMutationReceipt:
+        """Derive every promotion gate from one immutable protected result."""
 
-        When a protected budget is supplied, authorization is derived from a
-        recorded access for the same candidate digest. Otherwise an explicit
-        boolean authorization is required. Positive regressions pass only when
-        each has a named, non-identifying waiver token.
-        """
-
+        protected_store = self.experiment_ledger.protected_access_store
+        if protected_store is None:
+            raise ExperimentControlError(
+                "promotion requires the protected-access ledger"
+            )
+        checkpoint_value = integrity_checkpoint.verify(
+            required_stores={
+                "candidate_state_ledger": self.state.store,
+                "experiment_ledger": self.experiment_ledger.store,
+                "protected_access_ledger": protected_store,
+                "taint_registry": self.taint_registry.store,
+            }
+        )
+        checkpoint_population_raw = checkpoint_value.get(
+            "promotion_population"
+        )
+        if checkpoint_population_raw is None:
+            raise IntegrityError(
+                "promotion requires an externally checkpointed population tuple"
+            )
+        checkpoint_population = _normalize_promotion_population(
+            checkpoint_population_raw
+        )
+        checkpoint_runtime_leakage_finding_count = checkpoint_value[
+            "runtime_leakage_finding_count"
+        ]
+        taint_head = checkpoint_value["stores"]["taint_registry"][
+            "expected_head"
+        ]
         candidate_sha256 = str(candidate_sha256).strip().lower()
         if not re.fullmatch(r"[0-9a-f]{64}", candidate_sha256):
             raise ExperimentControlError("candidate_sha256 must be a SHA-256 hex digest")
-        baseline_ok = self._flag("baseline_verified", baseline_verified)
-        deterministic_ok = self._flag("deterministic", deterministic)
-        folds_ok = self._flag("fold_consistent", fold_consistent)
-        leakage_count = self._count(
-            "leakage_finding_count", leakage_finding_count
-        )
-        false_approval_count = self._count("false_approvals", false_approvals)
-        missing_count = self._count("missing_records", missing_records)
-        invalid_count = self._count("invalid_records", invalid_records)
-
-        normalized_regressions: dict[str, int] = {}
-        if not isinstance(regression_counts, Mapping):
-            raise ExperimentControlError("regression_counts must be an object")
-        for raw_name, raw_count in regression_counts.items():
-            name = str(raw_name).strip()
-            if not _SAFE_DIMENSION_RE.fullmatch(name):
-                raise ExperimentControlError("regression names must be safe aggregate tokens")
-            normalized_regressions[name] = self._count(
-                f"regression_counts.{name}", raw_count
+        (
+            result_record,
+            plan_record,
+            result_evidence,
+            result_plan,
+            experiment_head,
+        ) = self._verified_result(experiment_result_record_hash)
+        result_payload = result_record["payload"]
+        if result_evidence["candidate_artifact_sha256"] != candidate_sha256:
+            raise ExperimentControlError(
+                "experiment result candidate does not match promotion candidate"
             )
-        normalized_waivers: dict[str, str] = {}
-        if regression_waivers is not None and not isinstance(
-            regression_waivers, Mapping
-        ):
-            raise ExperimentControlError("regression_waivers must be an object")
-        for raw_name, raw_token in (regression_waivers or {}).items():
-            name = str(raw_name).strip()
-            token = str(raw_token).strip()
+        evidence_label = result_plan["evidence_label"]
+        if evidence_label != "protected":
+            raise ExperimentControlError(
+                "candidate promotion requires protected evidence"
+            )
+        access_record, protected_head = self._verified_protected_access(
+            result_evidence,
+            candidate_sha256=candidate_sha256,
+            plan_record=plan_record,
+            result_record=result_record,
+        )
+        access_purpose = access_record["payload"]["purpose"]
+        milestone_total_score = _PROMOTION_MILESTONE_THRESHOLDS.get(
+            access_purpose
+        )
+        if milestone_total_score is None:
+            raise ExperimentControlError(
+                "protected access purpose is not a promotion milestone"
+            )
+
+        state_records = self.state.store.verify()
+        state_head = self.state.store._head(state_records)
+        if expected_head is not None and expected_head != state_head:
+            raise CompareAndSwapError(
+                f"candidate-state CAS failed: expected {expected_head}, got {state_head}"
+            )
+        existing = [
+            record
+            for record in state_records
+            if record["payload"].get("event") == "candidate_assessment"
+            and record["payload"].get("assessment_id") == str(assessment_id).strip()
+        ]
+        if existing:
+            if len(existing) != 1:
+                raise IntegrityError(
+                    f"candidate assessment is duplicated: {assessment_id}"
+                )
+            prior_record = existing[0]
+            prior = prior_record["payload"]
+            prior_evidence = prior.get("aggregate_evidence", {})
             if (
-                name not in normalized_regressions
-                or not _SAFE_DIMENSION_RE.fullmatch(token)
+                prior.get("candidate_id") != str(candidate_id).strip()
+                or prior.get("candidate_sha256") != candidate_sha256
+                or prior_evidence.get("experiment_result_record_hash")
+                != result_record["record_hash"]
             ):
                 raise ExperimentControlError(
-                    "waivers must name a regression and use a safe explicit token"
+                    f"assessment retry does not match original: {assessment_id}"
                 )
-            normalized_waivers[name] = token
-        unwaived_regressions = {
-            name: count
-            for name, count in normalized_regressions.items()
-            if count > 0 and name not in normalized_waivers
-        }
-
-        if self.protected_budget is not None:
-            requested_access_id = str(access_id or "").strip()
-            access_ok = any(
-                access.get("access_id") == requested_access_id
-                and access.get("candidate_sha256") == candidate_sha256
-                for access in self.protected_budget.accesses()
+            if prior.get("decision") == "PASSED":
+                prior_gates = prior_evidence.get("gate_results")
+                prior_population = _promotion_population_from(
+                    prior_evidence
+                )
+                if (
+                    prior_evidence.get("promotion_gate_verified") is not True
+                    or prior_evidence.get("hard_gate_failure_count") != 0
+                    or not isinstance(prior_gates, Mapping)
+                    or not prior_gates
+                    or any(value is not True for value in prior_gates.values())
+                    or prior_population != checkpoint_population
+                    or checkpoint_runtime_leakage_finding_count != 0
+                ):
+                    raise IntegrityError(
+                        "idempotent PASSED receipt is not valid under "
+                        "the current checkpoint"
+                    )
+            successor = integrity_checkpoint.successor(
+                mutated_store="candidate_state_ledger",
+                record_hash=prior_record["record_hash"],
             )
-        else:
-            access_ok = self._flag("access_authorized", access_authorized)
+            return GovernedMutationReceipt(
+                value=dict(prior),
+                record_hash=prior_record["record_hash"],
+                integrity=successor,
+            )
+
+        passing = [
+            record["payload"]
+            for record in state_records
+            if record["payload"].get("event") == "candidate_assessment"
+            and record["payload"].get("decision") == "PASSED"
+        ]
+        latest_passing = passing[-1] if passing else None
+        latest_score: float | None = None
+        latest_milestone: float | None = None
+        latest_population: dict[str, Any] | None = None
+        milestone_thresholds = tuple(
+            sorted(_PROMOTION_MILESTONE_THRESHOLDS.values())
+        )
+        if latest_passing is not None:
+            try:
+                latest_evidence = latest_passing["aggregate_evidence"]
+                raw_latest_score = latest_evidence["metrics"]["total_score"]
+            except (KeyError, TypeError) as exc:
+                raise IntegrityError(
+                    "latest passing candidate lacks its bound total score"
+                ) from exc
+            if (
+                isinstance(raw_latest_score, bool)
+                or not isinstance(raw_latest_score, (int, float))
+                or not 0 <= raw_latest_score <= 150
+            ):
+                raise IntegrityError(
+                    "latest passing candidate total score is invalid"
+                )
+            latest_score = float(raw_latest_score)
+            latest_population = _promotion_population_from(
+                latest_evidence
+            )
+            if (
+                latest_evidence.get("experiment_result_record_hash")
+                is not None
+                and latest_population is None
+            ):
+                raise IntegrityError(
+                    "latest governed passing candidate lacks its population tuple"
+                )
+            if (
+                latest_population is not None
+                and latest_population != checkpoint_population
+            ):
+                raise IntegrityError(
+                    "latest passing candidate population contradicts "
+                    "the current checkpoint"
+                )
+            raw_latest_milestone = latest_evidence.get(
+                "milestone_total_score"
+            )
+            if raw_latest_milestone is None:
+                if (
+                    latest_score >= milestone_thresholds[0]
+                    or latest_evidence.get("experiment_result_record_hash")
+                    is not None
+                ):
+                    raise IntegrityError(
+                        "latest passing candidate lacks its achieved milestone"
+                    )
+            elif (
+                isinstance(raw_latest_milestone, bool)
+                or not isinstance(raw_latest_milestone, (int, float))
+                or float(raw_latest_milestone) not in milestone_thresholds
+                or float(raw_latest_milestone) > latest_score
+            ):
+                raise IntegrityError(
+                    "latest passing candidate milestone is invalid"
+                )
+            else:
+                latest_milestone = float(raw_latest_milestone)
+        baseline_ok = (
+            latest_passing is not None
+            and latest_passing.get("candidate_sha256")
+            == result_evidence["baseline_artifact_sha256"]
+        )
+        passing_candidate_sha256 = {
+            record.get("candidate_sha256") for record in passing
+        }
+        candidate_changed = (
+            candidate_sha256
+            != result_evidence["baseline_artifact_sha256"]
+        )
+        candidate_digest_new = (
+            candidate_sha256 not in passing_candidate_sha256
+        )
+        checks = result_evidence["checks"]
+        metrics = result_evidence["metrics"]
+        regressions = result_evidence["regression_counts"]
+        next_milestone = next(
+            (
+                threshold
+                for threshold in milestone_thresholds
+                if latest_milestone is None
+                or threshold > latest_milestone
+            ),
+            None,
+        )
+        result_population = _promotion_population_from(result_evidence)
+        plan_population = _promotion_population_from(result_plan)
+        comparison_population = (
+            latest_population
+            if latest_population is not None
+            else checkpoint_population
+        )
+        population_ok = (
+            result_population is not None
+            and plan_population is not None
+            and result_population == plan_population
+            and result_population == checkpoint_population
+            and result_population == comparison_population
+            and result_population["expected_record_count"]
+            == metrics["record_count"]
+        )
 
         gate_results = {
-            "access_authorized": access_ok,
             "baseline_verified": baseline_ok,
-            "deterministic": deterministic_ok,
-            "fold_consistent": folds_ok,
-            "no_false_approvals": false_approval_count == 0,
-            "no_invalid_records": invalid_count == 0,
-            "no_leakage": leakage_count == 0,
-            "no_missing_records": missing_count == 0,
-            "regressions_cleared": not unwaived_regressions,
+            "candidate_changed_verified": candidate_changed,
+            "candidate_digest_unique_verified": candidate_digest_new,
+            "checkpoint_runtime_leakage_clean": (
+                checkpoint_runtime_leakage_finding_count == 0
+            ),
+            "evidence_class_verified": evidence_label == "protected",
+            "experiment_result_adopted": (
+                result_payload["decision"] == "adopt"
+            ),
+            "population_binding_verified": population_ok,
+            "protected_aggregate_verified": True,
+            "milestone_sequence_verified": (
+                next_milestone is not None
+                and milestone_total_score == next_milestone
+            ),
+            "milestone_score_reached": (
+                metrics["total_score"] >= milestone_total_score
+            ),
+            "score_improved": (
+                latest_score is not None
+                and metrics["total_score"] > latest_score
+            ),
+            "decision_freeze_verified": checks[
+                "decision_freeze_verified"
+            ],
+            "runtime_limits_verified": checks["runtime_limits_verified"],
+            "deterministic": checks["deterministic"],
+            "fold_consistent": checks["fold_consistent"],
+            "no_false_approvals": (
+                metrics["catastrophic_false_approvals"] == 0
+            ),
+            "no_invalid_records": metrics["invalid_records"] == 0,
+            "no_leakage": checks["runtime_leakage_clean"],
+            "no_missing_records": metrics["missing_records"] == 0,
+            "regressions_cleared": not any(regressions.values()),
         }
         decision = "PASSED" if all(gate_results.values()) else "BLOCKED"
 
-        evidence = dict(aggregate_evidence or {})
-        protected_keys = {
-            "access_authorized",
-            "baseline_verified",
-            "deterministic",
-            "false_approvals",
-            "fold_consistent",
-            "gate_results",
-            "hard_gate_failure_count",
-            "invalid_records",
-            "leakage_finding_count",
-            "missing_records",
-            "promotion_gate_verified",
-            "regression_counts",
-            "regression_waiver_count",
-        }
-        collisions = protected_keys.intersection(evidence)
-        if collisions:
-            raise ExperimentControlError(
-                "aggregate_evidence cannot override promotion gates: "
-                + ", ".join(sorted(collisions))
-            )
+        evidence = dict(result_evidence)
         evidence.update(
             {
-                "access_authorized": access_ok,
                 "baseline_verified": baseline_ok,
-                "deterministic": deterministic_ok,
-                "false_approvals": false_approval_count,
-                "fold_consistent": folds_ok,
+                "experiment_ledger_head_sha256": experiment_head,
+                "experiment_plan_record_hash": plan_record["record_hash"],
+                "experiment_result_record_hash": result_record["record_hash"],
                 "gate_results": gate_results,
                 "hard_gate_failure_count": sum(
                     not result for result in gate_results.values()
                 ),
-                "invalid_records": invalid_count,
-                "leakage_finding_count": leakage_count,
-                "missing_records": missing_count,
+                "checkpoint_runtime_leakage_finding_count": (
+                    checkpoint_runtime_leakage_finding_count
+                ),
+                "integrity_checkpoint_sha256": (
+                    integrity_checkpoint.expected_sha256
+                ),
+                "milestone_total_score": milestone_total_score,
                 "promotion_gate_verified": True,
-                "regression_counts": normalized_regressions,
-                "regression_waiver_count": len(normalized_waivers),
+                "protected_access_ledger_head_sha256": protected_head,
+                "taint_registry_head_sha256": taint_head,
             }
         )
         require_aggregate_only(evidence)
-        return self.state._persist_assessment(
+        assessment_record = self.state._persist_assessment_record(
             assessment_id,
             candidate_id=candidate_id,
             candidate_sha256=candidate_sha256,
             decision=decision,
             aggregate_evidence=evidence,
-            expected_head=expected_head,
+            integrity_checkpoint=integrity_checkpoint,
+            expected_head=state_head,
             authority=_PROMOTION_GATE_AUTHORITY,
+        )
+        successor = integrity_checkpoint.successor(
+            mutated_store="candidate_state_ledger",
+            record_hash=assessment_record["record_hash"],
+        )
+        return GovernedMutationReceipt(
+            value=dict(assessment_record["payload"]),
+            record_hash=assessment_record["record_hash"],
+            integrity=successor,
         )

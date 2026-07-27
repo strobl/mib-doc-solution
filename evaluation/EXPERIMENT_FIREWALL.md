@@ -28,20 +28,42 @@ contracts:
 
 | Control | Enforced property |
 | --- | --- |
-| `CanonicalHashChainStore` | Canonical JSONL, sequence and previous-head hash, locked append, compare-and-swap, and retained-head truncation detection |
+| `CanonicalHashChainStore` | Canonical JSONL, sequence and previous-head hash, locked append, and compare-and-swap |
+| `ProgramIntegrityCheckpoint` | Exact head, length, and file hash for all four governed ledgers plus the immutable protected-population tuple, bound to a digest supplied by Git/Factory rather than discovered beside the mutable ledgers; every supported governed mutation consumes the current checkpoint and produces an unpublished successor |
+| `CheckpointAuthorityResolver` | The only supported bridge from an authenticated Git/Factory “current checkpoint” lookup into mutation authority; a locally recomputed digest can be inspected but cannot authorize mutation |
 | `ExperimentLedger` | Immutable `experiment_plan` preregistration followed by at most one plan-bound `experiment_result`; unique IDs and strict allowlist-based aggregate-only results reject case IDs, PDF filenames, row/sample/outcome collections, predictions, and case-score payloads |
 | `FrozenBaselineManifest` | Create-once path, byte-size, and SHA-256 pins; changed artifacts or a changed requested manifest fail verification |
-| `TaintRegistry` | Append-only exposure events; tainted groups cannot be untainted |
+| `TaintRegistry` | Supported exposure-event API is append-only and checkpoint-gated; tainted groups cannot be untainted |
 | `RepeatedGroupedSplitManager` | Deterministic repeated K-fold assignment with whole layout/template groups kept together and tainted groups excluded |
-| `ProtectedAccessBudget` | An immutable finite aggregate-only access budget; its first-event configuration and every access event are validated, and one exclusive lock covers duplicate detection, limit enforcement, and append so concurrent writers cannot overspend |
+| `ProtectedAccessBudget` | Finite aggregate-only access budget; every supported access mutation exact-verifies the current four-ledger checkpoint, and one exclusive lock covers duplicate detection, limit enforcement, and append so concurrent writers cannot overspend |
 | `RuntimeLeakageScanner` | Static Python/JSON scan for MIB case IDs, PDF filenames, case/label lookup maps, filename-to-digest tables, and per-file digest keys; allowlists are exact-path and exact-code only |
-| `CandidatePromotionGate` | The only authority that may persist `PASSED`; it evaluates every hard gate and derives protected authorization from the access ledger |
-| `CandidateStateStore` | Every pass/block decision is hash chained; direct pass injection fails and a blocked candidate never replaces the latest passing candidate |
+| `CandidatePromotionGate` | The supported authority for persisting `PASSED`; it selects one unique hash-bound experiment result, revalidates its earlier plan and exact protected aggregate, derives every gate from that record, and enforces strict score improvement plus the next unskipped milestone |
+| `CandidateStateStore` | Supported pass/block decisions are hash chained and checkpoint-gated; its public assessment API rejects direct `PASSED`, and a blocked candidate never replaces the latest passing candidate |
 
 The hash chain detects edited, reordered, malformed, non-canonical, or
-partially written records. A valid prefix cannot reveal that later records
-were removed by itself, so each phase-exit evidence package must retain and
-publish the expected ledger head and record count.
+partially written records. A hash chain alone cannot reveal removal of a valid
+suffix. Every supported governed mutation must therefore exact-verify the
+single externally published current checkpoint before its compare-and-swap
+append. It returns a successor checkpoint, which remains non-authoritative
+until Git/Factory publishes its digest. The old checkpoint becomes stale after
+the append, so a publication failure quarantines further mutation rather than
+permitting silent truncation. Direct access to the underlying storage object is
+outside this supported trust boundary and remains subject to code review.
+
+Every supported mutation holds the same deterministic
+`evaluation/program/.program-integrity.lock` from checkpoint verification
+through all reads, the one append, and successor construction. The lock is
+opened without following symlinks and is inode-checked before and after the
+critical section. Candidate-state readers must also resolve the externally
+published successor before treating a new `PASSED` record as finalized.
+
+Production integration must construct mutation checkpoints through
+`CheckpointAuthorityResolver`. Its callback must resolve the single current
+checkpoint path and digest from authenticated Git/Factory state; it must never
+call `build_program_integrity_checkpoint` over caller-mutable ledgers. Before
+publishing a successor, the authority verifies that
+`previous_checkpoint_sha256` equals its current digest. Local Git state is a
+useful transport and audit trail, but is not by itself an absolute trust root.
 
 ## Frozen baseline demonstration
 
@@ -55,7 +77,7 @@ the WO-11 baseline:
 | `taint_registry.jsonl` | Permanently marks the evaluated public labeled cohort as exposed |
 | `protected_access_ledger.jsonl` | Freezes a five-access budget and consumes one aggregate-only access to establish the baseline |
 | `candidate_state_ledger.jsonl` | Establishes the byte-reproduced baseline as the initial passing candidate through `CandidatePromotionGate` |
-| `integrity_heads.json` | Publishes each ledger's expected head, length, and file hash so valid-prefix truncation is detectable |
+| `integrity_heads.json` | Historical baseline checkpoint. Its Git/Factory-pinned SHA-256 binds exact heads, lengths, and file hashes for all four ledgers; later checkpoints are versioned instead of overwriting it |
 
 For the initial baseline only, `fold_consistent=true` means a zero-delta
 self-comparison: the baseline defines the reference rather than asserting that
@@ -72,11 +94,14 @@ committed and never cross into runtime.
 Before executing a candidate, call `ExperimentLedger.preregister` to append
 SHA-256 commitments to one externally retained hypothesis and one primary
 variable, the parent commit, a non-empty exact changed-file scope, evidence
-class, and frozen split-manifest hash. Hash commitments keep free-form plan text
-and any accidental identity outside the ledger. After execution,
+class, expected record count, evaluator, input tree, pre-run runtime contract,
+frozen split manifest, and truth artifact. Hash commitments keep free-form plan
+text and any accidental identity outside the ledger. The preregistration must
+consume the currently published four-ledger checkpoint. After execution,
 `ExperimentLedger.record_result` appends at most one aggregate-only result bound
-to the exact plan record hash. A result without a plan, a conflicting retry of a
-plan, or any duplicate result fails closed.
+to the exact plan record hash and separately binds the produced runtime-evidence
+artifact. A result without a plan, a conflicting retry of a plan, a changed
+population/runtime-contract binding, or any duplicate result fails closed.
 
 The previously published one-stage `event=experiment` records remain readable
 and exactly retryable for backward compatibility, but the legacy API cannot
@@ -102,20 +127,49 @@ rationale token. Its evidence must contain:
 - catastrophic false approvals, missing rows, and invalid rows;
 - aggregate per-field and adjudication deltas;
 - golden/adversarial regression counts;
-- fold-consistency status and, for public-grouped adoption, repeated fold
-  counts, non-negative fold deltas, and per-repeat means where every repeat
-  still shows a positive gain after its strongest fold is removed;
-- wall time, process CPU time, peak RSS, `/tmp`, model, image, and output sizes;
+- fold-consistency status and, for both public-grouped and protected adoption,
+  exactly three repeats of five group-exclusive folds, positive integer fold
+  weights covering the expected population, non-negative fold deltas, and
+  weighted per-repeat means where every repeat still shows a positive gain
+  after any one fold is removed;
+- non-vacuous wall time, process CPU time, peak RSS, peak container memory,
+  `/tmp`, total model, largest model artifact, image, and output sizes;
 - decision-freeze result for a declared confidence-only change;
 - runtime leakage-scan result;
 - the matching protected-access record hash, when applicable.
 
+An adopted result is rejected above 4 GiB image size, 1 GiB total model size,
+250 MiB for any one model artifact, 25 MiB output, 8 GiB peak RSS or container
+memory, 2 GiB `/tmp`, 30,000 seconds total wall time, 6 seconds per record, or
+120,000 process-CPU seconds. Image bytes, output bytes, wall time, process CPU,
+peak RSS, and peak container memory must also be positive so an all-zero
+attestation cannot satisfy the gate.
+
 For a protected result, `record_result` also verifies that hash against the
 actual configured protected-access ledger, requires the same candidate digest,
-and requires every protected-derived aggregate to match the recorded access
-exactly. An `adopt` result fails when any supplied boolean check is false.
-Recording an experiment result never authorizes promotion;
-`CandidatePromotionGate` remains the only passing authority.
+requires the protected access to bind the earlier plan and the experiment-ledger
+head observed before measurement, requires the access snapshot to precede the
+result, and requires every protected-derived aggregate to match the recorded
+access exactly at canonical-JSON byte semantics. An `adopt` result fails when
+any supplied boolean check is false, any fold is negative, any repeat depends on
+one fold, the result population differs from the plan, or the declared resource
+limits are exceeded.
+Recording an experiment result never authorizes promotion.
+`CandidatePromotionGate` remains the only passing authority. Its strict API
+does not accept caller-supplied scores, safety counts, fold flags, access
+authorization, waivers, or free-form promotion evidence. It requires the full
+hash of one `experiment_result`, revalidates that result and its earlier plan,
+requires `evidence_label=protected`, rechecks exact equality with the bound
+protected-access aggregate, and derives the baseline from the latest passing
+candidate digest. The candidate must strictly improve that score. The protected
+access purpose must equal the next persisted, unskipped milestone:
+`milestone-136`, `milestone-142`, `milestone-146`, or `milestone-148`.
+The evaluator, input tree, runtime contract, split manifest, truth, and expected
+record count must also equal both the externally checkpointed cutover population
+and the latest governed passing population. A candidate digest must differ from
+its baseline and may not be reused by a later passing milestone. A non-zero
+checkpointed runtime-leakage finding count is an independent hard failure even
+when a result claims that its local leakage check passed.
 
 Individual protected-case outcomes must not enter the experiment ledger.
 Diagnosis that reveals a protected case or group appends a taint event before
@@ -131,7 +185,7 @@ answers, adjudication, error status, or case IDs.
 For each frozen candidate:
 
 1. derive the group manifest before reading candidate scores;
-2. generate at least three repeats of five group-exclusive folds;
+2. generate exactly three repeats of five group-exclusive folds;
 3. run baseline and candidate on identical fold members;
 4. retain individual rows outside the repository and broker;
 5. publish only aggregate component, safety, validity, and runtime metrics;
@@ -139,8 +193,24 @@ For each frozen candidate:
 7. label the result as public-data robustness evidence.
 
 The case-level split manifest is required to prove separation but stays in the
-external evaluation directory. The committed phase evidence contains only its
-hash, group/fold counts, aggregate score distribution, and taint snapshot hash.
+external evaluation directory. `devtools/layout_manifest_freezer.py` creates it
+from page count and first-page rendered-pixel density only; it reads no labels
+or PDF text. Its `mib-wo12-layout-groups/v2` schema attests label-blind
+construction only. It deliberately makes no historical
+`frozen_before_scoring` claim for the already exposed public baseline. The
+committed WO-12 demonstration therefore proves deterministic 3×5 mechanics,
+population coverage, and group exclusion, not unseen status or temporal
+freeze.
+
+For a future experiment, temporal ordering is established separately: the
+exact v2 manifest hash, input-tree hash, and split seed commitment must be
+included in the immutable experiment plan and externally checkpointed before
+the candidate is executed. The historical
+`mib-wo15-layout-groups/v1` schema remains readable only for its already
+published retrospective evidence; its caller-authored timing flag is not
+promotion authority. Committed phase evidence contains only manifest and
+producer hashes, group/fold counts, aggregate score distribution, and explicit
+public/tainted evidence labels.
 
 ## Protected access budget
 
@@ -155,7 +225,10 @@ The Phase 5–8 program has five planned protected aggregate accesses:
 A retry with identical bytes and the same access ID is free. A changed
 candidate or changed aggregate result requires a new access. Debugging from
 individual protected errors is prohibited; diagnosis first taints and removes
-the relevant group from that protected role.
+the relevant group from that protected role. A protected-access append is not
+accepted from a stale checkpoint, so truncating a prior access cannot reset the
+budget. Each successful access yields a successor checkpoint that must be
+published before the next governed mutation.
 
 ## Runtime leakage boundary
 
@@ -182,14 +255,20 @@ any hard gate fails:
 - missing or invalid rows increase above zero;
 - a runtime identity/leakage finding exists;
 - a confidence-only change alters any non-confidence byte;
-- a protected case is exposed without being tainted;
-- a newly regressed golden/adversarial case lacks an explicit human waiver;
+- any golden/adversarial regression count is nonzero;
 - deterministic output differs;
 - a gain exists only on tuning data or a single fold; or
 - an official Docker/runtime limit fails.
 
-Failures remain in the append-only ledger. They are never erased or silently
-promoted.
+For a new `PASSED` candidate, the candidate-state record also retains the
+experiment-plan, experiment-result, and protected-access record hashes, both
+ledger heads, the enforced milestone threshold, the complete normalized result,
+and every derived gate outcome. Existing historical candidate records remain
+readable; they are not rewritten by the strict cutover.
+
+Under the externally pinned checkpoint workflow, failures and consumed accesses
+cannot be erased by replacing a ledger with a valid older prefix. The supported
+APIs never silently promote a failed result.
 
 ## Verification
 
@@ -199,12 +278,13 @@ Run the focused contract suite:
 python3 -m unittest tests.test_experiment_control -v
 ```
 
-It covers hash tampering, partial and retained-prefix truncation, stale
+It covers hash tampering, partial and valid-prefix truncation across all four
+ledgers, externally pinned checkpoint digests, stale checkpoints,
 compare-and-swap writers, duplicate experiments, nested identity leakage,
-permanent taint, manifest mutation, deterministic group isolation, access
+permanent taint, manifest mutation, exact 3x5 group isolation, access
 retry/exhaustion, concurrent budget enforcement, source and artifact leakage,
-filename/digest maps, narrow allowlists, non-bypassable promotion, and
-candidate rollback.
+filename/digest maps, narrow allowlists, supported promotion authority, strict
+milestone sequencing, score non-regression, and candidate rollback.
 
 Run the current production leakage scan:
 

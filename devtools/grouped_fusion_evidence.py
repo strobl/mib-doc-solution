@@ -849,18 +849,18 @@ def render_aggregate_markdown(aggregate: Mapping[str, Any]) -> str:
             f"- Serialization defaults used as evidence: "
             f"{counts['serialization_default_used_as_evidence_count']}",
             "",
-            "## Concentration diagnostics (non-hard)",
+            "## Robustness checks",
             "",
             "| Diagnostic | Result |",
             "| --- | :---: |",
-            f"| `no_negative_folds` | "
-            f"{'PASS' if checks['no_negative_folds'] else 'WARN'} |",
+            f"| `no_negative_folds` (hard) | "
+            f"{'PASS' if checks['no_negative_folds'] else 'FAIL'} |",
             f"| `leave_best_fold_out_nonnegative` | "
             f"{'PASS' if checks['leave_best_fold_out_nonnegative'] else 'WARN'} |",
             f"| `fold_majority_positive` | "
             f"{'PASS' if checks['fold_majority_positive'] else 'WARN'} |",
-            f"| `leave_best_fold_out_positive` | "
-            f"{'PASS' if checks['leave_best_fold_out_positive'] else 'WARN'} |",
+            f"| `leave_best_fold_out_positive` (hard) | "
+            f"{'PASS' if checks['leave_best_fold_out_positive'] else 'FAIL'} |",
             "",
         ]
     )
@@ -870,9 +870,8 @@ def render_aggregate_markdown(aggregate: Mapping[str, Any]) -> str:
                 "> **Robustness warning:** the aggregate repeated-CV gain is "
                 "positive, but it is not uniform across layout folds and/or "
                 "becomes non-positive when the strongest fold is omitted. "
-                "This is disclosed as a non-hard diagnostic; the Work Order "
-                "requires positive repeated grouped-CV deltas and no safety "
-                "regression.",
+                "Negative folds or a non-positive leave-best-fold-out result "
+                "block adoption. Fold-majority remains a diagnostic.",
                 "",
             ]
         )

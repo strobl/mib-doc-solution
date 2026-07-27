@@ -2,9 +2,10 @@
 
 The gate consumes no case identifiers.  It compares a frozen legacy-fusion
 control with the candidate over the full public corpus and three deterministic
-repeats of five layout-group-exclusive folds.  Majority-positive folds and a
-strictly-positive leave-best-out result are reported as concentration
-diagnostics only; every other acceptance condition below is fail-closed.
+repeats of five layout-group-exclusive folds.  Every fold must be non-negative
+and every repeat must remain positive after its strongest fold is removed.
+Fold-majority remains a concentration diagnostic; every acceptance condition
+is fail-closed.
 """
 
 from __future__ import annotations
@@ -347,11 +348,13 @@ class GroupedFusionGateDecision:
             "expected_record_count": self.expected_record_count,
             "layout_group_count": self.expected_layout_group_count,
             "repeat_count": REQUIRED_REPEATS,
-            "fold_count": REQUIRED_REPEATS * REQUIRED_FOLDS,
+            "fold_count": REQUIRED_FOLDS,
+            "evaluated_fold_count": REQUIRED_REPEATS * REQUIRED_FOLDS,
             "full_control_score": self.legacy_control_full.total_score,
             "full_candidate_score": self.candidate_full.total_score,
             "score_delta": self.full_score_delta,
             "fold_deltas": [fold.score_delta for fold in self.folds],
+            "fold_weights": [fold.record_count for fold in self.folds],
             "repeat_scores": list(self.repeat_weighted_deltas),
             "deterministic": (
                 gates["run_deterministic"]
@@ -360,6 +363,8 @@ class GroupedFusionGateDecision:
             "fold_consistent": (
                 gates["repeat_weighted_deltas_positive"]
                 and gates["at_least_one_positive_fold_per_repeat"]
+                and gates["no_negative_folds"]
+                and gates["leave_best_fold_out_positive"]
             ),
             "catastrophic_false_approvals": (
                 self.candidate_full.catastrophic_false_approvals
@@ -523,6 +528,12 @@ class GroupedFusionGate:
             )
 
         audit = evidence.candidate_fusion_audit
+        no_negative_folds = all(
+            pair.score_delta_decimal >= 0 for pair in ordered
+        )
+        leave_best_fold_out_positive = all(
+            delta > 0 for delta in repeat_leave_best_out
+        )
         gates: Mapping[str, bool] = {
             "public_exposed_evidence": (
                 PUBLIC_EXPOSED_SCOPE_LABEL
@@ -545,6 +556,8 @@ class GroupedFusionGate:
             "at_least_one_positive_fold_per_repeat": all(
                 count >= 1 for count in repeat_positive_counts
             ),
+            "no_negative_folds": no_negative_folds,
+            "leave_best_fold_out_positive": leave_best_fold_out_positive,
             "candidate_complete": complete(evidence.candidate_full),
             "legacy_control_complete": complete(evidence.legacy_control_full),
             "no_increased_catastrophic_false_approvals": (
@@ -579,18 +592,14 @@ class GroupedFusionGate:
             ),
         }
         diagnostics: Mapping[str, bool] = {
-            "no_negative_folds": all(
-                pair.score_delta_decimal >= 0 for pair in ordered
-            ),
+            "no_negative_folds": no_negative_folds,
             "leave_best_fold_out_nonnegative": all(
                 delta >= 0 for delta in repeat_leave_best_out
             ),
             "fold_majority_positive": all(
                 count >= 3 for count in repeat_positive_counts
             ),
-            "leave_best_fold_out_positive": all(
-                delta > 0 for delta in repeat_leave_best_out
-            ),
+            "leave_best_fold_out_positive": leave_best_fold_out_positive,
         }
         concentration_warning = not all(diagnostics.values())
         blocking_reasons = tuple(
