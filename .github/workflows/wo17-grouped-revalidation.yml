@@ -1,0 +1,1656 @@
+name: WO17 grouped policy revalidation
+
+run-name: WO17 grouped revalidation @ ${{ github.sha }} attempt ${{ github.run_attempt }}
+
+on:
+  push:
+    branches:
+      - improve/score-148
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: wo17-grouped-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  DATA_ARCHIVE: mib-doc-challenge-public-data-v2026-07-07.zip
+  DATA_CACHE_KEY: mib-public-v2026-07-07-a9bb8c1bbf51346e
+  DATA_SHA256: a9bb8c1bbf51346ebf49c2e3e1acdb7a5d6cd0760162767b0d133c7b7200f3c4
+  DATA_URL: https://huggingface.co/datasets/arjun-krishna1/mib-doc-challenge-data/resolve/main/mib-doc-challenge-public-data-v2026-07-07.zip?download=true
+  EVALUATOR_SHA256: 20515df0d93d6ac73f1f989dd230e4bb1ff6e295e118302114ddd5b4b753c2cf
+  EXPECTED_RECORD_COUNT: "1000"
+  HYPOTHESIS_SHA256: 1c5d199d0919337b57f03ae817cd77cc9bdb9a94c36738017f887a4361e08d71
+  INPUT_TREE_SHA256: 21e821aa3089b841683375da59cf961e679e10f7009e5332ea9e8582f00f4c8e
+  LAYOUT_MANIFEST_SHA256: d7aac395c2d42dc42128ba3b4ce15fef6c42c37a6e247a066c267fba8a514b7c
+  PRIMARY_VARIABLE_SHA256: f92cba7c466118bd913e7865fc13d7e1e24ac701a503e5798caebd9547486f55
+  RUNTIME_CONTRACT_SHA256: 8fb622cfc9046a1cde3b2fcf499959a16a9f97e3dfffcdbf75137e5cdb6429b8
+  TRUTH_SHA256: 9c6210df4a600c9520435cf7d79d61d7113795dbf94b0e7ab3e39d237388bc8a
+  MIB_MAX_WORKERS: "4"
+  MKL_NUM_THREADS: "4"
+  NUMEXPR_NUM_THREADS: "4"
+  OMP_NUM_THREADS: "4"
+  OPENBLAS_NUM_THREADS: "4"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  control:
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'strobl/mib-doc-solution' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      github.ref == 'refs/heads/improve/score-148' &&
+      contains(github.event.head_commit.message, '[wo17-control]') &&
+      !contains(github.event.head_commit.message, '[wo17-candidate]')
+    runs-on: macos-14
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout exact control P with complete history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind direct A to P topology
+        id: topology
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          read -r commit parent extra < <(
+            git show -s --format='%H %P' "$GITHUB_SHA"
+          )
+          test "$commit" = "$GITHUB_SHA"
+          test -n "$parent"
+          test -z "${extra:-}"
+          git show -s --format=%B "$GITHUB_SHA" |
+            grep -F '[wo17-control]' >/dev/null
+          if git show -s --format=%B "$GITHUB_SHA" |
+            grep -F '[wo17-candidate]' >/dev/null; then
+            exit 1
+          fi
+
+          echo "base=$parent" >> "$GITHUB_OUTPUT"
+          echo "control=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Create isolated pinned Python runtime
+        run: |
+          runtime="$RUNNER_TEMP/wo17-venv"
+          python3 -m venv --copies "$runtime"
+          "$runtime/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            pip==24.0
+          "$runtime/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --no-deps \
+            certifi==2026.6.17 \
+            charset-normalizer==3.4.9 \
+            colorlog==6.11.0 \
+            flatbuffers==25.12.19 \
+            idna==3.18 \
+            numpy==2.2.6 \
+            omegaconf==2.0.0 \
+            onnxruntime==1.27.0 \
+            opencv-python-headless==5.0.0.93 \
+            packaging==26.2 \
+            Pillow==12.2.0 \
+            protobuf==7.35.1 \
+            pyclipper==1.4.0 \
+            pypdfium2==5.11.0 \
+            PyYAML==6.0.3 \
+            rapidocr==3.9.2 \
+            requests==2.34.2 \
+            Shapely==2.1.2 \
+            six==1.17.0 \
+            tqdm==4.69.0 \
+            typing_extensions==4.16.0 \
+            urllib3==2.7.0
+          test -x /usr/bin/sandbox-exec
+          command -v tesseract >/dev/null
+
+      - name: Fingerprint the exact control runtime
+        run: |
+          fingerprint_dir="$RUNNER_TEMP/wo17-environment"
+          mkdir -m 700 "$fingerprint_dir"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - \
+            "$fingerprint_dir/environment-fingerprint.json" <<'PY'
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import pathlib
+          import platform
+          import re
+          import shutil
+          import subprocess
+          import sys
+
+          sandbox_path = (
+              "/opt/homebrew/bin:/usr/local/bin:"
+              "/usr/bin:/bin:/usr/sbin:/sbin"
+          )
+
+          def command(*arguments):
+              completed = subprocess.run(
+                  arguments,
+                  check=True,
+                  capture_output=True,
+                  env={"LC_ALL": "C", "PATH": sandbox_path},
+                  text=True,
+              )
+              return completed.stdout.strip()
+
+          def file_sha256(path):
+              digest = hashlib.sha256()
+              with pathlib.Path(path).open("rb") as handle:
+                  for chunk in iter(
+                      lambda: handle.read(1024 * 1024), b""
+                  ):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          distributions = []
+          seen = set()
+          for distribution in importlib.metadata.distributions():
+              name = re.sub(
+                  r"[-_.]+",
+                  "-",
+                  distribution.metadata["Name"],
+              ).casefold()
+              if name in seen:
+                  raise SystemExit("duplicate installed distribution")
+              seen.add(name)
+              content = hashlib.sha256()
+              content_count = 0
+              content_bytes = 0
+              for entry in sorted(
+                  distribution.files or (), key=lambda value: str(value)
+              ):
+                  relative = pathlib.PurePosixPath(str(entry))
+                  if (
+                      ".." in relative.parts
+                      or "__pycache__" in relative.parts
+                      or relative.suffix == ".pyc"
+                      or relative.name in {"RECORD", "direct_url.json"}
+                  ):
+                      continue
+                  path = pathlib.Path(
+                      distribution.locate_file(entry)
+                  )
+                  if path.is_symlink() or not path.is_file():
+                      continue
+                  raw = path.read_bytes()
+                  label = relative.as_posix().encode("utf-8")
+                  content.update(len(label).to_bytes(4, "big"))
+                  content.update(label)
+                  content.update(len(raw).to_bytes(8, "big"))
+                  content.update(raw)
+                  content_count += 1
+                  content_bytes += len(raw)
+              distributions.append(
+                  {
+                      "content_bytes": content_bytes,
+                      "content_file_count": content_count,
+                      "content_sha256": content.hexdigest(),
+                      "name": name,
+                      "version": distribution.version,
+                  }
+              )
+          distributions.sort(key=lambda value: value["name"])
+
+          tesseract = shutil.which("tesseract", path=sandbox_path)
+          if tesseract is None:
+              raise SystemExit("trusted Tesseract is unavailable")
+          tesseract_path = pathlib.Path(tesseract)
+          resolved_tesseract = tesseract_path.resolve(strict=True)
+          version_lines = subprocess.run(
+              (str(tesseract_path), "--version"),
+              check=True,
+              capture_output=True,
+              env={"LC_ALL": "C", "PATH": sandbox_path},
+              text=True,
+          ).stdout.splitlines()
+          if not version_lines:
+              raise SystemExit("Tesseract version is unavailable")
+
+          executable = pathlib.Path(sys.executable).resolve(strict=True)
+          base_executable = pathlib.Path(
+              getattr(sys, "_base_executable", sys.executable)
+          ).resolve(strict=True)
+          fingerprint = {
+              "operating_system": {
+                  "architecture": platform.machine(),
+                  "build_version": command(
+                      "/usr/bin/sw_vers", "-buildVersion"
+                  ),
+                  "product_name": command(
+                      "/usr/bin/sw_vers", "-productName"
+                  ),
+                  "product_version": command(
+                      "/usr/bin/sw_vers", "-productVersion"
+                  ),
+              },
+              "python": {
+                  "base_executable_path": str(base_executable),
+                  "base_executable_sha256": file_sha256(
+                      base_executable
+                  ),
+                  "executable_name": executable.name,
+                  "executable_sha256": file_sha256(executable),
+                  "implementation": platform.python_implementation(),
+                  "version": sys.version,
+                  "version_info": list(sys.version_info[:5]),
+                  "virtual_environment": sys.prefix != sys.base_prefix,
+              },
+              "python_distributions": distributions,
+              "sandbox_path": sandbox_path,
+              "schema": "mib-wo17-environment-fingerprint/v1",
+              "tesseract": {
+                  "executable_path": str(tesseract_path),
+                  "executable_sha256": file_sha256(
+                      resolved_tesseract
+                  ),
+                  "resolved_executable_path": str(
+                      resolved_tesseract
+                  ),
+                  "version": version_lines[0].strip(),
+              },
+          }
+          raw = (
+              json.dumps(
+                  fingerprint,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              )
+              + "\n"
+          ).encode("utf-8")
+          output = pathlib.Path(sys.argv[1])
+          descriptor = os.open(
+              output,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL
+              | getattr(os, "O_NOFOLLOW", 0),
+              0o600,
+          )
+          with os.fdopen(descriptor, "wb") as handle:
+              handle.write(raw)
+          PY
+
+      - name: Reconstruct and verify the preregistered plan
+        id: plan
+        env:
+          BASE_SHA: ${{ steps.topology.outputs.base }}
+          CONTROL_SHA: ${{ steps.topology.outputs.control }}
+        run: |
+          plan_dir="$RUNNER_TEMP/wo17-plan"
+          mkdir -m 700 "$plan_dir"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - "$plan_dir" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          from devtools.experiment_control import (
+              CanonicalHashChainStore,
+              _normalize_experiment_plan,
+              canonical_json,
+          )
+
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          base = os.environ["BASE_SHA"]
+          control = os.environ["CONTROL_SHA"]
+          ledger_path = "evaluation/program/experiment_ledger.jsonl"
+          raw = subprocess.run(
+              ["/usr/bin/git", "cat-file", "blob", f"{control}:{ledger_path}"],
+              cwd=root,
+              check=True,
+              capture_output=True,
+          ).stdout
+          records = CanonicalHashChainStore._parse(raw.decode("utf-8"))
+          if not records:
+              raise SystemExit("experiment ledger is empty")
+          payload = records[-1]["payload"]
+          if (
+              set(payload) != {"event", "experiment_id", "plan"}
+              or payload["event"] != "experiment_plan"
+          ):
+              raise SystemExit("final experiment record is not a plan")
+          plan = _normalize_experiment_plan(payload["plan"])
+          expected = {
+              "changed_files": [
+                  "mib_pipeline/decision_recovery.py",
+                  "tests/test_decision_recovery.py",
+              ],
+              "evidence_label": "public_grouped_robustness_not_unseen",
+              "evaluator_sha256": os.environ["EVALUATOR_SHA256"],
+              "expected_record_count": 1000,
+              "hypothesis_sha256": os.environ["HYPOTHESIS_SHA256"],
+              "input_tree_sha256": os.environ["INPUT_TREE_SHA256"],
+              "parent_commit_sha": base,
+              "primary_variable_sha256": os.environ[
+                  "PRIMARY_VARIABLE_SHA256"
+              ],
+              "runtime_contract_sha256": os.environ[
+                  "RUNTIME_CONTRACT_SHA256"
+              ],
+              "split_manifest_sha256": os.environ[
+                  "LAYOUT_MANIFEST_SHA256"
+              ],
+              "truth_sha256": os.environ["TRUTH_SHA256"],
+          }
+          if plan != expected or payload["plan"] != plan:
+              raise SystemExit("experiment plan does not match WO-17")
+
+          changed = subprocess.run(
+              [
+                  "/usr/bin/git",
+                  "diff",
+                  "--name-only",
+                  "-z",
+                  "--no-renames",
+                  base,
+                  control,
+                  "--",
+              ],
+              cwd=root,
+              check=True,
+              capture_output=True,
+          ).stdout.decode("utf-8").split("\0")
+          changed = {value for value in changed if value}
+          pointer = json.loads(
+              subprocess.run(
+                  [
+                      "/usr/bin/git",
+                      "cat-file",
+                      "blob",
+                      f"{control}:evaluation/program/current_checkpoint.json",
+                  ],
+                  cwd=root,
+                  check=True,
+                  capture_output=True,
+              ).stdout
+          )
+          expected_governance = {
+              "evaluation/program/current_checkpoint.json",
+              "evaluation/program/experiment_ledger.jsonl",
+              pointer["checkpoint_path"],
+          }
+          if changed != expected_governance:
+              raise SystemExit("P is not the exact governance-only transition")
+
+          content = (canonical_json(plan) + "\n").encode("utf-8")
+          output = pathlib.Path(sys.argv[1]) / "experiment-plan.json"
+          output.write_bytes(content)
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as handle:
+              handle.write(
+                  "sha256=" + hashlib.sha256(content).hexdigest() + "\n"
+              )
+          PY
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Materialize exact plan-bound public inputs
+        env:
+          HYPOTHESIS_B64: V08tMTcgZ3VhcmRlZCBpbml0aWFsIGFwcHJvdmFsLXJlY292ZXJ5IGh5cG90aGVzaXMsIHZlcnNpb24gMQoKQWN0aXZhdGluZyBvbmx5IHRoZSBleGlzdGluZyBoYXJkZW5lZCBhcHByb3ZhbC1ydWxlIG1hdGNoZXIgZHVyaW5nIHRoZSBpbml0aWFsCnN5bnRoZXRpYyBhZGp1ZGljYXRpb24gc3RhZ2Ugd2lsbCByZWNvdmVyIGEgZGlzdHJpYnV0ZWQgc3Vic2V0IG9mIGNvcnJlY3QKQVBQUk9WRUQgZGVjaXNpb25zIHRoYXQgdGhlIGN1cnJlbnQgc291cmNlIGVtaXRzIGFzIE5FRURTX1JFVklFVy4KCkFjY2VwdGFuY2UgcmVxdWlyZXMgYWxsIG9mIHRoZSBmb2xsb3dpbmcgb24gdGhlIGZpeGVkIHB1YmxpYyAxLDAwMC1QREYsCjI0LWxheW91dC1ncm91cCwgcmVwZWF0ZWQgM3g1IHBvcHVsYXRpb246CgotIHRvdGFsIGFuZCBjbGFzc2lmaWNhdGlvbiBzY29yZSBpbXByb3ZlOwotIGV4dHJhY3Rpb24gc2NvcmUgYW5kIGV2ZXJ5IG5vbi1kZWNpc2lvbiBvdXRwdXQgcmVtYWluIHVuY2hhbmdlZDsKLSBldmVyeSBwYWlyZWQgZm9sZCBkZWx0YSBpcyBub24tbmVnYXRpdmU7Ci0gZXZlcnkgcmVwZWF0IGhhcyBhIHN0cmljdGx5IHBvc2l0aXZlIHJlY29yZC13ZWlnaHRlZCBkZWx0YTsKLSBldmVyeSByZXBlYXQgcmVtYWlucyBzdHJpY3RseSBwb3NpdGl2ZSBhZnRlciByZW1vdmluZyBhbnkgb25lIGZvbGQ7Ci0gbm8gdHJ1dGggdmFsdWUgb3RoZXIgdGhhbiBBUFBST1ZFRCBuZXdseSBiZWNvbWVzIEFQUFJPVkVEOwotIGNhdGFzdHJvcGhpYyBmYWxzZSBhcHByb3ZhbHMsIG1pc3NpbmcsIGludmFsaWQsIGR1cGxpY2F0ZSwgYW5kIGV4dHJhIHJlY29yZHMKICByZW1haW4gemVybzsKLSB0aGUgZXhhY3QgZ3VhcmRlZCBicmFuY2ggaXMgZXhlcmNpc2VkOwotIGV4cGxpY2l0IGRlbmlhbHMsIGF1dGhvcml0YXRpdmUgcmV2aWV3cywgbWFsZm9ybWVkIHR5cGVkIG91dGNvbWVzLCBtaXNzaW5nIG9yCiAgbm9uLXN1YnN0YW50aXZlIHZpc2libGUgZXZpZGVuY2UsIHdyb25nIGNhc2UvYXBwbGljYW50IHNjb3BlLCB0ZXh0LWxheWVyCiAgZXZpZGVuY2UsIHN1cGVyc2VkZWQgZXZpZGVuY2UsIHNlbnRpbmVscywgZGVmYXVsdHMsIGFuZCBwbGFjZWhvbGRlcnMgcmVtYWluCiAgZmFpbC1jbG9zZWQ7Ci0gbGF0ZS1ldmlkZW5jZSByZXZhbGlkYXRpb24ga2VlcHMgYXBwcm92YWwgcmVjb3ZlcnkgZGlzYWJsZWQuCgpUaGUgaHlwb3RoZXNpcyBpcyBwdWJsaWMgZ3JvdXBlZC1yb2J1c3RuZXNzIGV2aWRlbmNlIG9ubHkuIEl0IGlzIG5vdCBhIGNsYWltCmFib3V0IHByb3RlY3RlZCwgcHJpdmF0ZSwgcHJpc3RpbmUsIHVuc2Vlbiwgb2ZmaWNpYWwtdmFsaWRhdGlvbiwgbGVhZGVyYm9hcmQsCm9yIG9yZ2FuaXplci1oZWxkIGRhdGEuCg==
+          PRIMARY_VARIABLE_B64: V08tMTcgcHJpbWFyeSB2YXJpYWJsZSBzcGVjaWZpY2F0aW9uLCB2ZXJzaW9uIDEKClZhcmlhYmxlIG5hbWU6Cmd1YXJkZWRfaW5pdGlhbF9yZXZpZXdfdG9fYXBwcm92YWxfYWN0aXZhdGlvbgoKVGhlIGNhbmRpZGF0ZSBtYXkgY2hhbmdlIG9ubHkgdGhlIGluaXRpYWwgYmVoYXZpb3Igb2YKUmV2aWV3RGVuaWFsUmVjb3ZlcnlBZGp1ZGljYXRvci5fYXBwbHlfc3ludGhldGljX3J1bGVzIGFmdGVyIGRlbmlhbCBwcmVjZWRlbmNlCmhhcyBiZWVuIGV2YWx1YXRlZDoKCjEuIFdoZW4gYWxsb3dfYXBwcm92YWxfcmVjb3ZlcnkgaXMgZmFsc2UsIHJldHVybiB0aGUgYmFzZWxpbmUgTkVFRFNfUkVWSUVXCiAgIG91dGNvbWUgdW5jaGFuZ2VkLgoyLiBXaGVuIGFsbG93X2FwcHJvdmFsX3JlY292ZXJ5IGlzIHRydWUsIGFuIGF1dGhvcml0YXRpdmUtc291cmNlIHJldmlldyBtdXN0CiAgIHJlbWFpbiB1bmNoYW5nZWQuCjMuIE90aGVyd2lzZSBldmFsdWF0ZSB0aGUgYWxyZWFkeS1leGlzdGluZyBoYXJkZW5lZAogICBfbWF0Y2hpbmdfYXBwcm92YWxfcnVsZXMocmVzb2x2ZWRfY2FzZSwgYmFzZWxpbmUpIHByZWRpY2F0ZXMuCjQuIFdoZW4gbm8gYXBwcm92YWwgcnVsZSBtYXRjaGVzLCByZXR1cm4gdGhlIGJhc2VsaW5lIHVuY2hhbmdlZC4KNS4gV2hlbiBvbmUgb3IgbW9yZSBydWxlcyBtYXRjaCwgZW1pdCBBUFBST1ZFRCBhdCB0aGUgZXhpc3RpbmcKICAgUkVWSUVXX0FQUFJPVkFMX0NPTkZJREVOQ0UsIGNsZWFyIHJldmlldyByZWFzb25zLCByZXRhaW4gcHJpb3IgYXBwcm92YWwKICAgZmFjdHMsIGFkZCB0aGUgbWF0Y2hpbmcgZ3VhcmRlZCByZWNvdmVyeSBmYWN0cywgYW5kIGxlYXZlIGV2ZXJ5CiAgIG5vbi1hZGp1ZGljYXRpb24vbm9uLWNvbmZpZGVuY2Ugb3V0cHV0IHVuY2hhbmdlZC4KCkZyb3plbiBiZWhhdmlvciB0aGF0IG1heSBub3QgY2hhbmdlOgoKLSBfbWF0Y2hpbmdfYXBwcm92YWxfcnVsZXMgcHJlZGljYXRlcyBhbmQgdGhyZXNob2xkczsKLSBfbWF0Y2hpbmdfcnVsZXMgZGVuaWFsIGJlaGF2aW9yIGFuZCBkZW5pYWwgcHJlY2VkZW5jZTsKLSBhbGwgUmFwaWQgcmVjb3ZlcnkgaGVhZHM7Ci0gcmV2YWxpZGF0ZV9hZnRlcl9yZWNvdmVyeSguLi4gYWxsb3dfYXBwcm92YWxfcmVjb3Zlcnk9RmFsc2UpOwotIGNvbmZpZGVuY2UgY29uc3RhbnRzOwotIGV2aWRlbmNlIHJlc29sdXRpb24sIGV4dHJhY3Rpb24sIGxpbmtpbmcsIGFuZCBzZXJpYWxpemF0aW9uOwotIGF1dGhvcml0YXRpdmUgZGVjaXNpb25zOwotIHJ1bnRpbWUgYXJ0aWZhY3RzIGFuZCBtb2RlbCBmaWxlcy4KClRoZSBwbGFubmVkIHJlcG9zaXRvcnkgZGlmZiBtYXkgaW5jbHVkZSBvbmx5Cm1pYl9waXBlbGluZS9kZWNpc2lvbl9yZWNvdmVyeS5weSBhbmQgaXRzIGNvbXBhbmlvbiBiZWhhdmlvciB0ZXN0cyBpbgp0ZXN0cy90ZXN0X2RlY2lzaW9uX3JlY292ZXJ5LnB5LiBPbmx5IHRoZSBwcm9kdWN0aW9uIGZpbGUgbWF5IGFmZmVjdCBydW50aW1lCm91dHB1dHMuCg==
+          RUNTIME_CONTRACT_B64: eyJjYXB0dXJlIjp7ImFybV9yZXBlYXRfY291bnQiOjIsImV4ZWN1dGlvbiI6InNlcXVlbnRpYWwiLCJtYXhfd29ya2VycyI6NCwibWV0cmljc19zb3VyY2UiOiJmcmVzaF9wcm9jZXNzX3J1c2FnZV9zZWxmX3BsdXNfd2FpdGVkX2NoaWxkcmVuX2FuZF9tb25vdG9uaWNfd2FsbCIsInJlcXVpcmVkX2J5dGVfZGV0ZXJtaW5pc20iOnRydWV9LCJjb250YWluZXJfbGltaXRzIjp7ImltYWdlX2J5dGVzIjo0Mjk0OTY3Mjk2LCJtYXhfbW9kZWxfYXJ0aWZhY3RfYnl0ZXMiOjI2MjE0NDAwMCwibW9kZWxfYnl0ZXMiOjEwNzM3NDE4MjQsIm5ldHdvcmsiOiJub25lIiwib3V0cHV0X2J5dGVzIjoyNjIxNDQwMCwicGVha19tZW1vcnlfYnl0ZXMiOjg1ODk5MzQ1OTIsInBlcl9yZWNvcmRfcnVudGltZV9zZWNvbmRzIjo2LCJydW50aW1lX3NlY29uZHMiOjMwMDAwLCJ0bXBfYnl0ZXMiOjIxNDc0ODM2NDh9LCJlbnZpcm9ubWVudCI6eyJNSUJfTUFYX1dPUktFUlMiOiI0IiwiTUtMX05VTV9USFJFQURTIjoiNCIsIk5VTUVYUFJfTlVNX1RIUkVBRFMiOiI0IiwiT01QX05VTV9USFJFQURTIjoiNCIsIk9QRU5CTEFTX05VTV9USFJFQURTIjoiNCJ9LCJldmFsdWF0aW9uIjp7ImV2YWx1YXRvcl9zaGEyNTYiOiIyMDUxNWRmMGQ5M2Q2YWM3M2YxZjk4OWRkMjMwZTRiYjFmZjZlMjk1ZTExODMwMjExNGRkZDViNGI3NTNjMmNmIiwiZXZpZGVuY2VfbGFiZWwiOiJwdWJsaWNfZ3JvdXBlZF9yb2J1c3RuZXNzX25vdF91bnNlZW4iLCJleHBlY3RlZF9yZWNvcmRfY291bnQiOjEwMDAsImlucHV0X3RyZWVfc2hhMjU2IjoiMjFlODIxYWEzMDg5Yjg0MTY4MzM3NWRhNTljZjk2MWU2NzllMTBmNzAwOWU1MzMyZWE5ZTg1ODJmMDBmNGM4ZSIsImxheW91dF9tYW5pZmVzdF9zaGEyNTYiOiJkN2FhYzM5NWMyZDQyZGM0MjEyOGJhM2I0Y2UxNWZlZjZjNDJjMzdhNmUyNDdhMDY2YzI2N2ZiYThhNTE0YjdjIiwidHJ1dGhfc2hhMjU2IjoiOWM2MjEwZGY0YTYwMGM5NTIwNDM1Y2Y3ZDc5ZDYxZDcxMTM3OTVkYmY5NGIwZTdhYjNlMzlkMjM3Mzg4YmM4YSJ9LCJpbnRlcmZhY2UiOnsiZW50cnlwb2ludCI6InNvbHV0aW9uLnB5IiwiaW5wdXQiOiJkaXJlY3RvcnkgY29udGFpbmluZyBjYW5vbmljYWwgUERGIGNhc2VzIiwib3V0cHV0IjoiY2Fub25pY2FsIHR3ZWx2ZS1maWVsZCBKU09OTCIsInJ1bm5lciI6InJ1bi5zaCJ9LCJzY2hlbWFfdmVyc2lvbiI6Im1pYi13bzE3LXJ1bnRpbWUtY29udHJhY3QvdjEifQo=
+        run: |
+          material="$RUNNER_TEMP/wo17-material"
+          mkdir -m 700 "$material"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - "$material" <<'PY'
+          import base64
+          import hashlib
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          values = (
+              (
+                  "hypothesis.txt",
+                  "HYPOTHESIS_B64",
+                  "HYPOTHESIS_SHA256",
+              ),
+              (
+                  "primary-variable.txt",
+                  "PRIMARY_VARIABLE_B64",
+                  "PRIMARY_VARIABLE_SHA256",
+              ),
+              (
+                  "runtime-contract.json",
+                  "RUNTIME_CONTRACT_B64",
+                  "RUNTIME_CONTRACT_SHA256",
+              ),
+          )
+          for filename, encoded_name, digest_name in values:
+              raw = base64.b64decode(
+                  os.environ[encoded_name], validate=True
+              )
+              if hashlib.sha256(raw).hexdigest() != os.environ[digest_name]:
+                  raise SystemExit(f"{filename} digest mismatch")
+              path = root / filename
+              descriptor = os.open(
+                  path,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                  | getattr(os, "O_NOFOLLOW", 0),
+                  0o600,
+              )
+              with os.fdopen(descriptor, "wb") as handle:
+                  handle.write(raw)
+          PY
+
+      - name: Restore immutable public dataset cache
+        id: dataset-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
+
+      - name: Download and verify immutable public dataset
+        run: |
+          archive="$RUNNER_TEMP/$DATA_ARCHIVE"
+          if [[ ! -e "$archive" ]]; then
+            curl \
+              --fail \
+              --location \
+              --proto '=https' \
+              --retry 5 \
+              --retry-all-errors \
+              --retry-delay 5 \
+              --show-error \
+              --silent \
+              --tlsv1.2 \
+              "$DATA_URL" \
+              --output "$archive"
+          fi
+          test "$(shasum -a 256 "$archive" | awk '{print $1}')" = \
+            "$DATA_SHA256"
+
+      - name: Save verified immutable public dataset cache
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
+
+      - name: Extract exact public evaluation population
+        run: |
+          population="$RUNNER_TEMP/wo17-population"
+          mkdir -m 700 "$population"
+          mkdir -m 700 "$population/input"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - \
+            "$RUNNER_TEMP/$DATA_ARCHIVE" \
+            "$population" <<'PY'
+          import os
+          import pathlib
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          archive = pathlib.Path(sys.argv[1])
+          target = pathlib.Path(sys.argv[2])
+          pattern = re.compile(r"data/train/(MIB-[0-9]{6})[.]pdf")
+          with zipfile.ZipFile(archive) as bundle:
+              infos = bundle.infolist()
+              names = [item.filename for item in infos]
+              if len(names) != len(set(names)):
+                  raise SystemExit("dataset archive contains duplicate names")
+              pdfs = [
+                  (item, pattern.fullmatch(item.filename))
+                  for item in infos
+                  if pattern.fullmatch(item.filename)
+              ]
+              labels = [
+                  item
+                  for item in infos
+                  if item.filename == "data/train_labels.csv"
+              ]
+              if len(pdfs) != 1000 or len(labels) != 1:
+                  raise SystemExit("dataset archive population is inexact")
+              selected = [(item, match.group(1) + ".pdf") for item, match in pdfs]
+              selected.append((labels[0], "train_labels.csv"))
+              for info, output_name in selected:
+                  mode = info.external_attr >> 16
+                  if (
+                      info.flag_bits & 1
+                      or info.is_dir()
+                      or stat.S_ISLNK(mode)
+                      or info.file_size > 64 * 1024 * 1024
+                  ):
+                      raise SystemExit("dataset archive entry is unsafe")
+                  parent = (
+                      target / "input"
+                      if output_name.endswith(".pdf")
+                      else target
+                  )
+                  output = parent / output_name
+                  descriptor = os.open(
+                      output,
+                      os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | getattr(os, "O_NOFOLLOW", 0),
+                      0o400,
+                  )
+                  with bundle.open(info) as source, os.fdopen(
+                      descriptor, "wb"
+                  ) as sink:
+                      while True:
+                          chunk = source.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          sink.write(chunk)
+          PY
+          rm "$RUNNER_TEMP/$DATA_ARCHIVE"
+          test ! -e "$RUNNER_TEMP/$DATA_ARCHIVE"
+
+      - name: Rebuild and bind label-blind layout manifest
+        run: |
+          "$RUNNER_TEMP/wo17-venv/bin/python" \
+            devtools/layout_manifest_freezer.py \
+            --pdf-dir "$RUNNER_TEMP/wo17-population/input" \
+            --output "$RUNNER_TEMP/wo17-material/layout-manifest.json" \
+            --expected-count 1000 \
+            --split-seed wo12-full-public-layout-v2-20260727
+          test "$(
+            shasum -a 256 \
+              "$RUNNER_TEMP/wo17-material/layout-manifest.json" |
+              awk '{print $1}'
+          )" = "$LAYOUT_MANIFEST_SHA256"
+
+      - name: Capture truth-blind control P twice
+        env:
+          CONTROL_SHA: ${{ steps.topology.outputs.control }}
+        run: |
+          output="$RUNNER_TEMP/wo17-control-output"
+          mkdir -m 700 "$output"
+          "$RUNNER_TEMP/wo17-venv/bin/python" \
+            devtools/policy_grouped_capture.py \
+            --arm baseline \
+            --source-revision-sha "$CONTROL_SHA" \
+            --input-dir "$RUNNER_TEMP/wo17-population/input" \
+            --layout-manifest \
+              "$RUNNER_TEMP/wo17-material/layout-manifest.json" \
+            --expected-layout-manifest-sha256 \
+              "$LAYOUT_MANIFEST_SHA256" \
+            --expected-input-tree-sha256 "$INPUT_TREE_SHA256" \
+            --denied-sensitive-path \
+              "$RUNNER_TEMP/wo17-population/train_labels.csv" \
+            --first-predictions \
+              "$output/control-prediction-1.jsonl" \
+            --second-predictions \
+              "$output/control-prediction-2.jsonl" \
+            --first-audit "$output/control-audit-1.json" \
+            --second-audit "$output/control-audit-2.json" \
+            --observation "$output/control-observation.json" \
+            --max-workers 4
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Stage exact short-retention control artifact
+        run: |
+          stage="$RUNNER_TEMP/wo17-control-artifact"
+          mkdir -m 700 "$stage"
+          cp "$RUNNER_TEMP/wo17-control-output/control-prediction-1.jsonl" \
+            "$stage/control-prediction-1.jsonl"
+          cp "$RUNNER_TEMP/wo17-control-output/control-prediction-2.jsonl" \
+            "$stage/control-prediction-2.jsonl"
+          cp "$RUNNER_TEMP/wo17-control-output/control-audit-1.json" \
+            "$stage/control-audit-1.json"
+          cp "$RUNNER_TEMP/wo17-control-output/control-audit-2.json" \
+            "$stage/control-audit-2.json"
+          cp "$RUNNER_TEMP/wo17-control-output/control-observation.json" \
+            "$stage/control-observation.json"
+          cp "$RUNNER_TEMP/wo17-material/layout-manifest.json" \
+            "$stage/layout-manifest.json"
+          cp "$RUNNER_TEMP/wo17-material/runtime-contract.json" \
+            "$stage/runtime-contract.json"
+          cp "$RUNNER_TEMP/wo17-material/hypothesis.txt" \
+            "$stage/hypothesis.txt"
+          cp "$RUNNER_TEMP/wo17-material/primary-variable.txt" \
+            "$stage/primary-variable.txt"
+          cp \
+            "$RUNNER_TEMP/wo17-environment/environment-fingerprint.json" \
+            "$stage/environment-fingerprint.json"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - "$stage" <<'PY'
+          import pathlib
+          import sys
+
+          expected = {
+              "control-audit-1.json",
+              "control-audit-2.json",
+              "control-observation.json",
+              "control-prediction-1.jsonl",
+              "control-prediction-2.jsonl",
+              "environment-fingerprint.json",
+              "hypothesis.txt",
+              "layout-manifest.json",
+              "primary-variable.txt",
+              "runtime-contract.json",
+          }
+          root = pathlib.Path(sys.argv[1])
+          observed = {path.name for path in root.iterdir() if path.is_file()}
+          if observed != expected or len(tuple(root.iterdir())) != len(expected):
+              raise SystemExit("control artifact staging set is inexact")
+          PY
+
+      - name: Upload run-attempt-bound control P artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wo17-control-${{ steps.topology.outputs.control }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/wo17-control-artifact/control-audit-1.json
+            ${{ runner.temp }}/wo17-control-artifact/control-audit-2.json
+            ${{ runner.temp }}/wo17-control-artifact/control-observation.json
+            ${{ runner.temp }}/wo17-control-artifact/control-prediction-1.jsonl
+            ${{ runner.temp }}/wo17-control-artifact/control-prediction-2.jsonl
+            ${{ runner.temp }}/wo17-control-artifact/environment-fingerprint.json
+            ${{ runner.temp }}/wo17-control-artifact/hypothesis.txt
+            ${{ runner.temp }}/wo17-control-artifact/layout-manifest.json
+            ${{ runner.temp }}/wo17-control-artifact/primary-variable.txt
+            ${{ runner.temp }}/wo17-control-artifact/runtime-contract.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+          include-hidden-files: false
+
+  candidate:
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'strobl/mib-doc-solution' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      github.ref == 'refs/heads/improve/score-148' &&
+      contains(github.event.head_commit.message, '[wo17-candidate]') &&
+      !contains(github.event.head_commit.message, '[wo17-control]')
+    runs-on: macos-14
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout exact candidate C with complete history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind exact A to P to C topology and markers
+        id: topology
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          read -r candidate control candidate_extra < <(
+            git show -s --format='%H %P' "$GITHUB_SHA"
+          )
+          test "$candidate" = "$GITHUB_SHA"
+          test -n "$control"
+          test -z "${candidate_extra:-}"
+          read -r parent base control_extra < <(
+            git show -s --format='%H %P' "$control"
+          )
+          test "$parent" = "$control"
+          test -n "$base"
+          test -z "${control_extra:-}"
+          git show -s --format=%B "$candidate" |
+            grep -F '[wo17-candidate]' >/dev/null
+          git show -s --format=%B "$control" |
+            grep -F '[wo17-control]' >/dev/null
+          if git show -s --format=%B "$candidate" |
+            grep -F '[wo17-control]' >/dev/null; then
+            exit 1
+          fi
+          if git show -s --format=%B "$control" |
+            grep -F '[wo17-candidate]' >/dev/null; then
+            exit 1
+          fi
+
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "control=$control" >> "$GITHUB_OUTPUT"
+          echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
+
+      - name: Prove immutable truth-adjacent control blobs
+        env:
+          CONTROL_SHA: ${{ steps.topology.outputs.control }}
+          CANDIDATE_SHA: ${{ steps.topology.outputs.candidate }}
+        run: |
+          git_clean() {
+            /usr/bin/env -i \
+              LC_ALL=C \
+              PATH=/usr/bin:/bin \
+              GIT_NO_REPLACE_OBJECTS=1 \
+              /usr/bin/git --no-replace-objects \
+              -C "$GITHUB_WORKSPACE" "$@"
+          }
+
+          test "$(git_clean rev-parse --verify "HEAD^{commit}")" = \
+            "$CANDIDATE_SHA"
+          test -z "$(git_clean status --porcelain=v1 --untracked-files=all)"
+          read -r candidate control candidate_extra < <(
+            git_clean show -s --format='%H %P' "$CANDIDATE_SHA"
+          )
+          test "$candidate" = "$CANDIDATE_SHA"
+          test "$control" = "$CONTROL_SHA"
+          test -z "${candidate_extra:-}"
+
+          control_paths=(
+            "devtools/__init__.py"
+            "devtools/evaluation.py"
+            "devtools/experiment_control.py"
+            "devtools/grouped_policy_revalidation_evidence.py"
+            "devtools/grouped_policy_revalidation_gate.py"
+            "devtools/grouped_split_evidence.py"
+            "devtools/layout_manifest_freezer.py"
+            "devtools/policy_grouped_capture.py"
+            "devtools/policy_grouped_capture_contract.py"
+            "devtools/policy_revalidation_audit_contract.py"
+            "devtools/policy_revalidation_contract_probe.py"
+            "devtools/wo18_production_capture.py"
+            "scripts/evaluate.py"
+          )
+          for path in "${control_paths[@]}"; do
+            control_entry="$(git_clean ls-tree "$CONTROL_SHA" -- "$path")"
+            candidate_entry="$(
+              git_clean ls-tree "$CANDIDATE_SHA" -- "$path"
+            )"
+            test -n "$control_entry"
+            test "$candidate_entry" = "$control_entry"
+            test "$(git_clean cat-file -t "$CONTROL_SHA:$path")" = "blob"
+            test "$(git_clean cat-file -t "$CANDIDATE_SHA:$path")" = "blob"
+            /usr/bin/cmp -s \
+              <(git_clean cat-file blob "$CONTROL_SHA:$path") \
+              <(git_clean cat-file blob "$CANDIDATE_SHA:$path")
+          done
+
+      - name: Create isolated pinned Python runtime
+        run: |
+          runtime="$RUNNER_TEMP/wo17-venv"
+          python3 -m venv --copies "$runtime"
+          "$runtime/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            pip==24.0
+          "$runtime/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --no-deps \
+            certifi==2026.6.17 \
+            charset-normalizer==3.4.9 \
+            colorlog==6.11.0 \
+            flatbuffers==25.12.19 \
+            idna==3.18 \
+            numpy==2.2.6 \
+            omegaconf==2.0.0 \
+            onnxruntime==1.27.0 \
+            opencv-python-headless==5.0.0.93 \
+            packaging==26.2 \
+            Pillow==12.2.0 \
+            protobuf==7.35.1 \
+            pyclipper==1.4.0 \
+            pypdfium2==5.11.0 \
+            PyYAML==6.0.3 \
+            rapidocr==3.9.2 \
+            requests==2.34.2 \
+            Shapely==2.1.2 \
+            six==1.17.0 \
+            tqdm==4.69.0 \
+            typing_extensions==4.16.0 \
+            urllib3==2.7.0
+          test -x /usr/bin/sandbox-exec
+          command -v tesseract >/dev/null
+
+      - name: Fingerprint the exact candidate runtime
+        run: |
+          fingerprint_dir="$RUNNER_TEMP/wo17-environment"
+          mkdir -m 700 "$fingerprint_dir"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - \
+            "$fingerprint_dir/environment-fingerprint.json" <<'PY'
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import pathlib
+          import platform
+          import re
+          import shutil
+          import subprocess
+          import sys
+
+          sandbox_path = (
+              "/opt/homebrew/bin:/usr/local/bin:"
+              "/usr/bin:/bin:/usr/sbin:/sbin"
+          )
+
+          def command(*arguments):
+              completed = subprocess.run(
+                  arguments,
+                  check=True,
+                  capture_output=True,
+                  env={"LC_ALL": "C", "PATH": sandbox_path},
+                  text=True,
+              )
+              return completed.stdout.strip()
+
+          def file_sha256(path):
+              digest = hashlib.sha256()
+              with pathlib.Path(path).open("rb") as handle:
+                  for chunk in iter(
+                      lambda: handle.read(1024 * 1024), b""
+                  ):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          distributions = []
+          seen = set()
+          for distribution in importlib.metadata.distributions():
+              name = re.sub(
+                  r"[-_.]+",
+                  "-",
+                  distribution.metadata["Name"],
+              ).casefold()
+              if name in seen:
+                  raise SystemExit("duplicate installed distribution")
+              seen.add(name)
+              content = hashlib.sha256()
+              content_count = 0
+              content_bytes = 0
+              for entry in sorted(
+                  distribution.files or (), key=lambda value: str(value)
+              ):
+                  relative = pathlib.PurePosixPath(str(entry))
+                  if (
+                      ".." in relative.parts
+                      or "__pycache__" in relative.parts
+                      or relative.suffix == ".pyc"
+                      or relative.name in {"RECORD", "direct_url.json"}
+                  ):
+                      continue
+                  path = pathlib.Path(
+                      distribution.locate_file(entry)
+                  )
+                  if path.is_symlink() or not path.is_file():
+                      continue
+                  raw = path.read_bytes()
+                  label = relative.as_posix().encode("utf-8")
+                  content.update(len(label).to_bytes(4, "big"))
+                  content.update(label)
+                  content.update(len(raw).to_bytes(8, "big"))
+                  content.update(raw)
+                  content_count += 1
+                  content_bytes += len(raw)
+              distributions.append(
+                  {
+                      "content_bytes": content_bytes,
+                      "content_file_count": content_count,
+                      "content_sha256": content.hexdigest(),
+                      "name": name,
+                      "version": distribution.version,
+                  }
+              )
+          distributions.sort(key=lambda value: value["name"])
+
+          tesseract = shutil.which("tesseract", path=sandbox_path)
+          if tesseract is None:
+              raise SystemExit("trusted Tesseract is unavailable")
+          tesseract_path = pathlib.Path(tesseract)
+          resolved_tesseract = tesseract_path.resolve(strict=True)
+          version_lines = subprocess.run(
+              (str(tesseract_path), "--version"),
+              check=True,
+              capture_output=True,
+              env={"LC_ALL": "C", "PATH": sandbox_path},
+              text=True,
+          ).stdout.splitlines()
+          if not version_lines:
+              raise SystemExit("Tesseract version is unavailable")
+
+          executable = pathlib.Path(sys.executable).resolve(strict=True)
+          base_executable = pathlib.Path(
+              getattr(sys, "_base_executable", sys.executable)
+          ).resolve(strict=True)
+          fingerprint = {
+              "operating_system": {
+                  "architecture": platform.machine(),
+                  "build_version": command(
+                      "/usr/bin/sw_vers", "-buildVersion"
+                  ),
+                  "product_name": command(
+                      "/usr/bin/sw_vers", "-productName"
+                  ),
+                  "product_version": command(
+                      "/usr/bin/sw_vers", "-productVersion"
+                  ),
+              },
+              "python": {
+                  "base_executable_path": str(base_executable),
+                  "base_executable_sha256": file_sha256(
+                      base_executable
+                  ),
+                  "executable_name": executable.name,
+                  "executable_sha256": file_sha256(executable),
+                  "implementation": platform.python_implementation(),
+                  "version": sys.version,
+                  "version_info": list(sys.version_info[:5]),
+                  "virtual_environment": sys.prefix != sys.base_prefix,
+              },
+              "python_distributions": distributions,
+              "sandbox_path": sandbox_path,
+              "schema": "mib-wo17-environment-fingerprint/v1",
+              "tesseract": {
+                  "executable_path": str(tesseract_path),
+                  "executable_sha256": file_sha256(
+                      resolved_tesseract
+                  ),
+                  "resolved_executable_path": str(
+                      resolved_tesseract
+                  ),
+                  "version": version_lines[0].strip(),
+              },
+          }
+          raw = (
+              json.dumps(
+                  fingerprint,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              )
+              + "\n"
+          ).encode("utf-8")
+          output = pathlib.Path(sys.argv[1])
+          descriptor = os.open(
+              output,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL
+              | getattr(os, "O_NOFOLLOW", 0),
+              0o600,
+          )
+          with os.fdopen(descriptor, "wb") as handle:
+              handle.write(raw)
+          PY
+
+      - name: Reconstruct plan and prove full governed topology
+        id: plan
+        env:
+          BASE_SHA: ${{ steps.topology.outputs.base }}
+          CONTROL_SHA: ${{ steps.topology.outputs.control }}
+          CANDIDATE_SHA: ${{ steps.topology.outputs.candidate }}
+        run: |
+          plan_dir="$RUNNER_TEMP/wo17-plan"
+          mkdir -m 700 "$plan_dir"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - "$plan_dir" <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          from devtools.experiment_control import (
+              CanonicalHashChainStore,
+              _normalize_experiment_plan,
+              canonical_json,
+          )
+          from devtools.grouped_policy_revalidation_evidence import (
+              verify_governed_experiment_topology,
+          )
+
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          base = os.environ["BASE_SHA"]
+          control = os.environ["CONTROL_SHA"]
+          candidate = os.environ["CANDIDATE_SHA"]
+          ledger_path = "evaluation/program/experiment_ledger.jsonl"
+          raw = subprocess.run(
+              ["/usr/bin/git", "cat-file", "blob", f"{control}:{ledger_path}"],
+              cwd=root,
+              check=True,
+              capture_output=True,
+          ).stdout
+          records = CanonicalHashChainStore._parse(raw.decode("utf-8"))
+          if not records:
+              raise SystemExit("experiment ledger is empty")
+          payload = records[-1]["payload"]
+          if (
+              set(payload) != {"event", "experiment_id", "plan"}
+              or payload["event"] != "experiment_plan"
+          ):
+              raise SystemExit("final experiment record is not a plan")
+          plan = _normalize_experiment_plan(payload["plan"])
+          expected = {
+              "changed_files": [
+                  "mib_pipeline/decision_recovery.py",
+                  "tests/test_decision_recovery.py",
+              ],
+              "evidence_label": "public_grouped_robustness_not_unseen",
+              "evaluator_sha256": os.environ["EVALUATOR_SHA256"],
+              "expected_record_count": 1000,
+              "hypothesis_sha256": os.environ["HYPOTHESIS_SHA256"],
+              "input_tree_sha256": os.environ["INPUT_TREE_SHA256"],
+              "parent_commit_sha": base,
+              "primary_variable_sha256": os.environ[
+                  "PRIMARY_VARIABLE_SHA256"
+              ],
+              "runtime_contract_sha256": os.environ[
+                  "RUNTIME_CONTRACT_SHA256"
+              ],
+              "split_manifest_sha256": os.environ[
+                  "LAYOUT_MANIFEST_SHA256"
+              ],
+              "truth_sha256": os.environ["TRUTH_SHA256"],
+          }
+          if plan != expected or payload["plan"] != plan:
+              raise SystemExit("experiment plan does not match WO-17")
+          content = (canonical_json(plan) + "\n").encode("utf-8")
+          plan_sha = hashlib.sha256(content).hexdigest()
+          verify_governed_experiment_topology(
+              root,
+              plan=plan,
+              experiment_plan_sha256=plan_sha,
+              control_revision_sha=control,
+              candidate_revision_sha=candidate,
+          )
+          output = pathlib.Path(sys.argv[1]) / "experiment-plan.json"
+          output.write_bytes(content)
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as handle:
+              handle.write("sha256=" + plan_sha + "\n")
+          PY
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Discover and download only the authenticated P artifact
+        env:
+          CONTROL_SHA: ${{ steps.topology.outputs.control }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          target="$RUNNER_TEMP/wo17-control-download"
+          mkdir -m 700 "$target"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - "$target" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import stat
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          api = os.environ["GITHUB_API_URL"].rstrip("/")
+          repository = os.environ["GITHUB_REPOSITORY"]
+          owner = os.environ["GITHUB_REPOSITORY_OWNER"]
+          control = os.environ["CONTROL_SHA"]
+          token = os.environ["GITHUB_TOKEN"]
+          target = pathlib.Path(sys.argv[1])
+          workflow_path = ".github/workflows/wo17-grouped-revalidation.yml"
+          expected_files = {
+              "control-audit-1.json",
+              "control-audit-2.json",
+              "control-observation.json",
+              "control-prediction-1.jsonl",
+              "control-prediction-2.jsonl",
+              "environment-fingerprint.json",
+              "hypothesis.txt",
+              "layout-manifest.json",
+              "primary-variable.txt",
+              "runtime-contract.json",
+          }
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": "Bearer " + token,
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def api_json(path):
+              request = urllib.request.Request(api + path, headers=headers)
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  raw = response.read(16 * 1024 * 1024 + 1)
+              if len(raw) > 16 * 1024 * 1024:
+                  raise SystemExit("GitHub metadata response is oversized")
+              return json.loads(raw)
+
+          workflow = api_json(
+              f"/repos/{repository}/actions/workflows/"
+              "wo17-grouped-revalidation.yml"
+          )
+          if (
+              workflow.get("path") != workflow_path
+              or workflow.get("name")
+              != "WO17 grouped policy revalidation"
+              or workflow.get("state") != "active"
+              or type(workflow.get("id")) is not int
+          ):
+              raise SystemExit("workflow identity is not exact")
+          workflow_id = workflow["id"]
+          query = urllib.parse.urlencode(
+              {
+                  "branch": "improve/score-148",
+                  "event": "push",
+                  "head_sha": control,
+                  "per_page": 100,
+                  "status": "completed",
+              }
+          )
+          run_list = api_json(
+              f"/repos/{repository}/actions/workflows/{workflow_id}/runs?"
+              + query
+          )
+          runs = run_list.get("workflow_runs")
+          if run_list.get("total_count") != 1 or not isinstance(runs, list):
+              raise SystemExit("control workflow run is not unique")
+          if len(runs) != 1:
+              raise SystemExit("control workflow run page is inexact")
+          run = runs[0]
+
+          def run_binding(value):
+              return {
+                  "actor": (value.get("actor") or {}).get("login"),
+                  "conclusion": value.get("conclusion"),
+                  "event": value.get("event"),
+                  "head_branch": value.get("head_branch"),
+                  "head_commit_message": (
+                      value.get("head_commit") or {}
+                  ).get("message"),
+                  "head_repository": (
+                      value.get("head_repository") or {}
+                  ).get("full_name"),
+                  "head_sha": value.get("head_sha"),
+                  "id": value.get("id"),
+                  "path": value.get("path"),
+                  "repository": (
+                      value.get("repository") or {}
+                  ).get("full_name"),
+                  "run_attempt": value.get("run_attempt"),
+                  "status": value.get("status"),
+                  "triggering_actor": (
+                      value.get("triggering_actor") or {}
+                  ).get("login"),
+                  "workflow_id": value.get("workflow_id"),
+                  "workflow_url": value.get("workflow_url"),
+              }
+
+          bound_run = run_binding(run)
+          if (
+              bound_run["actor"] != owner
+              or bound_run["conclusion"] != "success"
+              or bound_run["event"] != "push"
+              or bound_run["head_branch"] != "improve/score-148"
+              or "[wo17-control]"
+              not in str(bound_run["head_commit_message"])
+              or "[wo17-candidate]"
+              in str(bound_run["head_commit_message"])
+              or bound_run["head_repository"] != repository
+              or bound_run["head_sha"] != control
+              or type(bound_run["id"]) is not int
+              or bound_run["path"]
+              not in {
+                  workflow_path,
+                  workflow_path + "@improve/score-148",
+              }
+              or bound_run["repository"] != repository
+              or type(bound_run["run_attempt"]) is not int
+              or bound_run["run_attempt"] < 1
+              or bound_run["status"] != "completed"
+              or bound_run["triggering_actor"] != owner
+              or bound_run["workflow_id"] != workflow_id
+              or bound_run["workflow_url"]
+              != (
+                  f"{api}/repos/{repository}/actions/workflows/"
+                  f"{workflow_id}"
+              )
+          ):
+              raise SystemExit("control workflow run binding failed")
+          run_id = bound_run["id"]
+          refetched_run = api_json(
+              f"/repos/{repository}/actions/runs/{run_id}"
+          )
+          if run_binding(refetched_run) != bound_run:
+              raise SystemExit("control workflow run changed")
+
+          artifact_list = api_json(
+              f"/repos/{repository}/actions/runs/{run_id}/artifacts"
+              "?per_page=100"
+          )
+          artifacts = artifact_list.get("artifacts")
+          if not isinstance(artifacts, list):
+              raise SystemExit("artifact list is malformed")
+          expected_name = (
+              f"wo17-control-{control}-{bound_run['run_attempt']}"
+          )
+          matches = [
+              value
+              for value in artifacts
+              if value.get("name") == expected_name
+          ]
+          if len(matches) != 1:
+              raise SystemExit("current control artifact is not unique")
+          artifact = matches[0]
+
+          def artifact_binding(value):
+              workflow_run = value.get("workflow_run") or {}
+              return {
+                  "archive_download_url": value.get(
+                      "archive_download_url"
+                  ),
+                  "digest": value.get("digest"),
+                  "expired": value.get("expired"),
+                  "id": value.get("id"),
+                  "name": value.get("name"),
+                  "size_in_bytes": value.get("size_in_bytes"),
+                  "workflow_run_head_sha": workflow_run.get("head_sha"),
+                  "workflow_run_id": workflow_run.get("id"),
+              }
+
+          bound_artifact = artifact_binding(artifact)
+          if (
+              bound_artifact["name"] != expected_name
+              or bound_artifact["expired"] is not False
+              or type(bound_artifact["id"]) is not int
+              or type(bound_artifact["size_in_bytes"]) is not int
+              or not 0 < bound_artifact["size_in_bytes"] <= 64 * 1024 * 1024
+              or re.fullmatch(
+                  r"sha256:[0-9a-f]{64}",
+                  str(bound_artifact["digest"]),
+              )
+              is None
+              or bound_artifact["archive_download_url"]
+              != (
+                  f"{api}/repos/{repository}/actions/artifacts/"
+                  f"{bound_artifact['id']}/zip"
+              )
+              or (
+                  bound_artifact["workflow_run_id"] is not None
+                  and bound_artifact["workflow_run_id"] != run_id
+              )
+              or (
+                  bound_artifact["workflow_run_head_sha"] is not None
+                  and bound_artifact["workflow_run_head_sha"] != control
+              )
+          ):
+              raise SystemExit("control artifact binding failed")
+          artifact_id = bound_artifact["id"]
+          exact_artifact = api_json(
+              f"/repos/{repository}/actions/artifacts/{artifact_id}"
+          )
+          if artifact_binding(exact_artifact) != bound_artifact:
+              raise SystemExit("control artifact changed before download")
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, url):
+                  return None
+
+          request = urllib.request.Request(
+              bound_artifact["archive_download_url"], headers=headers
+          )
+          opener = urllib.request.build_opener(NoRedirect())
+          response = None
+          try:
+              response = opener.open(request, timeout=60)
+          except urllib.error.HTTPError as error:
+              if error.code not in {301, 302, 303, 307, 308}:
+                  raise
+              location = error.headers.get("Location")
+              parsed = urllib.parse.urlsplit(location or "")
+              host = (parsed.hostname or "").casefold()
+              if (
+                  parsed.scheme != "https"
+                  or parsed.username is not None
+                  or parsed.password is not None
+                  or not (
+                      host.endswith(".blob.core.windows.net")
+                      or host.endswith(".githubusercontent.com")
+                  )
+              ):
+                  raise SystemExit("artifact redirect target is untrusted")
+              response = urllib.request.urlopen(location, timeout=60)
+
+          archive_path = target / "control.zip"
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+          flags |= getattr(os, "O_NOFOLLOW", 0)
+          descriptor = os.open(archive_path, flags, 0o600)
+          digest = hashlib.sha256()
+          size = 0
+          try:
+              with response, os.fdopen(descriptor, "wb") as output:
+                  while True:
+                      chunk = response.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      size += len(chunk)
+                      if size > 64 * 1024 * 1024:
+                          raise SystemExit("artifact download is oversized")
+                      digest.update(chunk)
+                      output.write(chunk)
+          except BaseException:
+              archive_path.unlink(missing_ok=True)
+              raise
+          if (
+              size != bound_artifact["size_in_bytes"]
+              or "sha256:" + digest.hexdigest()
+              != bound_artifact["digest"]
+          ):
+              raise SystemExit("artifact bytes do not match GitHub metadata")
+
+          with zipfile.ZipFile(archive_path) as bundle:
+              infos = bundle.infolist()
+              names = [item.filename for item in infos]
+              if (
+                  len(names) != len(set(names))
+                  or set(names) != expected_files
+                  or len(names) != len(expected_files)
+                  or sum(item.file_size for item in infos)
+                  > 64 * 1024 * 1024
+              ):
+                  raise SystemExit("control ZIP member set is inexact")
+              for info in infos:
+                  mode = info.external_attr >> 16
+                  if (
+                      info.flag_bits & 1
+                      or info.is_dir()
+                      or "/" in info.filename
+                      or "\\" in info.filename
+                      or stat.S_ISLNK(mode)
+                      or info.file_size > 32 * 1024 * 1024
+                  ):
+                      raise SystemExit("control ZIP member is unsafe")
+                  output = target / info.filename
+                  file_descriptor = os.open(
+                      output,
+                      os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | getattr(os, "O_NOFOLLOW", 0),
+                      0o600,
+                  )
+                  with bundle.open(info) as source, os.fdopen(
+                      file_descriptor, "wb"
+                  ) as sink:
+                      while True:
+                          chunk = source.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          sink.write(chunk)
+          archive_path.unlink()
+
+          if run_binding(
+              api_json(f"/repos/{repository}/actions/runs/{run_id}")
+          ) != bound_run:
+              raise SystemExit("control run changed after download")
+          if artifact_binding(
+              api_json(
+                  f"/repos/{repository}/actions/artifacts/{artifact_id}"
+              )
+          ) != bound_artifact:
+              raise SystemExit("control artifact changed after download")
+          PY
+
+      - name: Verify downloaded plan-bound public inputs
+        run: |
+          cmp -s \
+            "$RUNNER_TEMP/wo17-environment/environment-fingerprint.json" \
+            "$RUNNER_TEMP/wo17-control-download/environment-fingerprint.json"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - \
+            "$RUNNER_TEMP/wo17-control-download" <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          expected = {
+              "hypothesis.txt": os.environ["HYPOTHESIS_SHA256"],
+              "layout-manifest.json": os.environ[
+                  "LAYOUT_MANIFEST_SHA256"
+              ],
+              "primary-variable.txt": os.environ[
+                  "PRIMARY_VARIABLE_SHA256"
+              ],
+              "runtime-contract.json": os.environ[
+                  "RUNTIME_CONTRACT_SHA256"
+              ],
+          }
+          for name, digest in expected.items():
+              if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit(f"{name} digest mismatch")
+          PY
+
+      - name: Restore immutable public dataset cache
+        id: dataset-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
+
+      - name: Download and verify immutable public dataset
+        run: |
+          archive="$RUNNER_TEMP/$DATA_ARCHIVE"
+          if [[ ! -e "$archive" ]]; then
+            curl \
+              --fail \
+              --location \
+              --proto '=https' \
+              --retry 5 \
+              --retry-all-errors \
+              --retry-delay 5 \
+              --show-error \
+              --silent \
+              --tlsv1.2 \
+              "$DATA_URL" \
+              --output "$archive"
+          fi
+          test "$(shasum -a 256 "$archive" | awk '{print $1}')" = \
+            "$DATA_SHA256"
+
+      - name: Save verified immutable public dataset cache
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
+
+      - name: Extract exact public evaluation population
+        run: |
+          population="$RUNNER_TEMP/wo17-population"
+          mkdir -m 700 "$population"
+          mkdir -m 700 "$population/input"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - \
+            "$RUNNER_TEMP/$DATA_ARCHIVE" \
+            "$population" <<'PY'
+          import os
+          import pathlib
+          import re
+          import stat
+          import sys
+          import zipfile
+
+          archive = pathlib.Path(sys.argv[1])
+          target = pathlib.Path(sys.argv[2])
+          pattern = re.compile(r"data/train/(MIB-[0-9]{6})[.]pdf")
+          with zipfile.ZipFile(archive) as bundle:
+              infos = bundle.infolist()
+              names = [item.filename for item in infos]
+              if len(names) != len(set(names)):
+                  raise SystemExit("dataset archive contains duplicate names")
+              pdfs = [
+                  (item, pattern.fullmatch(item.filename))
+                  for item in infos
+                  if pattern.fullmatch(item.filename)
+              ]
+              labels = [
+                  item
+                  for item in infos
+                  if item.filename == "data/train_labels.csv"
+              ]
+              if len(pdfs) != 1000 or len(labels) != 1:
+                  raise SystemExit("dataset archive population is inexact")
+              selected = [(item, match.group(1) + ".pdf") for item, match in pdfs]
+              selected.append((labels[0], "train_labels.csv"))
+              for info, output_name in selected:
+                  mode = info.external_attr >> 16
+                  if (
+                      info.flag_bits & 1
+                      or info.is_dir()
+                      or stat.S_ISLNK(mode)
+                      or info.file_size > 64 * 1024 * 1024
+                  ):
+                      raise SystemExit("dataset archive entry is unsafe")
+                  parent = (
+                      target / "input"
+                      if output_name.endswith(".pdf")
+                      else target
+                  )
+                  output = parent / output_name
+                  descriptor = os.open(
+                      output,
+                      os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                      | getattr(os, "O_NOFOLLOW", 0),
+                      0o400,
+                  )
+                  with bundle.open(info) as source, os.fdopen(
+                      descriptor, "wb"
+                  ) as sink:
+                      while True:
+                          chunk = source.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          sink.write(chunk)
+          PY
+          rm "$RUNNER_TEMP/$DATA_ARCHIVE"
+          test ! -e "$RUNNER_TEMP/$DATA_ARCHIVE"
+
+      - name: Capture truth-blind candidate C twice
+        env:
+          CANDIDATE_SHA: ${{ steps.topology.outputs.candidate }}
+        run: |
+          output="$RUNNER_TEMP/wo17-candidate-output"
+          mkdir -m 700 "$output"
+          "$RUNNER_TEMP/wo17-venv/bin/python" \
+            devtools/policy_grouped_capture.py \
+            --arm candidate \
+            --source-revision-sha "$CANDIDATE_SHA" \
+            --input-dir "$RUNNER_TEMP/wo17-population/input" \
+            --layout-manifest \
+              "$RUNNER_TEMP/wo17-control-download/layout-manifest.json" \
+            --expected-layout-manifest-sha256 \
+              "$LAYOUT_MANIFEST_SHA256" \
+            --expected-input-tree-sha256 "$INPUT_TREE_SHA256" \
+            --denied-sensitive-path \
+              "$RUNNER_TEMP/wo17-population/train_labels.csv" \
+            --first-predictions \
+              "$output/candidate-prediction-1.jsonl" \
+            --second-predictions \
+              "$output/candidate-prediction-2.jsonl" \
+            --first-audit "$output/candidate-audit-1.json" \
+            --second-audit "$output/candidate-audit-2.json" \
+            --observation "$output/candidate-observation.json" \
+            --max-workers 4
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Build and gate exact aggregate-only evidence
+        env:
+          CONTROL_SHA: ${{ steps.topology.outputs.control }}
+          CANDIDATE_SHA: ${{ steps.topology.outputs.candidate }}
+          PLAN_SHA256: ${{ steps.plan.outputs.sha256 }}
+        run: |
+          json_output="$GITHUB_WORKSPACE/evaluation/wo17-grouped-aggregate.json"
+          markdown_output="$GITHUB_WORKSPACE/evaluation/wo17-grouped-aggregate.md"
+          test ! -e "$json_output"
+          test ! -e "$markdown_output"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          set +e
+          "$RUNNER_TEMP/wo17-venv/bin/python" \
+            devtools/grouped_policy_revalidation_evidence.py \
+            --input-dir "$RUNNER_TEMP/wo17-population/input" \
+            --layout-manifest \
+              "$RUNNER_TEMP/wo17-control-download/layout-manifest.json" \
+            --truth "$RUNNER_TEMP/wo17-population/train_labels.csv" \
+            --evaluator "$GITHUB_WORKSPACE/scripts/evaluate.py" \
+            --experiment-plan \
+              "$RUNNER_TEMP/wo17-plan/experiment-plan.json" \
+            --expected-experiment-plan-sha256 "$PLAN_SHA256" \
+            --runtime-contract \
+              "$RUNNER_TEMP/wo17-control-download/runtime-contract.json" \
+            --expected-runtime-contract-sha256 \
+              "$RUNTIME_CONTRACT_SHA256" \
+            --hypothesis \
+              "$RUNNER_TEMP/wo17-control-download/hypothesis.txt" \
+            --primary-variable \
+              "$RUNNER_TEMP/wo17-control-download/primary-variable.txt" \
+            --control-revision-sha "$CONTROL_SHA" \
+            --candidate-revision-sha "$CANDIDATE_SHA" \
+            --control-prediction \
+              "$RUNNER_TEMP/wo17-control-download/control-prediction-1.jsonl" \
+            --control-prediction \
+              "$RUNNER_TEMP/wo17-control-download/control-prediction-2.jsonl" \
+            --candidate-prediction \
+              "$RUNNER_TEMP/wo17-candidate-output/candidate-prediction-1.jsonl" \
+            --candidate-prediction \
+              "$RUNNER_TEMP/wo17-candidate-output/candidate-prediction-2.jsonl" \
+            --control-audit \
+              "$RUNNER_TEMP/wo17-control-download/control-audit-1.json" \
+            --control-audit \
+              "$RUNNER_TEMP/wo17-control-download/control-audit-2.json" \
+            --candidate-audit \
+              "$RUNNER_TEMP/wo17-candidate-output/candidate-audit-1.json" \
+            --candidate-audit \
+              "$RUNNER_TEMP/wo17-candidate-output/candidate-audit-2.json" \
+            --control-observation \
+              "$RUNNER_TEMP/wo17-control-download/control-observation.json" \
+            --candidate-observation \
+              "$RUNNER_TEMP/wo17-candidate-output/candidate-observation.json" \
+            --output-json "$json_output" \
+            --output-markdown "$markdown_output"
+          builder_status=$?
+          set -e
+          case "$builder_status" in
+            0|2)
+              ;;
+            *)
+              echo "WO-17 evidence builder failed: $builder_status" >&2
+              exit "$builder_status"
+              ;;
+          esac
+          test -f "$json_output"
+          test -f "$markdown_output"
+
+          stage="$RUNNER_TEMP/wo17-final"
+          mkdir -m 700 "$stage"
+          cp "$json_output" "$stage/wo17-grouped-aggregate.json"
+          rm "$json_output" "$markdown_output"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          "$RUNNER_TEMP/wo17-venv/bin/python" - "$stage" <<'PY'
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          entries = tuple(root.iterdir())
+          if (
+              len(entries) != 1
+              or entries[0].name != "wo17-grouped-aggregate.json"
+              or not entries[0].is_file()
+              or entries[0].is_symlink()
+          ):
+              raise SystemExit("final aggregate staging set is inexact")
+          PY
+
+      - name: Upload sole run-attempt-bound aggregate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wo17-grouped-aggregate-${{ steps.topology.outputs.candidate }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wo17-final/wo17-grouped-aggregate.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 9
+          include-hidden-files: false

@@ -199,7 +199,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wo20-smoke-${{ steps.source.outputs.sha }}
+          name: wo20-smoke-${{ steps.source.outputs.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/wo20-smoke-output/evidence.json
           if-no-files-found: warn
           retention-days: 1
@@ -398,7 +398,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wo20-capture-${{ matrix.capture }}-${{ needs.preflight.outputs.source-sha }}
+          name: wo20-capture-${{ matrix.capture }}-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/wo20-capture-${{ matrix.capture }}/evidence-${{ matrix.capture }}.json
           if-no-files-found: warn
           retention-days: 1
@@ -424,7 +424,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: wo20-capture-*-${{ needs.preflight.outputs.source-sha }}
+          pattern: wo20-capture-*-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/wo20-captures
           merge-multiple: false
 
@@ -457,7 +457,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wo20-aggregate-${{ needs.preflight.outputs.source-sha }}
+          name: wo20-aggregate-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/wo20-aggregate.json
           if-no-files-found: warn
           retention-days: 1
@@ -488,7 +488,7 @@ jobs:
       - name: Download exact WO20 aggregate prerequisite
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: wo20-aggregate-${{ needs.preflight.outputs.source-sha }}
+          name: wo20-aggregate-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/wo20-prerequisite
 
       - name: Build clean adversarial-audit image
@@ -617,7 +617,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wo21-aggregate-${{ needs.preflight.outputs.source-sha }}
+          name: wo21-aggregate-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/wo21-evidence/wo21.json
             ${{ runner.temp }}/wo21-evidence/wo21.md
