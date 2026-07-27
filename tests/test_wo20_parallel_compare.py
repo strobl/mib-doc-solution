@@ -137,8 +137,17 @@ def _capture(
                 "peak_container_memory_bytes": peak_container,
                 "peak_container_memory_mib": peak_container / 1024**2,
                 "peak_container_memory_source": (
-                    "docker_stats_mem_usage_cgroup"
+                    "max_available_in_container_cgroup_and_docker_stats"
                 ),
+                "peak_container_memory_components": {
+                    "combination": "maximum_of_available_sources",
+                    "in_container_cgroup_bytes": peak_container,
+                    "in_container_cgroup_source": (
+                        "cgroup_v2_memory_peak"
+                    ),
+                    "docker_stats_peak_bytes": peak_rss,
+                    "docker_stats_sample_count": 1,
+                },
                 "output_sha256": OUTPUT_HASH,
                 "output_bytes": 1_000_000,
                 "coverage": coverage,
@@ -178,7 +187,7 @@ def _capture(
             "peak_container_memory_bytes": peak_container,
             "peak_container_memory_mib": peak_container / 1024**2,
             "peak_container_memory_source": (
-                "docker_stats_mem_usage_cgroup"
+                "max_available_in_container_cgroup_and_docker_stats"
             ),
         },
     }
@@ -232,6 +241,10 @@ class WO20ParallelCompareTests(unittest.TestCase):
         self.assertEqual(
             result["images"]["image_ids"],
             ["sha256:" + "5" * 64, "sha256:" + "6" * 64],
+        )
+        self.assertEqual(
+            len(result["runtime"]["peak_container_memory_components"]),
+            2,
         )
         rendered = json.dumps(result, sort_keys=True)
         self.assertNotIn("case_id", rendered.casefold())
@@ -380,6 +393,17 @@ class WO20ParallelCompareTests(unittest.TestCase):
             caught.exception.code,
             "container_memory_limit_exceeded",
         )
+
+    def test_container_memory_components_are_bound_to_reported_peak(self) -> None:
+        self.right_payload["runs"][0][
+            "peak_container_memory_components"
+        ]["in_container_cgroup_bytes"] -= 1
+        self._write()
+
+        with self.assertRaises(WO20ParallelCompareError) as caught:
+            self._compare()
+
+        self.assertEqual(caught.exception.code, "run_evidence_invalid")
 
     def test_exactly_two_distinct_capture_files_are_required(self) -> None:
         with self.assertRaises(WO20ParallelCompareError) as caught:

@@ -30,7 +30,12 @@ def run_metric(index, elapsed, output_hash="a" * 64):
         repeat_index=index,
         elapsed_seconds=elapsed,
         peak_process_tree_rss_bytes=index * 1024 * 1024,
-        peak_container_memory_bytes=(index + 1) * 1024 * 1024,
+        container_memory=docker_runner.ContainerMemoryMeasurement(
+            cgroup_bytes=(index + 1) * 1024 * 1024,
+            cgroup_source="cgroup_v2_memory_peak",
+            docker_stats_peak_bytes=index * 1024 * 1024,
+            docker_stats_sample_count=1,
+        ),
         output_sha256=output_hash,
         output_bytes=100,
         output=docker_runner.OutputSummary(
@@ -66,6 +71,59 @@ class DockerRuntimeEnvelopeTests(unittest.TestCase):
         )
         with self.assertRaises(docker_runner.RuntimeEnvelopeError):
             docker_runner.parse_memory_bytes("unknown")
+
+    def test_container_memory_uses_positive_cgroup_fallback(self):
+        self.assertEqual(
+            docker_runner.combine_container_memory_samples(
+                docker_stats_samples=(),
+                cgroup_memory_bytes=384 * 1024 * 1024,
+            ),
+            384 * 1024 * 1024,
+        )
+        self.assertEqual(
+            docker_runner.combine_container_memory_samples(
+                docker_stats_samples=(256 * 1024 * 1024,),
+                cgroup_memory_bytes=384 * 1024 * 1024,
+            ),
+            384 * 1024 * 1024,
+        )
+        self.assertEqual(
+            docker_runner.combine_container_memory_samples(
+                docker_stats_samples=(512 * 1024 * 1024,),
+                cgroup_memory_bytes=384 * 1024 * 1024,
+            ),
+            512 * 1024 * 1024,
+        )
+        with self.assertRaisesRegex(
+            docker_runner.RuntimeEnvelopeError,
+            "no positive sample",
+        ):
+            docker_runner.combine_container_memory_samples(
+                docker_stats_samples=(0,),
+                cgroup_memory_bytes=0,
+            )
+
+    def test_container_memory_provenance_must_match_measurements(self):
+        with self.assertRaisesRegex(
+            docker_runner.RuntimeEnvelopeError,
+            "source does not match",
+        ):
+            docker_runner.ContainerMemoryMeasurement(
+                cgroup_bytes=1,
+                cgroup_source="unavailable",
+                docker_stats_peak_bytes=0,
+                docker_stats_sample_count=0,
+            )
+        with self.assertRaisesRegex(
+            docker_runner.RuntimeEnvelopeError,
+            "no supporting sample",
+        ):
+            docker_runner.ContainerMemoryMeasurement(
+                cgroup_bytes=1,
+                cgroup_source="cgroup_v1_memory_max_usage",
+                docker_stats_peak_bytes=2,
+                docker_stats_sample_count=0,
+            )
 
     def test_container_command_enforces_the_complete_resource_envelope(self):
         command = docker_runner.build_container_command(
@@ -105,6 +163,14 @@ class DockerRuntimeEnvelopeTests(unittest.TestCase):
         )
         self.assertIn(
             "os.chmod(output_path, 0o644)",
+            docker_runner._RUNTIME_RSS_WRAPPER_SCRIPT,
+        )
+        self.assertIn(
+            "/sys/fs/cgroup/memory.peak",
+            docker_runner._RUNTIME_RSS_WRAPPER_SCRIPT,
+        )
+        self.assertIn(
+            "peak_container_cgroup_memory_bytes",
             docker_runner._RUNTIME_RSS_WRAPPER_SCRIPT,
         )
 
@@ -446,7 +512,12 @@ class DockerRuntimeEnvelopeTests(unittest.TestCase):
                 return (
                     2.0 + len(calls) / 10,
                     80 * 1024 * 1024,
-                    100 * 1024 * 1024,
+                    docker_runner.ContainerMemoryMeasurement(
+                        cgroup_bytes=100 * 1024 * 1024,
+                        cgroup_source="cgroup_v2_memory_peak",
+                        docker_stats_peak_bytes=90 * 1024 * 1024,
+                        docker_stats_sample_count=2,
+                    ),
                 )
 
             with (
@@ -545,6 +616,12 @@ class DockerRuntimeEnvelopeTests(unittest.TestCase):
         self.assertEqual(
             payload["runtime"]["peak_container_memory_mib"],
             100.0,
+        )
+        self.assertEqual(
+            payload["runs"][0]["peak_container_memory_components"][
+                "in_container_cgroup_source"
+            ],
+            "cgroup_v2_memory_peak",
         )
         self.assertIn(
             "per_case_deadline_not_enforced",

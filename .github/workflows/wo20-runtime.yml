@@ -109,7 +109,8 @@ jobs:
           echo "image-tag=$image_tag" >> "$GITHUB_OUTPUT"
 
       - name: Restore immutable public dataset cache
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: dataset-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
           key: ${{ env.DATA_CACHE_KEY }}
@@ -131,6 +132,13 @@ jobs:
 
           printf '%s  %s\n' "$DATA_SHA256" "$archive" |
             sha256sum --check --strict -
+
+      - name: Save verified immutable public dataset cache
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
 
       - name: Prepare eight-case smoke input
         id: smoke

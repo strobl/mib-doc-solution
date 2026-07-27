@@ -382,6 +382,15 @@ class WO21IdentityScanTests(unittest.TestCase):
         self.assertIn(".checks.model_identity_scan_clean == true", workflow)
         self.assertIn("--wo20-aggregate-sha256", workflow)
         self.assertIn("sha256sum \"$wo20_aggregate\"", workflow)
+        self.assertIn("actions/cache/save@", workflow)
+        self.assertLess(
+            workflow.index("Download and verify public dataset"),
+            workflow.index("Save verified immutable public dataset cache"),
+        )
+        self.assertLess(
+            workflow.index("Save verified immutable public dataset cache"),
+            workflow.index("Prepare eight-case smoke input"),
+        )
 
 
 if __name__ == "__main__":

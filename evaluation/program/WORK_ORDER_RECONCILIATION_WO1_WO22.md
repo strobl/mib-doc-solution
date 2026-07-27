@@ -45,7 +45,7 @@ Snapshot date: 2026-07-27.
 | 17 | in_review | Historical evidence recorded; governed revalidation pending | The retrospective result was a `+0.111145` calibration-only 32-case diagnostic, while targeted confusion deltas remained zero. It is not a governed full-public milestone or promotion and still requires revalidation under the current evidence contract. |
 | 18 | blocked | No promotion | The exact four-arm comparison is `blocked_precondition`: two protected roles lack coverage and the standard promotion gate was not evaluated. No model entered runtime composition. |
 | 19 | in_review | Evaluated, no promotion | The selected beta refit worsened OOF Brier by `+0.002765249`; S0 remains pinned. The in-sample/shadow `137.072877` total is not promoted. |
-| 20 | in_progress | Local harness complete; real Linux Docker evidence pending | The workflow now binds source, input, image and model inventory, runs two independent constrained 5,000-case captures, compares aggregate evidence fail-closed, and records sampled resource maxima. Acceptance requires the trusted workflow run to pass. |
+| 20 | in_progress | Local harness complete; real Linux Docker evidence pending | The workflow binds source, input, image and model inventory, runs two independent constrained 5,000-case captures, and compares aggregate evidence fail-closed. A trusted smoke run exposed missing `docker stats` samples; the measurement now conservatively takes the maximum of in-container cgroup readings and Docker stats while still blocking if both are unavailable. Acceptance requires the new exact-source workflow run to pass. |
 | 21 | in_progress | Production-path host audit passes; trusted report pending | The real production processor now passes all 15 scenarios twice locally with byte-identical captures, zero regressions, zero new approvals, and zero decoy adoption. The harness hard-gates all 13 categories and binds installed-model scanning plus the final report to the same-run WO-20 aggregate. Local model-root scanning and Docker/provenance attestations remain unavailable, so acceptance still requires the trusted workflow run. |
 | 22 | backlog | Not startable | Its own precondition is that all prior gates pass. WO-10 has not reached 148 and WO-15/18 are blocked, so no final 1,000-case rerun, candidate freeze, or resubmission package is authorized. |
 
@@ -60,7 +60,7 @@ Snapshot date: 2026-07-27.
 
 ## Verification for this reconciliation change set
 
-- Full local unit suite: 662 passed, 2 skipped.
+- Full local unit suite: 665 passed, 2 skipped.
 - Real local WO-21 production-path audit: 15/15 scenarios passed twice,
   byte-identical, with zero regressions, new approvals, or decoy adoption.
   Installed-model scanning and Docker/provenance gates remain external.

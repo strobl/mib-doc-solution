@@ -32,7 +32,17 @@ except ImportError:  # Direct execution adds scripts/, not the repository root.
 
 EVIDENCE_SCHEMA = "mib-wo20-docker-runtime-envelope/v1"
 PEAK_RSS_SOURCE = "in_container_procfs_summed_process_tree_vmrss"
-PEAK_CONTAINER_MEMORY_SOURCE = "docker_stats_mem_usage_cgroup"
+PEAK_CONTAINER_MEMORY_SOURCE = (
+    "max_available_in_container_cgroup_and_docker_stats"
+)
+CGROUP_MEMORY_SOURCES = frozenset(
+    {
+        "cgroup_v2_memory_peak",
+        "cgroup_v1_memory_max_usage",
+        "cgroup_v2_memory_current",
+        "cgroup_v1_memory_current",
+    }
+)
 IMAGE_MODEL_SCAN_SCOPE = "fixed_runtime_roots"
 MODEL_EXTENSIONS = {
     ".bin",
@@ -118,11 +128,75 @@ class OutputSummary:
 
 
 @dataclass(frozen=True)
+class ContainerMemoryMeasurement:
+    """Aggregate-safe provenance for one container-memory measurement."""
+
+    cgroup_bytes: int
+    cgroup_source: str
+    docker_stats_peak_bytes: int
+    docker_stats_sample_count: int
+
+    def __post_init__(self) -> None:
+        numeric_values = (
+            self.cgroup_bytes,
+            self.docker_stats_peak_bytes,
+            self.docker_stats_sample_count,
+        )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in numeric_values
+        ):
+            raise RuntimeEnvelopeError(
+                "peak_container_memory_unavailable",
+                "container memory measurements are invalid",
+            )
+        if (
+            self.cgroup_bytes > 0
+            and self.cgroup_source not in CGROUP_MEMORY_SOURCES
+        ) or (
+            self.cgroup_bytes == 0
+            and self.cgroup_source != "unavailable"
+        ):
+            raise RuntimeEnvelopeError(
+                "peak_container_memory_unavailable",
+                "container cgroup source does not match its measurement",
+            )
+        if (
+            self.docker_stats_sample_count == 0
+            and self.docker_stats_peak_bytes != 0
+        ):
+            raise RuntimeEnvelopeError(
+                "peak_container_memory_unavailable",
+                "Docker stats peak has no supporting sample",
+            )
+        if self.peak_bytes <= 0:
+            raise RuntimeEnvelopeError(
+                "peak_container_memory_unavailable",
+                "container cgroup and Docker stats yielded no positive sample",
+            )
+
+    @property
+    def peak_bytes(self) -> int:
+        return max(self.cgroup_bytes, self.docker_stats_peak_bytes)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "combination": "maximum_of_available_sources",
+            "in_container_cgroup_bytes": self.cgroup_bytes,
+            "in_container_cgroup_source": self.cgroup_source,
+            "docker_stats_peak_bytes": self.docker_stats_peak_bytes,
+            "docker_stats_sample_count": self.docker_stats_sample_count,
+        }
+
+
+@dataclass(frozen=True)
 class ContainerRun:
     repeat_index: int
     elapsed_seconds: float
     peak_process_tree_rss_bytes: int
-    peak_container_memory_bytes: int
+    container_memory: ContainerMemoryMeasurement
     output_sha256: str
     output_bytes: int
     output: OutputSummary
@@ -146,10 +220,10 @@ class ContainerRun:
                 "peak_rss_unavailable",
                 "container process-tree RSS was not observed",
             )
-        if self.peak_container_memory_bytes <= 0:
+        if not isinstance(self.container_memory, ContainerMemoryMeasurement):
             raise RuntimeEnvelopeError(
                 "peak_container_memory_unavailable",
-                "Docker container memory was not observed",
+                "container memory measurement is invalid",
             )
         if not re.fullmatch(r"[0-9a-f]{64}", self.output_sha256):
             raise RuntimeEnvelopeError(
@@ -161,6 +235,10 @@ class ContainerRun:
                 "invalid_output_size",
                 "output size cannot be negative",
             )
+
+    @property
+    def peak_container_memory_bytes(self) -> int:
+        return self.container_memory.peak_bytes
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -176,6 +254,9 @@ class ContainerRun:
                 self.peak_container_memory_bytes / (1024 * 1024)
             ),
             "peak_container_memory_source": PEAK_CONTAINER_MEMORY_SOURCE,
+            "peak_container_memory_components": (
+                self.container_memory.to_dict()
+            ),
             "output_sha256": self.output_sha256,
             "output_bytes": self.output_bytes,
             "coverage": self.output.to_dict(),
@@ -732,6 +813,41 @@ def parse_memory_bytes(value: str) -> int:
     return int(magnitude * multiplier)
 
 
+def combine_container_memory_samples(
+    *,
+    docker_stats_samples: Sequence[int],
+    cgroup_memory_bytes: int,
+) -> int:
+    """Return the conservative maximum across two cgroup observation paths."""
+
+    if (
+        isinstance(cgroup_memory_bytes, bool)
+        or not isinstance(cgroup_memory_bytes, int)
+        or cgroup_memory_bytes < 0
+        or any(
+            isinstance(sample, bool)
+            or not isinstance(sample, int)
+            or sample < 0
+            for sample in docker_stats_samples
+        )
+    ):
+        raise RuntimeEnvelopeError(
+            "peak_container_memory_unavailable",
+            "container memory samples are invalid",
+        )
+    measurement = ContainerMemoryMeasurement(
+        cgroup_bytes=cgroup_memory_bytes,
+        cgroup_source=(
+            "cgroup_v2_memory_peak"
+            if cgroup_memory_bytes > 0
+            else "unavailable"
+        ),
+        docker_stats_peak_bytes=max(docker_stats_samples, default=0),
+        docker_stats_sample_count=len(docker_stats_samples),
+    )
+    return measurement.peak_bytes
+
+
 _RUNTIME_RSS_WRAPPER_SCRIPT = """
 import json
 import os
@@ -779,18 +895,53 @@ def rss_bytes(pid):
                 return int(parts[1]) * 1024
     return 0
 
+def cgroup_memory_bytes():
+    candidates = (
+        ("/sys/fs/cgroup/memory.peak", "cgroup_v2_memory_peak"),
+        (
+            "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+            "cgroup_v1_memory_max_usage",
+        ),
+        ("/sys/fs/cgroup/memory.current", "cgroup_v2_memory_current"),
+        (
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+            "cgroup_v1_memory_current",
+        ),
+    )
+    for path, source in candidates:
+        try:
+            raw = open(path, encoding="utf-8").read().strip()
+            value = int(raw)
+        except (OSError, ValueError):
+            continue
+        if value > 0:
+            return value, source
+    return 0, "unavailable"
+
 process = subprocess.Popen([launcher, input_dir, output_path])
 peak = 0
 samples = 0
+cgroup_peak = 0
+cgroup_source = "unavailable"
 while process.poll() is None:
     peak = max(peak, sum(rss_bytes(pid) for pid in process_tree(process.pid)))
+    observed_cgroup, observed_source = cgroup_memory_bytes()
+    if observed_cgroup > cgroup_peak:
+        cgroup_peak = observed_cgroup
+        cgroup_source = observed_source
     samples += 1
     time.sleep(0.1)
 peak = max(peak, sum(rss_bytes(pid) for pid in process_tree(process.pid)))
+observed_cgroup, observed_source = cgroup_memory_bytes()
+if observed_cgroup > cgroup_peak:
+    cgroup_peak = observed_cgroup
+    cgroup_source = observed_source
 payload = {
     "peak_process_tree_rss_bytes": peak,
     "rss_sample_count": samples,
     "source": "in_container_procfs_summed_process_tree_vmrss",
+    "peak_container_cgroup_memory_bytes": cgroup_peak,
+    "container_cgroup_memory_source": cgroup_source,
 }
 temporary = metrics_path + ".tmp"
 with open(temporary, "w", encoding="utf-8") as handle:
@@ -932,7 +1083,7 @@ def execute_container(
     metrics_path: Path,
     timeout_seconds: int,
     stats_interval_seconds: float,
-) -> tuple[float, int, int]:
+) -> tuple[float, int, ContainerMemoryMeasurement]:
     """Run one retained container and capture elapsed, RSS, and cgroup memory."""
 
     print("+ " + " ".join(str(part) for part in command), flush=True)
@@ -993,20 +1144,33 @@ def execute_container(
                 "container_exit_nonzero",
                 "container exited unsuccessfully" + suffix,
             )
-        if not samples or max(samples) <= 0:
-            raise RuntimeEnvelopeError(
-                "peak_container_memory_unavailable",
-                "Docker stats did not yield a positive memory sample",
-            )
         try:
             rss_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeEnvelopeError(
+                "peak_rss_unavailable",
+                "in-container memory metrics were not emitted",
+            ) from exc
+        try:
             peak_rss = rss_payload["peak_process_tree_rss_bytes"]
             rss_samples = rss_payload["rss_sample_count"]
             rss_source = rss_payload["source"]
-        except (KeyError, OSError, TypeError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError) as exc:
             raise RuntimeEnvelopeError(
                 "peak_rss_unavailable",
                 "process-tree RSS metrics were not emitted",
+            ) from exc
+        try:
+            cgroup_memory = rss_payload[
+                "peak_container_cgroup_memory_bytes"
+            ]
+            cgroup_source = rss_payload[
+                "container_cgroup_memory_source"
+            ]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeEnvelopeError(
+                "peak_container_memory_unavailable",
+                "container cgroup memory metrics were not emitted",
             ) from exc
         if (
             isinstance(peak_rss, bool)
@@ -1021,7 +1185,13 @@ def execute_container(
                 "peak_rss_unavailable",
                 "process-tree RSS metrics are invalid",
             )
-        return elapsed, peak_rss, max(samples)
+        container_memory = ContainerMemoryMeasurement(
+            cgroup_bytes=cgroup_memory,
+            cgroup_source=cgroup_source,
+            docker_stats_peak_bytes=max(samples, default=0),
+            docker_stats_sample_count=len(samples),
+        )
+        return elapsed, peak_rss, container_memory
     except OSError as exc:
         raise RuntimeEnvelopeError(
             "container_start_failed",
@@ -1688,7 +1858,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     cpus=str(args.cpus),
                     memory=str(args.memory),
                 )
-                elapsed, peak_rss, peak_container_memory = execute_container(
+                elapsed, peak_rss, container_memory = execute_container(
                     command,
                     container_name=container_name,
                     metrics_path=metrics_path,
@@ -1728,7 +1898,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         repeat_index=repeat_index,
                         elapsed_seconds=elapsed,
                         peak_process_tree_rss_bytes=peak_rss,
-                        peak_container_memory_bytes=peak_container_memory,
+                        container_memory=container_memory,
                         output_sha256=_sha256_file(repeated_output),
                         output_bytes=output_size,
                         output=summary,

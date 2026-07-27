@@ -119,11 +119,16 @@ single-run captures and admits a determinism claim only after
 coverage, output hash and bytes, limits, platform, and artifact inventory.
 
 The fields named `peak_process_tree_rss_*` and `peak_container_memory_*` are the
-maximum observed samples from in-container `/proc` polling and `docker stats`;
-they are not claimed to be kernel-recorded absolute peaks. The Docker 8-GiB
-limit and OOM state remain hard enforcement. A whole-run timeout is enforced;
-the absence of a separate per-case deadline is reported as a warning and may
-not be hidden by the evidence.
+maximum observed values from in-container `/proc` polling and the conservative
+maximum of in-container cgroup peak/current readings plus `docker stats`.
+Where the kernel exposes `memory.peak`, that value is included; fallback
+readings remain sampled observations rather than a claim of an absolute peak.
+Each run records the selected cgroup source and value, the Docker stats peak,
+and the Docker stats sample count before taking the conservative maximum of
+the sources that were actually available.
+The Docker 8-GiB limit and OOM state remain hard enforcement. A whole-run
+timeout is enforced; the absence of a separate per-case deadline is reported
+as a warning and may not be hidden by the evidence.
 
 ## Verify locally
 

@@ -129,9 +129,27 @@ _RUN_KEYS = frozenset(
         "peak_container_memory_bytes",
         "peak_container_memory_mib",
         "peak_container_memory_source",
+        "peak_container_memory_components",
         "output_sha256",
         "output_bytes",
         "coverage",
+    }
+)
+_CONTAINER_MEMORY_COMPONENT_KEYS = frozenset(
+    {
+        "combination",
+        "in_container_cgroup_bytes",
+        "in_container_cgroup_source",
+        "docker_stats_peak_bytes",
+        "docker_stats_sample_count",
+    }
+)
+_CGROUP_MEMORY_SOURCES = frozenset(
+    {
+        "cgroup_v2_memory_peak",
+        "cgroup_v1_memory_max_usage",
+        "cgroup_v2_memory_current",
+        "cgroup_v1_memory_current",
     }
 )
 _RUNTIME_KEYS = frozenset(
@@ -200,6 +218,7 @@ class ValidatedCapture:
     elapsed_seconds: float
     peak_process_tree_rss_bytes: int
     peak_container_memory_bytes: int
+    peak_container_memory_components: Mapping[str, Any]
     image_id: str
     image_size_bytes: int
     image_build_mode: str
@@ -1058,9 +1077,56 @@ def _validate_capture(
         run["peak_process_tree_rss_source"]
         == "in_container_procfs_summed_process_tree_vmrss"
         and run["peak_container_memory_source"]
-        == "docker_stats_mem_usage_cgroup",
+        == "max_available_in_container_cgroup_and_docker_stats",
         "run_evidence_invalid",
         "run memory sources are invalid",
+    )
+    memory_components = _mapping(
+        run["peak_container_memory_components"],
+        code="run_evidence_invalid",
+        label="container memory components",
+    )
+    _exact_keys(
+        memory_components,
+        _CONTAINER_MEMORY_COMPONENT_KEYS,
+        code="run_evidence_invalid",
+        label="container memory components",
+    )
+    cgroup_bytes = _integer(
+        memory_components["in_container_cgroup_bytes"],
+        code="run_evidence_invalid",
+        label="in-container cgroup memory",
+    )
+    docker_stats_peak = _integer(
+        memory_components["docker_stats_peak_bytes"],
+        code="run_evidence_invalid",
+        label="Docker stats peak memory",
+    )
+    docker_stats_sample_count = _integer(
+        memory_components["docker_stats_sample_count"],
+        code="run_evidence_invalid",
+        label="Docker stats sample count",
+    )
+    cgroup_source = memory_components["in_container_cgroup_source"]
+    _require(
+        memory_components["combination"] == "maximum_of_available_sources"
+        and (
+            (
+                cgroup_bytes > 0
+                and cgroup_source in _CGROUP_MEMORY_SOURCES
+            )
+            or (
+                cgroup_bytes == 0
+                and cgroup_source == "unavailable"
+            )
+        )
+        and not (
+            docker_stats_sample_count == 0
+            and docker_stats_peak != 0
+        )
+        and peak_container == max(cgroup_bytes, docker_stats_peak),
+        "run_evidence_invalid",
+        "container memory components are inconsistent",
     )
     output_sha256 = _digest(
         run["output_sha256"],
@@ -1101,6 +1167,7 @@ def _validate_capture(
         elapsed_seconds=elapsed,
         peak_process_tree_rss_bytes=peak_rss,
         peak_container_memory_bytes=peak_container,
+        peak_container_memory_components=memory_components,
         image_id=image_id,
         image_size_bytes=image_size,
         image_build_mode=image_build_mode,
@@ -1309,6 +1376,10 @@ def compare_capture_evidence(
                 first.peak_container_memory_bytes,
                 second.peak_container_memory_bytes,
             ),
+            "peak_container_memory_components": [
+                dict(first.peak_container_memory_components),
+                dict(second.peak_container_memory_components),
+            ],
             "all_captures_within_official_runtime_limit": True,
             "all_captures_within_official_memory_limit": True,
         },
