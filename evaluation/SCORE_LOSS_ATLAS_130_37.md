@@ -154,28 +154,129 @@ confidence bottoms out in-sample at Brier 0.061314, or 17.547435/20. There are
 an optimistic, overfit ceiling rather than a publishable calibration model.
 Decision logic must freeze before cross-fitted final-trace calibration.
 
-## Dimension coverage and evidence gaps
+## Required dimension atlas
 
-WO-13 requires analysis across more dimensions than the public evaluator
-artifacts expose. The following matrix prevents absent metadata from being
-mistaken for a measured result.
+WO-13 requires ten dimensions. This pass measures field,
+adjudication-confusion, and confidence-bucket loss on the exact frozen
+1,000-case result. It also presents a clearly qualified auxiliary historical
+page/template grouping and cites the frozen whole-run runtime. Five
+production-trace dimensions and exact current-source page/runtime allocation
+remain explicitly blocked; they are not reported as zero-loss findings.
 
-| Dimension | Evidence in this pass | Result or next measurement |
-| --- | --- | --- |
-| Field | Exact official per-case field scores, aggregated | Quantified above |
-| Adjudication confusion | Exact official per-case decisions, aggregated | Quantified above |
-| Page/template family | Not present in public labels or official case-score output | Generate identity-free visible-layout signatures in WO-14; never group by case ID |
-| Provenance route | Not present in the frozen evaluator artifacts | Add aggregate trace hooks to the shared production graph before claiming route causality |
-| Applicant-linking state | No final-run aggregate state counter | Field co-occurrence is a prioritization signal only; add an identity-free link-state counter in WO-16 |
-| Evidence conflict | No final-run aggregate conflict counter | Add counts by generic field/conflict category in WO-16 |
-| OCR/recovery path | Final output does not identify which visible OCR route supplied a value | Benchmark one bounded route at a time in WO-14 and record aggregate route counters |
-| Policy trace | Not present in the frozen evaluator artifacts | Final production-policy replay with aggregate trace counters is required in WO-17 |
-| Confidence bucket | Exact final confidence and correctness available | Existing output-only ceiling is insufficient; refit out of fold in WO-19 |
-| Runtime cost | Full-run wall time and sampled memory are recorded in WO-11 | WO-14 must report score gain per CPU second for every OCR candidate |
-| Damage profile/difficulty | Columns are empty in the public truth and case-score artifacts | Not measurable from current public evidence; do not invent private metadata |
+| Dimension | Status |
+| --- | --- |
+| Field | Measured from official case scores |
+| Adjudication confusion | Measured from official case scores |
+| Page/template family | Auxiliary historical only: exact case set, unresolved source/input-tree binding |
+| Provenance route | Blocked: current-source trace absent |
+| Applicant-linking state | Blocked: current-source trace absent |
+| Evidence conflict | Blocked: current-source trace absent |
+| OCR/recovery path | Blocked: current-source trace absent |
+| Policy trace | Blocked: current-source trace absent |
+| Confidence bucket | Frozen-baseline measurement from final submitted confidence |
+| Runtime cost | Frozen whole-run total cited; per-case loss allocation blocked |
 
-The unavailable dimensions are explicit evidence gaps, not zero-loss findings.
-Their aggregate instrumentation is part of the named downstream Work Orders.
+### Page/template-family loss
+
+The auxiliary page/template grouping comes from the label-blind
+`page-count-plus-first-page-ink-v1` layout manifest. It covers exactly the same
+1,000 case IDs as the frozen evaluator artifacts and is bound by SHA-256
+`d7aac395c2d42dc42128ba3b4ce15fef6c42c37a6e247a066c267fba8a514b7c`.
+The grouping uses only PDF page count and first-page rendered pixels; labels
+are not construction inputs. However, that WO-12 manifest does not bind the
+exact `bf6c009` source revision and input-tree bytes recorded by WO-11.
+Therefore its status is `auxiliary_historical`, not `current_source`.
+
+There are 24 raw layout groups. Thirteen groups below the `K=10` literal
+support floor are combined into one 35-case aggregate suppression bucket,
+leaving 12 reported rows. No emitted category has support below 10. Every loss
+column sums back to the corresponding frozen component gap.
+
+| Layout family | Cases | Field misses | Wrong decisions | Extraction loss | Classification loss | Calibration loss |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `page-count-03__ink-bucket-00` | 239 | 190 | 81 | 1.227778 | 4.920000 | 1.070791 |
+| `page-count-03__ink-bucket-01` | 113 | 124 | 49 | 0.757778 | 3.050000 | 0.607896 |
+| `page-count-04__ink-bucket-00` | 137 | 140 | 18 | 0.808889 | 1.100000 | 0.354537 |
+| `page-count-05__ink-bucket-00` | 178 | 128 | 9 | 0.704444 | 0.590000 | 0.311787 |
+| `page-count-04__ink-bucket-01` | 57 | 37 | 11 | 0.227778 | 0.670000 | 0.149506 |
+| `page-count-05__ink-bucket-01` | 68 | 44 | 4 | 0.243333 | 0.260000 | 0.128081 |
+| `<suppressed_low_support>` | 35 | 55 | 3 | 0.304444 | 0.190000 | 0.110825 |
+| `page-count-06__ink-bucket-00` | 88 | 71 | 2 | 0.375556 | 0.130000 | 0.066693 |
+| `page-count-03__ink-bucket-02` | 16 | 32 | 5 | 0.174444 | 0.320000 | 0.053217 |
+| `page-count-04__ink-bucket-02` | 22 | 29 | 2 | 0.153333 | 0.120000 | 0.043196 |
+| `page-count-06__ink-bucket-01` | 31 | 6 | 2 | 0.032222 | 0.130000 | 0.096167 |
+| `page-count-05__ink-bucket-02` | 16 | 18 | 0 | 0.112222 | 0.000000 | 0.033225 |
+
+The first two three-page layout families alone account for 11.634243 of the
+19.628146-point residual. This is a prioritization result, not proof that page
+count or ink density causes the errors.
+
+### Confidence-bucket loss
+
+Fixed confidence deciles use final submitted confidence only. Exact confidence
+values and case identities are not emitted. One under-`K` fixed decile and one
+complementary decile are coarsened into a 21-case suppression pool. This keeps
+the allocation complete without revealing either category's individual
+support. No emitted category has support below 10.
+
+| Confidence | Cases | Field misses | Wrong decisions | Extraction loss | Classification loss | Calibration loss |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0.5-0.6` | 97 | 146 | 43 | 0.948889 | 2.760000 | 0.960931 |
+| `0.2-0.3` | 79 | 79 | 53 | 0.523333 | 3.180000 | 0.718878 |
+| `0.9-1.0` | 661 | 493 | 5 | 2.715556 | 0.340000 | 0.210072 |
+| `0.0-0.1` | 30 | 22 | 27 | 0.151111 | 1.620000 | 0.108546 |
+| `0.3-0.4` | 23 | 37 | 13 | 0.221111 | 0.780000 | 0.236346 |
+| `0.1-0.2` | 20 | 21 | 17 | 0.103333 | 1.020000 | 0.101172 |
+| `0.4-0.5` | 27 | 20 | 13 | 0.141111 | 0.780000 | 0.268699 |
+| `<suppressed_low_support>` | 21 | 37 | 8 | 0.213333 | 0.510000 | 0.189825 |
+| `0.8-0.9` | 42 | 19 | 7 | 0.104444 | 0.490000 | 0.231455 |
+
+### Runtime cost
+
+The governed baseline ledger records 2,567.7 seconds for the 1,000-case run
+(`experiment_ledger.jsonl` sequence 1, record hash
+`769b6ef7c1297cbddc32c0440d8b601e58850fc0fdc84391a0355b1454d58881`),
+or 2.5677 seconds per case on average. That is a measured whole-run cost.
+Because the frozen run did not retain per-case timings, allocating score loss
+to runtime buckets remains blocked rather than inferred from page family.
+
+### Current-source trace blockers
+
+The frozen evaluator artifacts and output rows do not contain:
+
+- provenance route;
+- applicant-linking state;
+- evidence-conflict category;
+- accepted OCR/recovery path; or
+- final policy-trace category.
+
+`scripts/score_loss_atlas.py` now accepts an optional development-only
+`--trace-dimensions` JSON artifact. Its exact versioned schema carries source
+revision and input-tree identifiers and binds the truth SHA-256, submission
+SHA-256, record count, and rows. The CLI computes the supplied file's SHA-256
+itself. Source revision and input tree remain self-declared until compared with
+an authoritative frozen-run manifest, so any supplied trace stays
+`auxiliary_historical`. Each row contains exactly `case_id`, the five trace
+dimensions, and `runtime_seconds`. Every trace category must belong to that
+dimension's versioned allowlist. The tool rejects missing or extra cases,
+unexpected fields, mismatched truth/submission hashes, malformed source/input
+identifiers, non-finite runtime, and duplicate case IDs.
+
+The committed atlas remains aggregate-only. Literal categories require
+`K=10`. Under-K categories may share a suppression bucket only when that
+bucket itself has at least ten cases; otherwise the residual is omitted.
+Neither case IDs nor trace rows are retained.
+
+No exact-case trace from the frozen `bf6c009` source and its exact input tree
+exists, so those five
+measurements cannot be backfilled honestly. A fresh current-source capture is
+required before WO-13 can claim those dimensions as measured. Downstream
+32-case WO-14/WO-17 observations are not substituted because they use
+different revisions and populations.
+
+Damage profile and difficulty also remain unmeasurable: those columns are
+empty in the public truth and case-score artifacts. No private metadata is
+invented.
 
 ## Oracle ceilings
 
@@ -222,10 +323,19 @@ python3 scripts/score_loss_atlas.py \
   --submission /tmp/full1000-predictions.jsonl \
   --evaluation /tmp/full1000-evaluation.json \
   --case-scores /tmp/full1000-case-scores.jsonl \
+  --layout-manifest /tmp/full1000-layout-manifest.json \
   --output-json /tmp/full1000-score-loss-atlas.json \
   --output-markdown /tmp/full1000-score-loss-atlas.md \
   --target-score 148
 ```
+
+This checked-in Markdown is a curated narrative over the validated aggregates;
+the command produces the canonical machine-rendered tables used to verify it
+and is not expected to reproduce this narrative byte-for-byte.
+
+Add `--trace-dimensions /tmp/full1000-trace-dimensions.json` only when a
+source-bound exact-case capture exists. Without it, the tool records the five
+trace dimensions as blockers.
 
 `scripts/score_loss_atlas.py`, this report, truth labels, predictions, and
 case-level evaluator output are development-only. The submitted Dockerfile

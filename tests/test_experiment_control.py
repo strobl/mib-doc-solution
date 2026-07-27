@@ -95,6 +95,51 @@ class CanonicalHashChainStoreTests(TemporaryDirectoryTestCase):
 
 
 class ExperimentLedgerTests(TemporaryDirectoryTestCase):
+    @staticmethod
+    def plan(**overrides):
+        value = {
+            "changed_files": [
+                "devtools/experiment_control.py",
+                "tests/test_experiment_control.py",
+            ],
+            "evidence_label": "public_grouped_robustness_not_unseen",
+            "evaluator_sha256": SHA_A,
+            "expected_record_count": 8,
+            "hypothesis_sha256": SHA_A,
+            "input_tree_sha256": SHA_A,
+            "parent_commit_sha": "c" * 40,
+            "primary_variable_sha256": SHA_B,
+            "runtime_contract_sha256": SHA_A,
+            "split_manifest_sha256": SHA_A,
+            "truth_sha256": SHA_A,
+        }
+        value.update(overrides)
+        return value
+
+    @staticmethod
+    def result(**overrides):
+        value = {
+            "checks": {
+                "baseline_verified": True,
+                "deterministic": True,
+                "runtime_leakage_clean": True,
+            },
+            "evaluator_sha256": SHA_A,
+            "expected_record_count": 8,
+            "input_tree_sha256": SHA_A,
+            "metrics": {
+                "invalid_records": 0,
+                "missing_records": 0,
+                "record_count": 8,
+                "runtime_seconds": 1.0,
+            },
+            "runtime_contract_sha256": SHA_A,
+            "split_manifest_sha256": SHA_A,
+            "truth_sha256": SHA_A,
+        }
+        value.update(overrides)
+        return value
+
     def test_records_aggregate_evidence_and_makes_identical_retry_idempotent(self):
         ledger = ExperimentLedger(self.root / "experiments.jsonl")
         first = ledger.record(
@@ -117,6 +162,74 @@ class ExperimentLedgerTests(TemporaryDirectoryTestCase):
         with self.assertRaises(ExperimentControlError):
             ledger.record("exp-001", {"total_score": 131.0})
         self.assertEqual(ledger.store.length, 1)
+
+    def test_preregister_then_record_result_are_distinct_and_bound(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        plan = ledger.preregister("wo12-demo", self.plan())
+        retry = ledger.preregister(
+            "wo12-demo",
+            self.plan(changed_files=list(reversed(self.plan()["changed_files"]))),
+        )
+        result = ledger.record_result(
+            "wo12-demo",
+            self.result(),
+            decision="reject",
+            rationale="no_runtime_candidate",
+            expected_head=plan["record_hash"],
+        )
+
+        self.assertEqual(plan, retry)
+        self.assertEqual(plan["payload"]["event"], "experiment_plan")
+        self.assertEqual(result["payload"]["event"], "experiment_result")
+        self.assertEqual(
+            result["payload"]["plan_record_hash"],
+            plan["record_hash"],
+        )
+        self.assertEqual(len(ledger.plans()), 1)
+        self.assertEqual(len(ledger.results()), 1)
+
+    def test_two_stage_contract_fails_closed(self):
+        ledger = ExperimentLedger(self.root / "experiments.jsonl")
+        with self.assertRaises(ExperimentControlError):
+            ledger.record_result(
+                "missing-plan",
+                self.result(),
+                decision="reject",
+                rationale="missing_plan",
+            )
+
+        ledger.preregister("bound-plan", self.plan())
+        mismatched = self.result(input_tree_sha256=SHA_B)
+        with self.assertRaises(ExperimentControlError):
+            ledger.record_result(
+                "bound-plan",
+                mismatched,
+                decision="reject",
+                rationale="population_mismatch",
+            )
+        leaked = self.result()
+        leaked["metrics"]["notes"] = "MIB-000042.pdf"
+        with self.assertRaises(LeakageError):
+            ledger.record_result(
+                "bound-plan",
+                leaked,
+                decision="reject",
+                rationale="identity_leakage",
+            )
+
+        ledger.record_result(
+            "bound-plan",
+            self.result(),
+            decision="reject",
+            rationale="no_runtime_candidate",
+        )
+        with self.assertRaises(ExperimentControlError):
+            ledger.record_result(
+                "bound-plan",
+                self.result(),
+                decision="reject",
+                rationale="duplicate_result",
+            )
 
     def test_rejects_nested_case_ids_filenames_and_case_level_keys(self):
         ledger = ExperimentLedger(self.root / "experiments.jsonl")

@@ -15,6 +15,7 @@ import hashlib
 import itertools
 import json
 import math
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -65,8 +66,84 @@ OUTPUT_DEFAULTS = {
     "fee_status": "paid",
 }
 SENSITIVE_MODAL_FIELDS = {"applicant_name", "sponsor_id", "arrival_date"}
-SAFE_LITERAL_MODAL_MIN_SUPPORT = 3
+SAFE_LITERAL_MODAL_MIN_SUPPORT = 10
 FLOAT_TOLERANCE = 1e-9
+DIMENSION_MIN_SUPPORT = 10
+TRACE_DIMENSIONS = (
+    "provenance_route",
+    "applicant_linking_state",
+    "evidence_conflict",
+    "ocr_recovery_path",
+    "policy_trace",
+)
+REQUIRED_ATLAS_DIMENSIONS = (
+    "field",
+    "adjudication_confusion",
+    "page_template_family",
+    *TRACE_DIMENSIONS,
+    "confidence_bucket",
+    "runtime_cost",
+)
+_DIMENSION_CATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,95}$")
+_LAYOUT_CATEGORY_RE = re.compile(
+    r"^page-count-[0-9]{2}__ink-bucket-[0-9]{2}$"
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+TRACE_CATEGORY_ENUMS = {
+    "provenance_route": frozenset(
+        {
+            "visible_ocr",
+            "authoritative_source",
+            "mixed_visible_sources",
+            "no_accepted_provenance",
+            "unknown",
+        }
+    ),
+    "applicant_linking_state": frozenset(
+        {
+            "linked_unique",
+            "linked_ambiguous",
+            "unlinked",
+            "authoritative_scope",
+            "unknown",
+        }
+    ),
+    "evidence_conflict": frozenset(
+        {
+            "none",
+            "field_conflict",
+            "identity_conflict",
+            "authority_conflict",
+            "multiple_conflicts",
+            "unknown",
+        }
+    ),
+    "ocr_recovery_path": frozenset(
+        {
+            "primary",
+            "consensus_retry",
+            "sparse_intake_retry",
+            "orientation_retry",
+            "risk_flag_retry",
+            "targeted_rapidocr",
+            "multiple_recovery_paths",
+            "no_visible_ocr",
+            "unknown",
+        }
+    ),
+    "policy_trace": frozenset(
+        {
+            "binding_authority",
+            "deterministic_policy",
+            "revalidated_policy",
+            "recovery_review",
+            "recovery_denial",
+            "needs_review_conflict",
+            "unknown",
+        }
+    ),
+}
 
 
 class AtlasInputError(ValueError):
@@ -730,6 +807,550 @@ def _empirical_calibration_ceiling(
     }
 
 
+def _dimension_category(
+    value: Any,
+    *,
+    dimension: str,
+    allowed: frozenset[str] | None = None,
+) -> str:
+    category = str(value or "").strip().casefold()
+    if not _DIMENSION_CATEGORY_RE.fullmatch(category):
+        raise AtlasInputError(
+            f"{dimension} category must be a generic lower-case token"
+        )
+    if re.fullmatch(r"mib-[0-9]{6}", category):
+        raise AtlasInputError(f"{dimension} category resembles a case identifier")
+    if allowed is not None and category not in allowed:
+        raise AtlasInputError(
+            f"{dimension} category is not in the versioned allowlist"
+        )
+    return category
+
+
+def _dimension_labels(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    case_ids: set[str],
+    dimension: str,
+    value_key: str,
+    exact_keys: set[str],
+) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for row in rows:
+        if set(row) != exact_keys:
+            raise AtlasInputError(
+                f"{dimension} rows must contain exactly {sorted(exact_keys)}"
+            )
+        case_id = str(row.get("case_id", "")).strip()
+        if not case_id:
+            raise AtlasInputError(f"{dimension} contains an empty case_id")
+        if case_id in labels:
+            raise AtlasInputError(f"{dimension} contains duplicate case_id values")
+        labels[case_id] = _dimension_category(
+            row.get(value_key),
+            dimension=dimension,
+        )
+    if set(labels) != case_ids:
+        raise AtlasInputError(
+            f"{dimension} must cover exactly the evaluated case set"
+        )
+    return labels
+
+
+def _loss_by_dimension(
+    *,
+    labels: Mapping[str, str],
+    scored: Mapping[str, Mapping[str, Any]],
+    per_case: Mapping[str, Mapping[str, Any]],
+    components: Mapping[str, float],
+    suppress_low_support: bool = True,
+) -> dict[str, Any]:
+    raw_support = Counter(labels.values())
+    low_support_categories = {
+        category
+        for category, support in raw_support.items()
+        if suppress_low_support and support < DIMENSION_MIN_SUPPORT
+    }
+    raw_low_support = sum(
+        support
+        for category, support in raw_support.items()
+        if category in low_support_categories
+    )
+    suppressed_categories = set(low_support_categories)
+    complementary_category: str | None = None
+    if low_support_categories and raw_low_support < DIMENSION_MIN_SUPPORT:
+        candidates = [
+            (support, category)
+            for category, support in raw_support.items()
+            if category not in low_support_categories
+        ]
+        if candidates:
+            _, complementary_category = min(candidates)
+            suppressed_categories.add(complementary_category)
+    suppression_pool_support = sum(
+        support
+        for category, support in raw_support.items()
+        if category in suppressed_categories
+    )
+    emit_low_support_pool = (
+        bool(suppressed_categories)
+        and suppression_pool_support >= DIMENSION_MIN_SUPPORT
+    )
+    extraction_max_raw = sum(
+        float(case["extraction_max_raw"]) for case in scored.values()
+    )
+    classification_max_raw = sum(
+        float(case["classification_max_raw"]) for case in scored.values()
+    )
+    calibration_gap = components["calibration_max"] - components["calibration"]
+    total_brier_sum = sum(
+        float(case["confidence_brier"]) for case in scored.values()
+    )
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for case_id, category in labels.items():
+        if category in suppressed_categories:
+            if not emit_low_support_pool:
+                continue
+            safe_category = "<suppressed_low_support>"
+        else:
+            safe_category = category
+        grouped[safe_category].append(case_id)
+
+    groups: list[dict[str, Any]] = []
+    for category, case_ids in grouped.items():
+        extraction_raw_loss = 0.0
+        classification_raw_loss = 0.0
+        brier_sum = 0.0
+        field_misses = 0
+        wrong_decisions = 0
+        for case_id in case_ids:
+            case = scored[case_id]
+            extraction_raw_loss += (
+                float(case["extraction_max_raw"])
+                - float(case["extraction_raw"])
+            )
+            classification_raw_loss += (
+                float(case["classification_max_raw"])
+                - float(case["classification_raw"])
+            )
+            brier_sum += float(case["confidence_brier"])
+            field_misses += len(per_case[case_id]["missed_fields"])
+            wrong_decisions += int(not per_case[case_id]["decision_correct"])
+        extraction_loss = (
+            extraction_raw_loss
+            / extraction_max_raw
+            * components["extraction_max"]
+            if extraction_max_raw
+            else 0.0
+        )
+        classification_loss = (
+            classification_raw_loss
+            / classification_max_raw
+            * components["classification_max"]
+            if classification_max_raw
+            else 0.0
+        )
+        calibration_loss = (
+            calibration_gap * brier_sum / total_brier_sum
+            if total_brier_sum
+            else 0.0
+        )
+        groups.append(
+            {
+                "category": category,
+                "case_count": len(case_ids),
+                "case_share": len(case_ids) / len(scored) if scored else 0.0,
+                "field_misses": field_misses,
+                "wrong_decision_cases": wrong_decisions,
+                "extraction_score_loss": extraction_loss,
+                "classification_score_loss": classification_loss,
+                "calibration_score_loss_contribution": calibration_loss,
+                "accounted_score_loss": (
+                    extraction_loss + classification_loss + calibration_loss
+                ),
+            }
+        )
+    groups.sort(
+        key=lambda item: (
+            -item["accounted_score_loss"],
+            -item["case_count"],
+            item["category"],
+        )
+    )
+    return {
+        "case_count": len(scored),
+        "emitted_case_count": sum(group["case_count"] for group in groups),
+        "emitted_category_count": len(groups),
+        "low_support_case_count": (
+            raw_low_support
+            if emit_low_support_pool and complementary_category is None
+            else None
+        ),
+        "suppression_pool_case_count": (
+            suppression_pool_support if emit_low_support_pool else None
+        ),
+        "low_support_pool_emitted": emit_low_support_pool,
+        "complementary_suppression_applied": complementary_category is not None,
+        "under_k_residual_omitted": bool(
+            low_support_categories and not emit_low_support_pool
+        ),
+        "minimum_literal_support": (
+            DIMENSION_MIN_SUPPORT if suppress_low_support else 1
+        ),
+        "groups": groups,
+    }
+
+
+def _confidence_bucket(confidence: float, valid: bool) -> str:
+    if not valid:
+        return "invalid"
+    bucket = min(9, int(confidence * 10.0))
+    return f"{bucket / 10:.1f}-{(bucket + 1) / 10:.1f}"
+
+
+def _runtime_bucket(runtime_seconds: float) -> str:
+    if runtime_seconds < 1.0:
+        return "under_1s"
+    if runtime_seconds < 2.0:
+        return "1s_to_under_2s"
+    if runtime_seconds < 4.0:
+        return "2s_to_under_4s"
+    if runtime_seconds < 8.0:
+        return "4s_to_under_8s"
+    return "8s_or_more"
+
+
+def _blocked_dimension(reason: str, required_input: str) -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "reason": reason,
+        "required_input": required_input,
+    }
+
+
+def _layout_evidence(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    payload = _read_json(path)
+    if not isinstance(payload, Mapping):
+        raise AtlasInputError("layout manifest must be an object")
+    if payload.get("schema") != "mib-wo12-layout-groups/v2":
+        raise AtlasInputError("layout manifest schema is unsupported")
+    if payload.get("label_blind_construction") is not True:
+        raise AtlasInputError("layout manifest must attest label-blind construction")
+    layout_signature = payload.get("layout_signature")
+    if not isinstance(layout_signature, Mapping):
+        raise AtlasInputError("layout manifest layout_signature must be an object")
+    if layout_signature.get("version") != "page-count-plus-first-page-ink-v1":
+        raise AtlasInputError("layout signature version is unsupported")
+    cases = payload.get("cases")
+    if not isinstance(cases, list):
+        raise AtlasInputError("layout manifest cases must be an array")
+    rows: list[dict[str, Any]] = []
+    for item in cases:
+        if not isinstance(item, Mapping) or set(item) != {
+            "case_id",
+            "layout_group",
+        }:
+            raise AtlasInputError(
+                "layout manifest cases must contain only case_id and layout_group"
+            )
+        layout_group = item["layout_group"]
+        if (
+            not isinstance(layout_group, str)
+            or not _LAYOUT_CATEGORY_RE.fullmatch(layout_group)
+        ):
+            raise AtlasInputError(
+                "layout_group must match the canonical "
+                "page-count-NN__ink-bucket-NN schema"
+            )
+        rows.append(dict(item))
+    return rows, {
+        "file_sha256": _sha256_path(path),
+        "schema": payload["schema"],
+        "layout_signature_version": layout_signature["version"],
+        "label_blind_construction": True,
+    }
+
+
+def _trace_evidence(
+    path: Path,
+    *,
+    source_sha256: Mapping[str, str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    payload = _read_json(path)
+    expected_keys = {
+        "schema_version",
+        "source_revision_sha",
+        "input_tree_sha256",
+        "truth_sha256",
+        "submission_sha256",
+        "case_count",
+        "rows",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise AtlasInputError(
+            "trace evidence must use the exact versioned top-level schema"
+        )
+    if payload["schema_version"] != "mib-score-loss-dimension-trace/v1":
+        raise AtlasInputError("trace evidence schema_version is unsupported")
+    source_revision = str(payload["source_revision_sha"]).casefold()
+    input_tree_sha256 = str(payload["input_tree_sha256"]).casefold()
+    truth_sha256 = str(payload["truth_sha256"]).casefold()
+    submission_sha256 = str(payload["submission_sha256"]).casefold()
+    if not _REVISION_RE.fullmatch(source_revision):
+        raise AtlasInputError("trace source_revision_sha is invalid")
+    for label, digest in (
+        ("input_tree_sha256", input_tree_sha256),
+        ("truth_sha256", truth_sha256),
+        ("submission_sha256", submission_sha256),
+    ):
+        if not _SHA256_RE.fullmatch(digest):
+            raise AtlasInputError(f"trace {label} is invalid")
+    if truth_sha256 != source_sha256["truth"]:
+        raise AtlasInputError("trace truth hash does not match the atlas source")
+    if submission_sha256 != source_sha256["submission"]:
+        raise AtlasInputError("trace submission hash does not match the atlas source")
+    rows = payload["rows"]
+    if not isinstance(rows, list) or payload["case_count"] != len(rows):
+        raise AtlasInputError("trace case_count does not match rows")
+    if not isinstance(payload["case_count"], int) or payload["case_count"] < 1:
+        raise AtlasInputError("trace case_count must be a positive integer")
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise AtlasInputError("trace rows must be objects")
+    return [dict(row) for row in rows], {
+        "file_sha256": _sha256_path(path),
+        "schema_version": payload["schema_version"],
+        "source_revision_sha": source_revision,
+        "input_tree_sha256": input_tree_sha256,
+        "truth_sha256": truth_sha256,
+        "submission_sha256": submission_sha256,
+    }
+
+
+def _build_dimension_atlas(
+    *,
+    predictions: Mapping[str, Mapping[str, Any]],
+    scored: Mapping[str, Mapping[str, Any]],
+    per_case: Mapping[str, Mapping[str, Any]],
+    components: Mapping[str, float],
+    source_sha256: Mapping[str, str],
+    layout_manifest_path: Path | None,
+    trace_dimensions_path: Path | None,
+) -> tuple[dict[str, Any], list[dict[str, str]], dict[str, str]]:
+    case_ids = set(scored)
+    evidence_hashes: dict[str, str] = {}
+
+    confidence_labels = {
+        case_id: _confidence_bucket(
+            per_case[case_id]["confidence"],
+            per_case[case_id]["confidence_valid"],
+        )
+        for case_id in sorted(case_ids)
+    }
+    dimensions: dict[str, Any] = {
+        "confidence_bucket": {
+            **_loss_by_dimension(
+                labels=confidence_labels,
+                scored=scored,
+                per_case=per_case,
+                components=components,
+            ),
+            "status": "frozen_baseline",
+            "source": "final_submitted_confidence",
+            "bucket_definition": "fixed_deciles_left_closed_right_open_except_1.0",
+        }
+    }
+
+    if layout_manifest_path is None:
+        dimensions["page_template_family"] = _blocked_dimension(
+            "No label-blind layout manifest was supplied.",
+            "--layout-manifest",
+        )
+    else:
+        layout_rows, layout_binding = _layout_evidence(layout_manifest_path)
+        evidence_hashes["layout_manifest"] = layout_binding["file_sha256"]
+        layout_labels = _dimension_labels(
+            layout_rows,
+            case_ids=case_ids,
+            dimension="page_template_family",
+            value_key="layout_group",
+            exact_keys={"case_id", "layout_group"},
+        )
+        dimensions["page_template_family"] = {
+            **_loss_by_dimension(
+                labels=layout_labels,
+                scored=scored,
+                per_case=per_case,
+                components=components,
+            ),
+            "status": "auxiliary_historical",
+            "source": "label_blind_layout_manifest",
+            "binding": {
+                **layout_binding,
+                "exact_case_set_verified": True,
+                "exact_source_revision_verified": False,
+                "input_tree_sha256_verified": False,
+            },
+            "qualification": (
+                "Auxiliary only: the manifest has exact case coverage but does "
+                "not bind the frozen baseline source revision and input tree."
+            ),
+        }
+
+    trace_by_case: dict[str, Mapping[str, Any]] | None = None
+    expected_trace_keys = {"case_id", *TRACE_DIMENSIONS, "runtime_seconds"}
+    trace_binding: dict[str, Any] | None = None
+    if trace_dimensions_path is not None:
+        trace_rows, trace_binding = _trace_evidence(
+            trace_dimensions_path,
+            source_sha256=source_sha256,
+        )
+        evidence_hashes["trace_dimensions"] = trace_binding["file_sha256"]
+        trace_by_case = {}
+        for row in trace_rows:
+            if set(row) != expected_trace_keys:
+                raise AtlasInputError(
+                    "trace rows must contain exactly "
+                    f"{sorted(expected_trace_keys)}"
+                )
+            case_id = str(row.get("case_id", "")).strip()
+            if not case_id:
+                raise AtlasInputError("trace rows contain an empty case_id")
+            if case_id in trace_by_case:
+                raise AtlasInputError("trace rows contain duplicate case_id values")
+            try:
+                runtime_seconds = float(row["runtime_seconds"])
+            except (TypeError, ValueError) as exc:
+                raise AtlasInputError(
+                    "trace runtime_seconds must be numeric"
+                ) from exc
+            if not math.isfinite(runtime_seconds) or runtime_seconds < 0.0:
+                raise AtlasInputError(
+                    "trace runtime_seconds must be finite and non-negative"
+                )
+            normalized = {
+                "case_id": case_id,
+                "runtime_seconds": runtime_seconds,
+            }
+            for dimension in TRACE_DIMENSIONS:
+                normalized[dimension] = _dimension_category(
+                    row[dimension],
+                    dimension=dimension,
+                    allowed=TRACE_CATEGORY_ENUMS[dimension],
+                )
+            trace_by_case[case_id] = normalized
+        if set(trace_by_case) != case_ids:
+            raise AtlasInputError(
+                "trace dimensions must cover exactly the evaluated case set"
+            )
+
+    for dimension in TRACE_DIMENSIONS:
+        if trace_by_case is None:
+            dimensions[dimension] = _blocked_dimension(
+                "The frozen evaluator artifacts do not contain this production trace.",
+                "--trace-dimensions",
+            )
+            continue
+        labels = {
+            case_id: str(row[dimension])
+            for case_id, row in trace_by_case.items()
+        }
+        dimensions[dimension] = {
+            **_loss_by_dimension(
+                labels=labels,
+                scored=scored,
+                per_case=per_case,
+                components=components,
+            ),
+            "status": "auxiliary_historical",
+            "source": "development_only_trace",
+            "binding": {
+                **dict(trace_binding or {}),
+                "source_revision_verified_against_authority": False,
+                "input_tree_verified_against_authority": False,
+            },
+            "qualification": (
+                "Auxiliary only: the file, schema, truth, and evaluated output "
+                "are bound. Source revision and input tree are self-declared "
+                "metadata without an authoritative frozen-baseline comparison."
+            ),
+        }
+
+    if trace_by_case is not None:
+        runtime_labels = {
+            case_id: _runtime_bucket(float(row["runtime_seconds"]))
+            for case_id, row in trace_by_case.items()
+        }
+        total_runtime = sum(
+            float(row["runtime_seconds"]) for row in trace_by_case.values()
+        )
+        dimensions["runtime_cost"] = {
+            **_loss_by_dimension(
+                labels=runtime_labels,
+                scored=scored,
+                per_case=per_case,
+                components=components,
+            ),
+            "status": "auxiliary_historical",
+            "source": "development_only_trace",
+            "binding": {
+                **dict(trace_binding or {}),
+                "source_revision_verified_against_authority": False,
+                "input_tree_verified_against_authority": False,
+            },
+            "total_runtime_seconds": total_runtime,
+            "mean_runtime_seconds_per_case": (
+                total_runtime / len(trace_by_case) if trace_by_case else 0.0
+            ),
+            "bucket_definition": (
+                "under_1s,1s_to_under_2s,2s_to_under_4s,"
+                "4s_to_under_8s,8s_or_more"
+            ),
+        }
+    else:
+        dimensions["runtime_cost"] = _blocked_dimension(
+            "No source-bound per-case runtime trace was supplied; the committed "
+            "report separately cites the frozen whole-run ledger total.",
+            "--trace-dimensions",
+        )
+
+    coverage = {
+        "field": "frozen_baseline",
+        "adjudication_confusion": "frozen_baseline",
+        **{
+            dimension: details["status"]
+            for dimension, details in dimensions.items()
+        },
+    }
+    if set(coverage) != set(REQUIRED_ATLAS_DIMENSIONS):
+        raise AssertionError("required dimension coverage is incomplete")
+    blockers: list[dict[str, str]] = []
+    for dimension in REQUIRED_ATLAS_DIMENSIONS:
+        status = coverage[dimension]
+        if status in {"frozen_baseline", "current_source"}:
+            continue
+        if status == "auxiliary_historical":
+            blockers.append(
+                {
+                    "dimension": dimension,
+                    "status": status,
+                    "reason": (
+                        "Auxiliary evidence is not exact current-source evidence "
+                        "for the frozen baseline."
+                    ),
+                }
+            )
+            continue
+        details = dimensions[dimension]
+        blockers.append(
+            {
+                "dimension": dimension,
+                "status": status,
+                "reason": str(details["reason"]),
+            }
+        )
+    return dimensions, blockers, evidence_hashes
+
+
 def build_atlas(
     *,
     truth_rows: Sequence[Mapping[str, Any]],
@@ -738,6 +1359,8 @@ def build_atlas(
     case_scores: Sequence[Mapping[str, Any]],
     target_score: float = 148.0,
     source_sha256: Mapping[str, str] | None = None,
+    layout_manifest_path: Path | None = None,
+    trace_dimensions_path: Path | None = None,
 ) -> dict[str, Any]:
     """Return aggregate score losses after cross-artifact validation."""
 
@@ -897,12 +1520,32 @@ def build_atlas(
         ),
         key=lambda item: (-item["classification_score_loss"], item["confusion"]),
     )
+    dimension_atlas, dimension_blockers, dimension_hashes = (
+        _build_dimension_atlas(
+            predictions=predictions,
+            scored=scored,
+            per_case=validated["per_case"],
+            components=components,
+            source_sha256=hashes,
+            layout_manifest_path=layout_manifest_path,
+            trace_dimensions_path=trace_dimensions_path,
+        )
+    )
+    dimension_coverage = {
+        "field": "frozen_baseline",
+        "adjudication_confusion": "frozen_baseline",
+        **{
+            dimension: details["status"]
+            for dimension, details in dimension_atlas.items()
+        },
+    }
 
     return {
-        "report_version": "mib_score_loss_atlas_v2",
+        "report_version": "mib_score_loss_atlas_v3",
         "evidence_class": "public_full_training_diagnostic_not_unseen",
         "source_sha256": hashes,
         "source_hash_basis": hash_basis,
+        "dimension_source_sha256": dimension_hashes,
         "case_count": case_count,
         "target_score": target_score,
         "current_scores": {
@@ -945,6 +1588,9 @@ def build_atlas(
         ),
         "confusion_losses": confusion_groups,
         "confusion_priority": confusion_priority,
+        "required_dimension_coverage": dimension_coverage,
+        "dimension_atlas": dimension_atlas,
+        "dimension_measurement_blockers": dimension_blockers,
         "calibration": {
             "mean_brier": float(evaluation["raw"]["mean_confidence_brier"]),
             "score_loss": calibration_gap,
@@ -986,6 +1632,8 @@ def build_atlas(
             "Field corrections can change adjudication and confidence, so component effects are not causally independent.",
             "Public labels may omit private difficulty, damage-profile, trap, and unrecoverable-field metadata.",
             "Exact confidence values and low-support or sensitive modal outputs are suppressed.",
+            "Trace dimensions remain blocked unless an exact-case current-source development capture is supplied.",
+            "Whole-run runtime cannot allocate loss by cost bucket without per-case timings.",
             "The report contains aggregates only and must never be converted into runtime per-case rules.",
         ],
     }
@@ -1013,6 +1661,8 @@ def render_markdown(atlas: Mapping[str, Any]) -> str:
     ]
     for name, digest in atlas["source_sha256"].items():
         lines.append(f"- `{name}` SHA-256: `{digest}`")
+    for name, digest in atlas["dimension_source_sha256"].items():
+        lines.append(f"- Dimension evidence `{name}` SHA-256: `{digest}`")
     lines.extend(
         [
             "",
@@ -1116,10 +1766,82 @@ def render_markdown(atlas: Mapping[str, Any]) -> str:
             "",
             empirical_ceiling["interpretation"],
             "",
-            "## Oracle ceilings",
+            "## Required dimension coverage",
             "",
+            "| Dimension | Status |",
+            "| --- | --- |",
         ]
     )
+    for dimension in REQUIRED_ATLAS_DIMENSIONS:
+        lines.append(
+            f"| `{dimension}` | "
+            f"`{atlas['required_dimension_coverage'][dimension]}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "Field and adjudication-confusion loss are quantified above. "
+            "The tables below allocate loss across emitted K-safe groups. "
+            "A dimension is only a complete reconciliation when no under-K "
+            "residual was omitted.",
+        ]
+    )
+    for dimension in (
+        "page_template_family",
+        *TRACE_DIMENSIONS,
+        "confidence_bucket",
+        "runtime_cost",
+    ):
+        details = atlas["dimension_atlas"][dimension]
+        lines.extend(["", f"### {dimension.replace('_', ' ').title()}", ""])
+        if "groups" in details:
+            lines.append(f"- Status: `{details['status']}`")
+            if details.get("qualification"):
+                lines.append(f"- Qualification: {details['qualification']}")
+            if details.get("complementary_suppression_applied"):
+                lines.append(
+                    "- Complementary suppression: an additional category was "
+                    "coarsened into the K-safe suppression pool"
+                )
+            if details["emitted_case_count"] < details["case_count"]:
+                lines.append(
+                    "- Under-K residual: omitted from the aggregate output"
+                )
+            lines.append("")
+            lines.extend(
+                [
+                    "| Category | Cases | Field misses | Wrong decisions | "
+                    "Extraction loss | Classification loss | Calibration loss |",
+                    "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for group in details["groups"]:
+                lines.append(
+                    f"| `{group['category']}` | {group['case_count']} | "
+                    f"{group['field_misses']} | "
+                    f"{group['wrong_decision_cases']} | "
+                    f"{group['extraction_score_loss']:.6f} | "
+                    f"{group['classification_score_loss']:.6f} | "
+                    f"{group['calibration_score_loss_contribution']:.6f} |"
+                )
+        else:
+            lines.extend(
+                [
+                    f"- Status: `{details['status']}`",
+                    f"- Reason: {details['reason']}",
+                    f"- Required input: `{details['required_input']}`",
+                ]
+            )
+    lines.extend(["", "### Remaining measurement blockers", ""])
+    if atlas["dimension_measurement_blockers"]:
+        for blocker in atlas["dimension_measurement_blockers"]:
+            lines.append(
+                f"- `{blocker['dimension']}` (`{blocker['status']}`): "
+                f"{blocker['reason']}"
+            )
+    else:
+        lines.append("- None.")
+    lines.extend(["", "## Oracle ceilings", ""])
     for name, value in atlas["oracle_ceilings"].items():
         lines.append(f"- `{name}`: {value:.6f}/150")
     lines.extend(["", "## Limitations", ""])
@@ -1146,12 +1868,25 @@ def main() -> int:
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown", required=True)
     parser.add_argument("--target-score", type=float, default=148.0)
+    parser.add_argument(
+        "--layout-manifest",
+        help="label-blind exact-case layout manifest for page/template loss",
+    )
+    parser.add_argument(
+        "--trace-dimensions",
+        help=(
+            "versioned development-only JSON trace evidence with exact-case "
+            "allowlisted categories and per-case runtime"
+        ),
+    )
     args = parser.parse_args()
 
     truth_path = Path(args.truth)
     submission_path = Path(args.submission)
     evaluation_path = Path(args.evaluation)
     case_scores_path = Path(args.case_scores)
+    layout_path = Path(args.layout_manifest) if args.layout_manifest else None
+    trace_path = Path(args.trace_dimensions) if args.trace_dimensions else None
     atlas = build_atlas(
         truth_rows=_read_csv(truth_path),
         prediction_rows=_prediction_rows(submission_path),
@@ -1164,6 +1899,8 @@ def main() -> int:
             "evaluation": _sha256_path(evaluation_path),
             "case_scores": _sha256_path(case_scores_path),
         },
+        layout_manifest_path=layout_path,
+        trace_dimensions_path=trace_path,
     )
     _write_json(Path(args.output_json), atlas)
     markdown_path = Path(args.output_markdown)

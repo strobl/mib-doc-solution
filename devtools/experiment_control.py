@@ -165,8 +165,10 @@ _AGGREGATE_SEQUENCE_KEYS = frozenset(
 )
 _AGGREGATE_STRING_KEYS = frozenset(
     {
+        "comparison_scope",
         "evidence_label",
         "evaluation_mode",
+        "invocation_scope",
         "release_tier",
         "status",
     }
@@ -178,13 +180,49 @@ _AGGREGATE_STRING_VALUES = frozenset(
         "blocked",
         "candidate",
         "failed",
+        "fusion_vs_legacy_resolver_after_current_case_linking",
         "local",
+        "accepted_final_fusion_result_per_case",
         "passed",
         "protected",
         "public_grouped_robustness_not_unseen",
         "verified",
     }
 )
+_EXPERIMENT_PLAN_KEYS = frozenset(
+    {
+        "changed_files",
+        "evidence_label",
+        "evaluator_sha256",
+        "expected_record_count",
+        "hypothesis_sha256",
+        "input_tree_sha256",
+        "parent_commit_sha",
+        "primary_variable_sha256",
+        "runtime_contract_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    }
+)
+_EXPERIMENT_PLAN_SHA256_KEYS = frozenset(
+    {
+        "evaluator_sha256",
+        "hypothesis_sha256",
+        "input_tree_sha256",
+        "primary_variable_sha256",
+        "runtime_contract_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    }
+)
+_EXPERIMENT_EVIDENCE_LABELS = frozenset(
+    {
+        "aggregate_only",
+        "protected",
+        "public_grouped_robustness_not_unseen",
+    }
+)
+_EXPERIMENT_RESULT_DECISIONS = frozenset({"adopt", "reject", "rollback"})
 
 
 class ExperimentControlError(ValueError):
@@ -233,6 +271,135 @@ def _record_hash(sequence: int, previous_hash: str, payload: Mapping[str, Any]) 
         "sequence": sequence,
     }
     return _sha256_bytes(canonical_json(unsigned).encode("utf-8"))
+
+
+def _require_sha256(name: str, value: Any) -> str:
+    normalized = str(value).strip().lower()
+    if not _SHA256_RE.fullmatch(normalized):
+        raise ExperimentControlError(f"{name} must be a SHA-256 hex digest")
+    return normalized
+
+
+def _normalize_experiment_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one immutable, non-identifying pre-execution contract."""
+
+    if not isinstance(plan, Mapping) or set(plan) != _EXPERIMENT_PLAN_KEYS:
+        raise ExperimentControlError(
+            "experiment plan must contain the exact governed schema"
+        )
+    raw_changed_files = plan["changed_files"]
+    if (
+        not isinstance(raw_changed_files, (list, tuple))
+        or not raw_changed_files
+        or len(raw_changed_files) > 64
+    ):
+        raise ExperimentControlError(
+            "experiment plan changed_files must be a non-empty bounded list"
+        )
+    changed_files: list[str] = []
+    for raw_path in raw_changed_files:
+        path = str(raw_path).strip()
+        _require_nonidentifying_control_text("changed_files", path)
+        parts = path.split("/")
+        if (
+            not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ExperimentControlError(
+                "experiment plan changed_files must be relative POSIX paths"
+            )
+        changed_files.append(path)
+    if len(set(changed_files)) != len(changed_files):
+        raise ExperimentControlError(
+            "experiment plan changed_files must not contain duplicates"
+        )
+
+    evidence_label = str(plan["evidence_label"]).strip()
+    if evidence_label not in _EXPERIMENT_EVIDENCE_LABELS:
+        raise ExperimentControlError(
+            "experiment plan evidence_label is not governed"
+        )
+    expected_record_count = plan["expected_record_count"]
+    if (
+        isinstance(expected_record_count, bool)
+        or not isinstance(expected_record_count, int)
+        or expected_record_count < 1
+    ):
+        raise ExperimentControlError(
+            "experiment plan expected_record_count must be positive"
+        )
+    parent_commit_sha = str(plan["parent_commit_sha"]).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", parent_commit_sha):
+        raise ExperimentControlError(
+            "experiment plan parent_commit_sha must be a Git SHA"
+        )
+
+    normalized = {
+        "changed_files": sorted(changed_files),
+        "evidence_label": evidence_label,
+        "expected_record_count": expected_record_count,
+        "parent_commit_sha": parent_commit_sha,
+    }
+    for key in sorted(_EXPERIMENT_PLAN_SHA256_KEYS):
+        normalized[key] = _require_sha256(key, plan[key])
+    return normalized
+
+
+def _normalize_experiment_result(
+    evidence: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate aggregate evidence and bind it to its immutable plan."""
+
+    if not isinstance(evidence, Mapping):
+        raise ExperimentControlError("experiment result evidence is required")
+    require_aggregate_only(evidence)
+    normalized = json.loads(canonical_json(dict(evidence)))
+    required = {
+        "checks",
+        "evaluator_sha256",
+        "expected_record_count",
+        "input_tree_sha256",
+        "metrics",
+        "runtime_contract_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    }
+    if not required.issubset(normalized):
+        raise ExperimentControlError(
+            "experiment result is missing governed bindings or aggregates"
+        )
+    if not isinstance(normalized["checks"], dict) or not isinstance(
+        normalized["metrics"], dict
+    ):
+        raise ExperimentControlError(
+            "experiment result checks and metrics must be objects"
+        )
+    for key, value in normalized["checks"].items():
+        if not isinstance(value, bool):
+            raise ExperimentControlError(
+                f"experiment result check must be boolean: {key}"
+            )
+    for key in (
+        "evaluator_sha256",
+        "input_tree_sha256",
+        "runtime_contract_sha256",
+        "split_manifest_sha256",
+        "truth_sha256",
+    ):
+        normalized[key] = _require_sha256(key, normalized[key])
+        if normalized[key] != plan[key]:
+            raise ExperimentControlError(
+                f"experiment result {key} does not match its plan"
+            )
+    if normalized["expected_record_count"] != plan["expected_record_count"]:
+        raise ExperimentControlError(
+            "experiment result record count does not match its plan"
+        )
+    return normalized
 
 
 def _raise_aggregate_schema(path: str, reason: str) -> None:
@@ -537,7 +704,7 @@ class CanonicalHashChainStore:
 
 
 class ExperimentLedger:
-    """Append aggregate-only experiment evidence under unique experiment IDs."""
+    """Append aggregate-only evidence under immutable two-stage contracts."""
 
     def __init__(self, path: Path | str) -> None:
         self.store = CanonicalHashChainStore(path)
@@ -547,6 +714,20 @@ class ExperimentLedger:
             dict(record["payload"])
             for record in self.store.verify()
             if record["payload"].get("event") == "experiment"
+        )
+
+    def plans(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(record["payload"])
+            for record in self.store.verify()
+            if record["payload"].get("event") == "experiment_plan"
+        )
+
+    def results(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(record["payload"])
+            for record in self.store.verify()
+            if record["payload"].get("event") == "experiment_result"
         )
 
     def record(
@@ -582,6 +763,142 @@ class ExperimentLedger:
                             f"experiment_id retry does not match original: {experiment_id}"
                         )
                     return record
+            return None
+
+        return self.store.append_transactional(
+            payload,
+            expected_head=expected_head,
+            locked_check=check,
+        )
+
+    def preregister(
+        self,
+        experiment_id: str,
+        plan: Mapping[str, Any],
+        *,
+        expected_head: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the exact plan before any candidate execution."""
+
+        experiment_id = str(experiment_id).strip()
+        if not _SAFE_DIMENSION_RE.fullmatch(experiment_id):
+            raise ExperimentControlError(
+                "experiment_id must be a non-identifying token"
+            )
+        _require_nonidentifying_control_text("experiment_id", experiment_id)
+        normalized_plan = _normalize_experiment_plan(plan)
+        payload = {
+            "event": "experiment_plan",
+            "experiment_id": experiment_id,
+            "plan": normalized_plan,
+        }
+
+        def check(
+            records: tuple[dict[str, Any], ...],
+            requested: Mapping[str, Any],
+        ) -> Mapping[str, Any] | None:
+            for record in records:
+                existing = record["payload"]
+                if existing.get("experiment_id") != experiment_id:
+                    continue
+                if existing.get("event") != "experiment_plan":
+                    raise ExperimentControlError(
+                        f"experiment_id is already used: {experiment_id}"
+                    )
+                if existing != requested:
+                    raise ExperimentControlError(
+                        "experiment plan conflicts with immutable "
+                        f"preregistration: {experiment_id}"
+                    )
+                return record
+            return None
+
+        return self.store.append_transactional(
+            payload,
+            expected_head=expected_head,
+            locked_check=check,
+        )
+
+    def record_result(
+        self,
+        experiment_id: str,
+        evidence: Mapping[str, Any],
+        *,
+        decision: str,
+        rationale: str,
+        expected_head: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one aggregate result bound to a prior immutable plan."""
+
+        experiment_id = str(experiment_id).strip()
+        if not _SAFE_DIMENSION_RE.fullmatch(experiment_id):
+            raise ExperimentControlError(
+                "experiment_id must be a non-identifying token"
+            )
+        _require_nonidentifying_control_text("experiment_id", experiment_id)
+        normalized_decision = str(decision).strip().casefold()
+        if normalized_decision not in _EXPERIMENT_RESULT_DECISIONS:
+            raise ExperimentControlError(
+                "experiment result decision must be adopt, reject, or rollback"
+            )
+        normalized_rationale = str(rationale).strip()
+        if not _SAFE_DIMENSION_RE.fullmatch(normalized_rationale):
+            raise ExperimentControlError(
+                "experiment result rationale must be a non-identifying token"
+            )
+        _require_nonidentifying_control_text("rationale", normalized_rationale)
+
+        records = self.store.verify()
+        plans = [
+            record
+            for record in records
+            if record["payload"].get("event") == "experiment_plan"
+            and record["payload"].get("experiment_id") == experiment_id
+        ]
+        if len(plans) != 1:
+            raise ExperimentControlError(
+                "experiment result requires exactly one prior plan"
+            )
+        plan_record = plans[0]
+        normalized_evidence = _normalize_experiment_result(
+            evidence,
+            plan=plan_record["payload"]["plan"],
+        )
+        payload = {
+            "decision": normalized_decision,
+            "event": "experiment_result",
+            "evidence": normalized_evidence,
+            "experiment_id": experiment_id,
+            "plan_record_hash": plan_record["record_hash"],
+            "rationale": normalized_rationale,
+        }
+
+        def check(
+            locked_records: tuple[dict[str, Any], ...],
+            requested: Mapping[str, Any],
+        ) -> Mapping[str, Any] | None:
+            locked_plans = [
+                record
+                for record in locked_records
+                if record["payload"].get("event") == "experiment_plan"
+                and record["payload"].get("experiment_id") == experiment_id
+            ]
+            if (
+                len(locked_plans) != 1
+                or locked_plans[0]["record_hash"]
+                != requested["plan_record_hash"]
+            ):
+                raise IntegrityError(
+                    f"experiment plan binding changed: {experiment_id}"
+                )
+            if any(
+                record["payload"].get("event") == "experiment_result"
+                and record["payload"].get("experiment_id") == experiment_id
+                for record in locked_records
+            ):
+                raise ExperimentControlError(
+                    f"experiment result is already recorded: {experiment_id}"
+                )
             return None
 
         return self.store.append_transactional(

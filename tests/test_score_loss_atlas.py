@@ -1,12 +1,16 @@
 import copy
 import json
 import re
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts import evaluate
 from scripts.score_loss_atlas import (
     AtlasInputError,
     FIELD_NAMES,
+    REQUIRED_ATLAS_DIMENSIONS,
+    TRACE_DIMENSIONS,
     build_atlas,
     render_markdown,
 )
@@ -142,6 +146,107 @@ def extended_atlas_inputs():
         ),
     ]
     return evaluated_inputs(truth_rows, prediction_rows)
+
+
+def layout_rows_for(truth_rows):
+    return [
+        {
+            "case_id": row["case_id"],
+            "layout_group": (
+                "page-count-03__ink-bucket-00"
+                if index < 3
+                else "page-count-01__ink-bucket-09"
+            ),
+        }
+        for index, row in enumerate(truth_rows)
+    ]
+
+
+def trace_rows_for(truth_rows):
+    rows = []
+    for index, truth in enumerate(truth_rows):
+        common = index < 10
+        rows.append(
+            {
+                "case_id": truth["case_id"],
+                "provenance_route": (
+                    "visible_ocr" if common else "authoritative_source"
+                ),
+                "applicant_linking_state": (
+                    "linked_unique" if common else "linked_ambiguous"
+                ),
+                "evidence_conflict": (
+                    "none" if common else "field_conflict"
+                ),
+                "ocr_recovery_path": (
+                    "primary" if common else "orientation_retry"
+                ),
+                "policy_trace": (
+                    "deterministic_policy" if common else "revalidated_policy"
+                ),
+                "runtime_seconds": (0.5, 1.5, 3.0, 9.0)[index % 4],
+            }
+        )
+    return rows
+
+
+def dimension_atlas_inputs():
+    truth_rows = []
+    prediction_rows = []
+    for index in range(12):
+        case_id = f"MIB-{200000 + index:06d}"
+        adjudication = "DENIED" if index % 3 == 0 else "APPROVED"
+        truth = truth_row(
+            case_id,
+            f"Private Person {index}",
+            adjudication=adjudication,
+        )
+        prediction = dict(truth)
+        prediction["confidence"] = 0.55 if index < 10 else 0.75
+        if index < 4:
+            prediction["applicant_name"] = "unknown"
+        if index < 3:
+            prediction["adjudication"] = "NEEDS_REVIEW"
+        truth_rows.append(truth)
+        prediction_rows.append(prediction)
+    return evaluated_inputs(truth_rows, prediction_rows)
+
+
+def write_dimension_evidence(directory, truth_rows, *, truth_hash, submission_hash):
+    layout_path = Path(directory) / "layout.json"
+    layout_payload = {
+        "schema": "mib-wo12-layout-groups/v2",
+        "label_blind_construction": True,
+        "layout_signature": {
+            "version": "page-count-plus-first-page-ink-v1",
+        },
+        "cases": [
+            {
+                "case_id": row["case_id"],
+                "layout_group": (
+                    "page-count-03__ink-bucket-00"
+                    if index < 10
+                    else "page-count-01__ink-bucket-09"
+                ),
+            }
+            for index, row in enumerate(truth_rows)
+        ],
+    }
+    layout_path.write_text(json.dumps(layout_payload), encoding="utf-8")
+
+    trace_path = Path(directory) / "trace.json"
+    trace_rows = trace_rows_for(truth_rows)
+    trace_payload = {
+        "schema_version": "mib-score-loss-dimension-trace/v1",
+        "source_revision_sha": "e" * 40,
+        "input_tree_sha256": "f" * 64,
+        "truth_sha256": truth_hash,
+        "submission_sha256": submission_hash,
+        "case_count": len(trace_rows),
+        "rows": trace_rows,
+    }
+    trace_path.write_text(json.dumps(trace_payload), encoding="utf-8")
+    return layout_path, trace_path
 
 
 class ScoreLossAtlasTests(unittest.TestCase):
@@ -533,6 +638,222 @@ class ScoreLossAtlasTests(unittest.TestCase):
             "SPN-1234",
         ):
             self.assertNotIn(sensitive_value, combined)
+
+    def test_required_dimensions_are_explicitly_measured_or_blocked(self):
+        atlas = self.build()
+
+        self.assertEqual(
+            set(atlas["required_dimension_coverage"]),
+            set(REQUIRED_ATLAS_DIMENSIONS),
+        )
+        self.assertEqual(
+            atlas["required_dimension_coverage"]["field"],
+            "frozen_baseline",
+        )
+        self.assertEqual(
+            atlas["required_dimension_coverage"]["adjudication_confusion"],
+            "frozen_baseline",
+        )
+        self.assertEqual(
+            atlas["required_dimension_coverage"]["confidence_bucket"],
+            "frozen_baseline",
+        )
+        for dimension in ("page_template_family", *TRACE_DIMENSIONS, "runtime_cost"):
+            self.assertEqual(
+                atlas["required_dimension_coverage"][dimension],
+                "blocked",
+            )
+        self.assertEqual(
+            {item["dimension"] for item in atlas["dimension_measurement_blockers"]},
+            {"page_template_family", *TRACE_DIMENSIONS, "runtime_cost"},
+        )
+
+    def test_supplied_layout_and_trace_remain_auxiliary_without_source_binding(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            layout_path, trace_path = write_dimension_evidence(
+                directory,
+                truth,
+                truth_hash=explicit_hashes["truth"],
+                submission_hash=explicit_hashes["submission"],
+            )
+            atlas = build_atlas(
+                truth_rows=truth,
+                prediction_rows=predictions,
+                evaluation=evaluation,
+                case_scores=case_scores,
+                source_sha256=explicit_hashes,
+                layout_manifest_path=layout_path,
+                trace_dimensions_path=trace_path,
+            )
+
+        for dimension in (
+            "page_template_family",
+            *TRACE_DIMENSIONS,
+        ):
+            details = atlas["dimension_atlas"][dimension]
+            self.assertEqual(details["status"], "auxiliary_historical")
+            self.assertEqual(details["emitted_case_count"], 12)
+            self.assertIsNone(details["low_support_case_count"])
+            self.assertTrue(details["low_support_pool_emitted"])
+            self.assertTrue(details["complementary_suppression_applied"])
+            self.assertFalse(details["under_k_residual_omitted"])
+            self.assertTrue(
+                all(group["case_count"] >= 10 for group in details["groups"])
+            )
+        runtime = atlas["dimension_atlas"]["runtime_cost"]
+        self.assertEqual(runtime["status"], "auxiliary_historical")
+        self.assertEqual(runtime["emitted_case_count"], 12)
+        self.assertTrue(runtime["low_support_pool_emitted"])
+        self.assertTrue(
+            all(group["case_count"] >= 10 for group in runtime["groups"])
+        )
+        self.assertEqual(
+            atlas["dimension_atlas"]["confidence_bucket"]["status"],
+            "frozen_baseline",
+        )
+        self.assertEqual(
+            set(atlas["dimension_source_sha256"]),
+            {"layout_manifest", "trace_dimensions"},
+        )
+        self.assertTrue(
+            all(
+                re.fullmatch(r"[0-9a-f]{64}", digest)
+                for digest in atlas["dimension_source_sha256"].values()
+            )
+        )
+        self.assertEqual(
+            {item["dimension"] for item in atlas["dimension_measurement_blockers"]},
+            {"page_template_family", *TRACE_DIMENSIONS, "runtime_cost"},
+        )
+
+    def test_low_support_trace_labels_and_case_ids_are_not_emitted(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            layout_path, trace_path = write_dimension_evidence(
+                directory,
+                truth,
+                truth_hash=explicit_hashes["truth"],
+                submission_hash=explicit_hashes["submission"],
+            )
+            atlas = build_atlas(
+                truth_rows=truth,
+                prediction_rows=predictions,
+                evaluation=evaluation,
+                case_scores=case_scores,
+                source_sha256=explicit_hashes,
+                layout_manifest_path=layout_path,
+                trace_dimensions_path=trace_path,
+            )
+        combined = json.dumps(atlas, sort_keys=True) + render_markdown(atlas)
+
+        self.assertNotIn("authoritative_source", combined)
+        self.assertNotIn("linked_ambiguous", combined)
+        self.assertNotIn("field_conflict", combined)
+        self.assertNotIn("orientation_retry", combined)
+        self.assertNotIn("revalidated_policy", combined)
+        self.assertNotIn("page-count-01__ink-bucket-09", combined)
+        self.assertIsNone(re.search(r"\bMIB-[0-9]{6}\b", combined))
+        for details in atlas["dimension_atlas"].values():
+            for group in details.get("groups", []):
+                if group["category"] == "<suppressed_low_support>":
+                    self.assertGreaterEqual(group["case_count"], 10)
+
+    def test_runtime_loss_stays_blocked_without_per_case_trace(self):
+        truth, predictions, evaluation, case_scores = atlas_inputs()
+        atlas = build_atlas(
+            truth_rows=truth,
+            prediction_rows=predictions,
+            evaluation=evaluation,
+            case_scores=case_scores,
+        )
+        runtime = atlas["dimension_atlas"]["runtime_cost"]
+
+        self.assertEqual(runtime["status"], "blocked")
+        self.assertNotIn("total_runtime_seconds", runtime)
+        self.assertIn(
+            "## Required dimension coverage",
+            render_markdown(atlas),
+        )
+
+    def test_trace_dimensions_fail_closed_on_binding_schema_and_allowlist(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        explicit_hashes = {
+            "truth": "a" * 64,
+            "submission": "b" * 64,
+            "evaluation": "c" * 64,
+            "case_scores": "d" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            _layout_path, valid_path = write_dimension_evidence(
+                directory,
+                truth,
+                truth_hash=explicit_hashes["truth"],
+                submission_hash=explicit_hashes["submission"],
+            )
+            valid = json.loads(valid_path.read_text(encoding="utf-8"))
+            mutations = []
+            missing = copy.deepcopy(valid)
+            missing["rows"] = missing["rows"][:-1]
+            missing["case_count"] -= 1
+            mutations.append(missing)
+            extra_key = copy.deepcopy(valid)
+            extra_key["rows"][0]["unexpected"] = "value"
+            mutations.append(extra_key)
+            bad_allowlist = copy.deepcopy(valid)
+            bad_allowlist["rows"][0]["policy_trace"] = "per_case_secret"
+            mutations.append(bad_allowlist)
+            wrong_binding = copy.deepcopy(valid)
+            wrong_binding["submission_sha256"] = "9" * 64
+            mutations.append(wrong_binding)
+
+            for index, payload in enumerate(mutations):
+                trace_path = Path(directory) / f"mutated-{index}.json"
+                trace_path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(AtlasInputError):
+                    build_atlas(
+                        truth_rows=truth,
+                        prediction_rows=predictions,
+                        evaluation=evaluation,
+                        case_scores=case_scores,
+                        source_sha256=explicit_hashes,
+                        trace_dimensions_path=trace_path,
+                    )
+
+    def test_layout_manifest_rejects_identity_encodable_category(self):
+        truth, predictions, evaluation, case_scores = dimension_atlas_inputs()
+        with tempfile.TemporaryDirectory() as directory:
+            layout_path, _trace_path = write_dimension_evidence(
+                directory,
+                truth,
+                truth_hash="a" * 64,
+                submission_hash="b" * 64,
+            )
+            payload = json.loads(layout_path.read_text(encoding="utf-8"))
+            for row in payload["cases"]:
+                row["layout_group"] = "john_smith"
+            layout_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaises(AtlasInputError):
+                build_atlas(
+                    truth_rows=truth,
+                    prediction_rows=predictions,
+                    evaluation=evaluation,
+                    case_scores=case_scores,
+                    layout_manifest_path=layout_path,
+                )
 
     def test_every_expected_field_is_still_present(self):
         atlas = self.build()

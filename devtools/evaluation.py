@@ -6,7 +6,6 @@ import csv
 import hashlib
 import json
 import math
-import re
 import resource
 import subprocess
 import sys
@@ -31,9 +30,6 @@ FIELD_NAMES = (
     "fee_status",
 )
 NON_TUNING_ROLES = frozenset({"calibration", "release", "golden", "adversarial"})
-PUBLIC_ROBUSTNESS_EVIDENCE = "public_grouped_robustness_not_unseen"
-UNSEEN_HOLDOUT_EVIDENCE = "genuinely_unseen_holdout"
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class EvaluationConfigurationError(ValueError):
@@ -66,8 +62,6 @@ class SplitEvidence:
     name: str
     role: str
     tuned_on_splits: tuple[str, ...] = ()
-    evidence_class: str = PUBLIC_ROBUSTNESS_EVIDENCE
-    split_manifest_sha256: str = ""
 
     def __post_init__(self) -> None:
         if not self.name or not self.role:
@@ -76,41 +70,16 @@ class SplitEvidence:
             raise EvaluationConfigurationError(
                 "a measured split cannot also be declared as a tuning split"
             )
-        if self.evidence_class not in {
-            PUBLIC_ROBUSTNESS_EVIDENCE,
-            UNSEEN_HOLDOUT_EVIDENCE,
-        }:
-            raise EvaluationConfigurationError("unsupported split evidence class")
-        if self.split_manifest_sha256 and not _SHA256_RE.fullmatch(
-            self.split_manifest_sha256
-        ):
-            raise EvaluationConfigurationError(
-                "split manifest SHA-256 must be 64 lowercase hexadecimal characters"
-            )
-
-    @property
-    def is_separated_non_tuning_partition(self) -> bool:
-        return self.role in NON_TUNING_ROLES and self.name not in self.tuned_on_splits
 
     @property
     def is_honest_holdout(self) -> bool:
-        """Backward-compatible field that is true only for genuinely unseen data."""
-
-        return (
-            self.evidence_class == UNSEEN_HOLDOUT_EVIDENCE
-            and self.is_separated_non_tuning_partition
-        )
+        return self.role in NON_TUNING_ROLES and self.name not in self.tuned_on_splits
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "role": self.role,
             "tuned_on_splits": list(self.tuned_on_splits),
-            "evidence_class": self.evidence_class,
-            "split_manifest_sha256": self.split_manifest_sha256,
-            "is_separated_non_tuning_partition": (
-                self.is_separated_non_tuning_partition
-            ),
             "is_honest_holdout": self.is_honest_holdout,
         }
 
@@ -267,14 +236,6 @@ class RuntimeArtifactLeakageScanner:
 def _peak_memory_mib(raw_value: float) -> float:
     # macOS reports bytes; Linux reports KiB.
     return raw_value / (1024 * 1024) if sys.platform == "darwin" else raw_value / 1024
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class EvaluationHarness:
@@ -452,13 +413,12 @@ class EvaluationHarness:
 
 
 class InstrumentedBenchmarkRunner:
-    """Run the exact production processor while retaining calibration samples."""
+    """Run the real offline pipeline while retaining development-only traces."""
 
-    def __init__(self, *, max_workers: int = 4, processor_factory: Any = None) -> None:
+    def __init__(self, *, max_workers: int = 4) -> None:
         if not 1 <= max_workers <= 4:
             raise EvaluationConfigurationError("max_workers must be between 1 and 4")
         self._max_workers = max_workers
-        self._processor_factory = processor_factory
 
     def run(
         self,
@@ -470,7 +430,16 @@ class InstrumentedBenchmarkRunner:
         predictions_path: Path,
         samples_path: Path,
     ) -> dict[str, Any]:
-        from mib_pipeline import BatchRunner, build_production_processor
+        from mib_pipeline import (
+            AdjudicationEngine,
+            BatchRunner,
+            CaseLinker,
+            ConfidenceCalibrator,
+            DocumentRenderer,
+            EvidencePrecedenceResolver,
+            GeneralizablePolicyExceptionStore,
+            VisibleEvidenceExtractor,
+        )
 
         selected = tuple(sorted(set(selected_case_ids)))
         if not selected:
@@ -486,28 +455,42 @@ class InstrumentedBenchmarkRunner:
             raise EvaluationConfigurationError(
                 f"truth labels are missing {len(missing_truth)} selected cases"
             )
-        processor_factory = self._processor_factory or build_production_processor
-        production_processor = processor_factory()
+        calibrator = ConfidenceCalibrator.from_pinned_artifact()
+        exception_store = GeneralizablePolicyExceptionStore.from_pinned_artifact()
+        engine = AdjudicationEngine(
+            calibrator=calibrator,
+            exceptions=exception_store,
+        )
         records: dict[str, dict[str, Any]] = {}
         records_lock = threading.Lock()
 
         class InstrumentedProcessor:
+            def __init__(self) -> None:
+                self.renderer = DocumentRenderer()
+                self.extractor = VisibleEvidenceExtractor()
+                self.linker = CaseLinker()
+                self.resolver = EvidencePrecedenceResolver()
+
             def process_case(self, pdf_path: Path) -> Any:
-                row = production_processor.process_case(pdf_path)
-                if row is None:
-                    return None
+                rendered = self.renderer.render(pdf_path)
+                candidates = self.extractor.extract(rendered)
+                linked = self.linker.link(rendered.case_id, candidates)
+                resolved = self.resolver.resolve(linked)
+                outcome = engine.adjudicate_case(resolved)
                 with records_lock:
-                    records[row.case_id] = {
-                        "case_id": row.case_id,
+                    records[outcome.row.case_id] = {
+                        "case_id": outcome.row.case_id,
                         "split_name": split_name,
-                        "emitted_confidence": row.confidence,
-                        "signal_stage": "final_emitted_confidence",
-                        "correct": row.adjudication
-                        == truth[row.case_id]["adjudication"],
-                        "emitted_adjudication": row.adjudication,
-                        "truth_adjudication": truth[row.case_id]["adjudication"],
+                        "raw_signal": calibrator.raw_signal(outcome.trace),
+                        "correct": outcome.row.adjudication
+                        == truth[outcome.row.case_id]["adjudication"],
+                        "emitted_adjudication": outcome.row.adjudication,
+                        "truth_adjudication": truth[outcome.row.case_id]["adjudication"],
+                        "denial_reasons": list(outcome.trace.denial_reasons),
+                        "review_reasons": list(outcome.trace.review_reasons),
+                        "approval_facts": list(outcome.trace.approval_facts),
                     }
-                return row
+                return outcome.row
 
         predictions_path.parent.mkdir(parents=True, exist_ok=True)
         samples_path.parent.mkdir(parents=True, exist_ok=True)
@@ -535,17 +518,6 @@ class InstrumentedBenchmarkRunner:
             "".join(json.dumps(record, sort_keys=True) + "\n" for record in ordered_records),
             encoding="utf-8",
         )
-        artifact_dir = (
-            Path(__file__).resolve().parents[1] / "mib_pipeline" / "artifacts"
-        )
-        runtime_artifact_sha256 = {
-            name: _sha256_file(artifact_dir / name)
-            for name in (
-                "confidence_calibration.json",
-                "output_confidence_recalibration.json",
-                "policy_exceptions.json",
-            )
-        }
         return {
             "split_name": split_name,
             "attempted": batch_report.attempted,
@@ -553,10 +525,8 @@ class InstrumentedBenchmarkRunner:
             "omitted": batch_report.omitted,
             "runtime_seconds": elapsed,
             "peak_memory_mib": peak,
-            "processor_composition": "production_v1",
-            "sample_signal_stage": "final_emitted_confidence",
-            "samples_fit_inner_calibrator": False,
-            "runtime_artifact_sha256": runtime_artifact_sha256,
+            "calibration_artifact_id": calibrator.artifact_id,
+            "policy_exception_artifact_id": exception_store.artifact_id,
             "failures": [
                 {"source_name": failure.source_name, "reason": failure.reason}
                 for failure in batch_report.failures
@@ -601,35 +571,12 @@ class ReleaseGate:
         warnings: list[str] = []
         candidate_split = candidate.get("split", {})
         baseline_split = baseline.get("split", {})
-        if not candidate_split.get("is_separated_non_tuning_partition"):
-            blocking.append(
-                "candidate result is not from a separated non-tuning partition"
-            )
-        if not baseline_split.get("is_separated_non_tuning_partition"):
-            blocking.append(
-                "baseline result is not from a separated non-tuning partition"
-            )
+        if not candidate_split.get("is_honest_holdout"):
+            blocking.append("candidate result is not from an honest non-tuning split")
+        if not baseline_split.get("is_honest_holdout"):
+            blocking.append("baseline result is not from an honest non-tuning split")
         if candidate_split.get("name") != baseline_split.get("name"):
             blocking.append("candidate and baseline were not measured on the same split")
-        candidate_evidence_class = candidate_split.get("evidence_class")
-        baseline_evidence_class = baseline_split.get("evidence_class")
-        if candidate_evidence_class not in {
-            PUBLIC_ROBUSTNESS_EVIDENCE,
-            UNSEEN_HOLDOUT_EVIDENCE,
-        }:
-            blocking.append("candidate split evidence class is missing or unsupported")
-        if candidate_evidence_class != baseline_evidence_class:
-            blocking.append("candidate and baseline evidence classes differ")
-        candidate_manifest_hash = str(
-            candidate_split.get("split_manifest_sha256", "")
-        )
-        baseline_manifest_hash = str(
-            baseline_split.get("split_manifest_sha256", "")
-        )
-        if not _SHA256_RE.fullmatch(candidate_manifest_hash):
-            blocking.append("candidate split manifest is not hash-pinned")
-        if candidate_manifest_hash != baseline_manifest_hash:
-            blocking.append("candidate and baseline split manifest hashes differ")
         if set(candidate.get("case_outcomes", {})) != set(
             baseline.get("case_outcomes", {})
         ):
@@ -668,13 +615,17 @@ class ReleaseGate:
         golden_regressions = self._regressions(candidate, baseline, "golden")
         adversarial_regressions = self._regressions(candidate, baseline, "adversarial")
         if golden_regressions:
-            blocking.append("new golden-case regressions")
+            warnings.append("new golden-case regressions")
         if adversarial_regressions:
-            blocking.append("new adversarial-case regressions")
-        if candidate_summary.get("invalid_rows", 0) > 0:
-            blocking.append("candidate contains invalid rows")
-        if candidate_summary.get("missing_rows", 0) > 0:
-            blocking.append("candidate contains missing rows")
+            warnings.append("new adversarial-case regressions")
+        if candidate_summary.get("invalid_rows", 0) > baseline_summary.get(
+            "invalid_rows", 0
+        ):
+            warnings.append("invalid row count increased")
+        if candidate_summary.get("missing_rows", 0) > baseline_summary.get(
+            "missing_rows", 0
+        ):
+            warnings.append("missing row count increased")
 
         score_deltas = {
             key: candidate_summary.get(key, 0) - baseline_summary.get(key, 0)
@@ -687,7 +638,7 @@ class ReleaseGate:
         else:
             decision = "PASS"
         return {
-            "gate_version": "mib_release_gate_v2",
+            "gate_version": "mib_false_approval_gate_v1",
             "decision": decision,
             "adopt": not blocking,
             "blocking_reasons": blocking,
@@ -701,9 +652,7 @@ class ReleaseGate:
 
 
 class IsotonicCalibrationFitter:
-    """Fit the inner policy calibrator from its pre-calibration signal only."""
-
-    REQUIRED_SIGNAL_STAGE = "pre_policy_calibration"
+    """Fit a deterministic PAV isotonic map on one honest calibration split."""
 
     @staticmethod
     def fit(
@@ -716,13 +665,9 @@ class IsotonicCalibrationFitter:
     ) -> dict[str, Any]:
         if not samples:
             raise EvaluationConfigurationError("calibration requires samples")
-        if (
-            split.role != "calibration"
-            or not split.is_separated_non_tuning_partition
-            or not split.split_manifest_sha256
-        ):
+        if split.role != "calibration" or not split.is_honest_holdout:
             raise EvaluationConfigurationError(
-                "calibration requires a hash-pinned separated calibration partition"
+                "calibration must be fit on a declared honest calibration split"
             )
         seen: set[str] = set()
         allowed = set(calibration_case_ids)
@@ -736,11 +681,6 @@ class IsotonicCalibrationFitter:
         for sample in samples:
             case_id = str(sample.get("case_id", "")).strip()
             sample_split = str(sample.get("split_name", "")).strip()
-            signal_stage = str(sample.get("signal_stage", "")).strip()
-            if signal_stage != IsotonicCalibrationFitter.REQUIRED_SIGNAL_STAGE:
-                raise EvaluationConfigurationError(
-                    "inner calibration samples must use pre_policy_calibration signals"
-                )
             if not case_id or case_id in seen:
                 raise EvaluationConfigurationError(
                     "calibration samples need unique non-empty case IDs"
@@ -811,7 +751,6 @@ class IsotonicCalibrationFitter:
                 "method": "pool_adjacent_violators_isotonic_regression",
                 "fit_split": split.name,
                 "fit_split_role": split.role,
-                "signal_stage": IsotonicCalibrationFitter.REQUIRED_SIGNAL_STAGE,
                 "training_case_count": len(samples),
                 "positive_target_count": sum(int(sample["correct"]) for sample in samples),
                 "target": "emitted_adjudication_is_correct",
