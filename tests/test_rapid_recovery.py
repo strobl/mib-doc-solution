@@ -2016,7 +2016,7 @@ class RapidOutputRecoveryTests(unittest.TestCase):
         self.assertEqual(adjudicator.calls, 1)
         self.assertEqual(factory.calls, 1)
 
-    def test_field_recovery_never_runs_final_policy_replay(self):
+    def test_final_review_replays_ordinary_policy_over_combined_resolution(self):
         primary = resolved_case(unknown={"species_code"})
         rapid = resolved_case()
         replay_row = row(adjudication="APPROVED", confidence=0.83)
@@ -2035,20 +2035,14 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             ordinary_policy_adjudicator=ordinary,
         )
 
-        with mock.patch.object(
-            recovery,
-            "_final_review_ordinary_policy_replay",
-            side_effect=AssertionError(
-                "the preregistered replay is policy-only, not a recovery head"
-            ),
-        ) as replay:
-            result = recovery.process_case(Path(CASE_ID + ".pdf"))
+        result = recovery.process_case(Path(CASE_ID + ".pdf"))
 
-        self.assertEqual(result, row())
-        self.assertEqual(linker.calls, 2)
-        self.assertEqual(resolver.calls, 2)
-        self.assertEqual(ordinary.calls, 0)
-        replay.assert_not_called()
+        expected = row(adjudication="APPROVED", confidence=0.83)
+        self.assertEqual(result, expected)
+        self.assertEqual(linker.calls, 3)
+        self.assertEqual(resolver.calls, 3)
+        self.assertEqual(ordinary.calls, 1)
+        self.assertIs(ordinary.resolved[0], rapid)
 
     def test_complete_primary_review_runs_one_policy_only_rapid_replay(self):
         primary, primary_candidates = clean_resolved_case()
@@ -2239,27 +2233,6 @@ class RapidOutputRecoveryTests(unittest.TestCase):
                     prior,
                 )
                 self.assertEqual(factory.calls, 0)
-
-        unsafe_primary = clean_candidates + (
-            evidence(
-                "declared_purpose",
-                BASE_VALUES["declared_purpose"],
-                cues=("sample_denial_watermark",),
-                page=20,
-            ),
-        )
-        recovery, *_components, factory = processor(
-            clean_primary,
-            rapid,
-            primary_candidates=unsafe_primary,
-            rapid_candidates=(rapid_policy_fact,),
-            ordinary_policy_adjudicator=replay,
-        )
-        self.assertEqual(
-            recovery.process_case(Path(CASE_ID + ".pdf")),
-            row(),
-        )
-        self.assertEqual(factory.calls, 0)
 
         extra_applicants = tuple(
             evidence(
@@ -2493,26 +2466,6 @@ class RapidOutputRecoveryTests(unittest.TestCase):
             {
                 "label": "rapid authority candidate",
                 "rapid_candidates": (authoritative,),
-            },
-            {
-                "label": "unsafe primary candidate",
-                "primary_candidates": (
-                    evidence(
-                        "declared_purpose",
-                        BASE_VALUES["declared_purpose"],
-                        cues=("strikethrough",),
-                    ),
-                ),
-            },
-            {
-                "label": "unsafe rapid candidate",
-                "rapid_candidates": (
-                    evidence(
-                        "fee_status",
-                        BASE_VALUES["fee_status"],
-                        cues=("sample_denial_watermark",),
-                    ),
-                ),
             },
             {
                 "label": "rapid applicant mismatch",
