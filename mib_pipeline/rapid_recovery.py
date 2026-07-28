@@ -882,6 +882,18 @@ class RapidOutputRecoveryProcessor:
         )
 
     @staticmethod
+    def _contains_unsafe_visual_cue(
+        candidates: Iterable[CandidateEvidence],
+    ) -> bool:
+        """Veto replay when any visible candidate carries an unsafe cue."""
+
+        return any(
+            isinstance(candidate, CandidateEvidence)
+            and RAPID_BAD_CUES.intersection(candidate.visual_cues)
+            for candidate in candidates
+        )
+
+    @staticmethod
     def _resolved_output_exactly_matches(
         *,
         resolved: ResolvedCase,
@@ -954,6 +966,7 @@ class RapidOutputRecoveryProcessor:
         if self._ordinary_policy_adjudicator is None:
             return False
         try:
+            primary_candidates = tuple(primary_candidates)
             return bool(
                 final_row.adjudication == "NEEDS_REVIEW"
                 and final_row.case_id == rendered.case_id
@@ -963,6 +976,7 @@ class RapidOutputRecoveryProcessor:
                 and not self._primary_authoritative_decision(primary_outcome)
                 and not primary_outcome.trace.exception_ids
                 and not self._contains_visible_authority(primary_candidates)
+                and not self._contains_unsafe_visual_cue(primary_candidates)
                 and primary_resolved.case_id == rendered.case_id
                 and not primary_resolved.unresolved_linkage
                 and not primary_resolved.contested_fields
@@ -1010,6 +1024,8 @@ class RapidOutputRecoveryProcessor:
             or primary_outcome.trace.exception_ids
             or self._contains_visible_authority(primary_candidates)
             or self._contains_visible_authority(rapid_candidates)
+            or self._contains_unsafe_visual_cue(primary_candidates)
+            or self._contains_unsafe_visual_cue(rapid_candidates)
             or primary_resolved.case_id != rendered.case_id
             or rapid_resolved.case_id != rendered.case_id
             or primary_resolved.active_applicant is None
@@ -1469,15 +1485,7 @@ class RapidOutputRecoveryProcessor:
             rapid_candidates=rapid_candidates,
             rapid_resolved=rapid_resolved,
         )
-        return self._final_review_ordinary_policy_replay(
-            final_row=final_row,
-            rendered=rendered,
-            primary_candidates=primary_candidates,
-            rapid_candidates=rapid_candidates,
-            primary_resolved=primary_resolved,
-            rapid_resolved=rapid_resolved,
-            primary_outcome=primary_outcome,
-        )
+        return final_row
 
     def process_case(self, pdf_path: Path) -> PredictionRow:
         rendered = self._renderer.render(pdf_path)
