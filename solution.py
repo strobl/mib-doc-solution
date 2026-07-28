@@ -103,10 +103,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                             exceptions=GeneralizablePolicyExceptionStore.from_pinned_artifact(),
                         )
                     ),
-                    ordinary_policy_adjudicator=AdjudicationEngine(
-                        calibrator=ConfidenceCalibrator.from_pinned_artifact(),
-                        exceptions=GeneralizablePolicyExceptionStore.from_pinned_artifact(),
-                    ),
                 ),
                 recalibrator=OutputConfidenceRecalibrator.from_pinned_artifact(),
             ),

@@ -206,7 +206,6 @@ class RapidOutputRecoveryProcessor:
         linker: Any,
         resolver: Any,
         adjudicator: PrimaryAdjudicator,
-        ordinary_policy_adjudicator: PrimaryAdjudicator | None = None,
         rapid_extractor_factory: Callable[[], Any] = build_rapid_extractor,
     ) -> None:
         self._renderer = renderer
@@ -214,7 +213,6 @@ class RapidOutputRecoveryProcessor:
         self._linker = linker
         self._resolver = resolver
         self._adjudicator = adjudicator
-        self._ordinary_policy_adjudicator = ordinary_policy_adjudicator
         self._rapid_extractor_factory = rapid_extractor_factory
         self._local = threading.local()
 
@@ -865,281 +863,6 @@ class RapidOutputRecoveryProcessor:
         )
 
     @staticmethod
-    def _contains_visible_authority(
-        candidates: Iterable[CandidateEvidence],
-    ) -> bool:
-        """Veto replay when either OCR pass saw a live signed decision."""
-
-        return any(
-            isinstance(candidate, CandidateEvidence)
-            and candidate.field_name == "adjudication"
-            and candidate.value in {"APPROVED", "DENIED", "NEEDS_REVIEW"}
-            and candidate.evidence_type in AUTHORITATIVE_RAPID_TYPES
-            and candidate.legible
-            and not candidate.superseded
-            and candidate.source == "visible_ocr"
-            for candidate in candidates
-        )
-
-    @staticmethod
-    def _resolved_output_exactly_matches(
-        *,
-        resolved: ResolvedCase,
-        row: PredictionRow,
-    ) -> bool:
-        """Require nine genuinely resolved fields, never output fallbacks."""
-
-        if resolved.case_id != row.case_id:
-            return False
-        for field_name in _COMPLETE_REVIEW_OUTPUT_FIELDS:
-            field = resolved.fields.get(field_name)
-            if (
-                field is None
-                or field.state is not FieldState.RESOLVED
-                or field.value is None
-                or field.value != getattr(row, field_name)
-            ):
-                return False
-        return True
-
-    @classmethod
-    def _clean_primary_output_exactly_matches(
-        cls,
-        *,
-        resolved: ResolvedCase,
-        row: PredictionRow,
-    ) -> bool:
-        """Require nine clean visible primary winners equal to the final row."""
-
-        active_applicant = resolved.active_applicant
-        if (
-            active_applicant is None
-            or active_applicant != row.applicant_name
-            or not cls._complete_review_output(row)
-            or not cls._resolved_output_exactly_matches(
-                resolved=resolved,
-                row=row,
-            )
-        ):
-            return False
-        for field_name in _COMPLETE_REVIEW_OUTPUT_FIELDS:
-            field = resolved.fields[field_name]
-            evidence = field.winning_evidence
-            if (
-                not isinstance(evidence, CandidateEvidence)
-                or evidence.field_name != field_name
-                or evidence.value != field.value
-                or not evidence.legible
-                or evidence.superseded
-                or evidence.source != "visible_ocr"
-                or evidence.evidence_type is EvidenceType.TEXT_LAYER
-                or RAPID_BAD_CUES.intersection(evidence.visual_cues)
-                or evidence.case_id_hint not in {None, resolved.case_id}
-                or evidence.applicant_hint not in {None, active_applicant}
-            ):
-                return False
-        return True
-
-    def _eligible_for_policy_only_rapid_replay(
-        self,
-        *,
-        final_row: PredictionRow,
-        rendered: RenderedCase,
-        primary_candidates: Iterable[CandidateEvidence],
-        primary_resolved: ResolvedCase,
-        primary_outcome: AdjudicationOutcome,
-    ) -> bool:
-        """Admit only complete, clean primary reviews with no authority."""
-
-        if self._ordinary_policy_adjudicator is None:
-            return False
-        try:
-            return bool(
-                final_row.adjudication == "NEEDS_REVIEW"
-                and final_row.case_id == rendered.case_id
-                and primary_outcome.row.case_id == rendered.case_id
-                and primary_outcome.row.adjudication == "NEEDS_REVIEW"
-                and primary_outcome.trace.decision == "NEEDS_REVIEW"
-                and not self._primary_authoritative_decision(primary_outcome)
-                and not primary_outcome.trace.exception_ids
-                and not self._contains_visible_authority(primary_candidates)
-                and primary_resolved.case_id == rendered.case_id
-                and not primary_resolved.unresolved_linkage
-                and not primary_resolved.contested_fields
-                and self._clean_primary_output_exactly_matches(
-                    resolved=primary_resolved,
-                    row=final_row,
-                )
-            )
-        except Exception:
-            return False
-
-    def _final_review_ordinary_policy_replay_unchecked(
-        self,
-        *,
-        final_row: PredictionRow,
-        rendered: RenderedCase,
-        primary_candidates: Iterable[CandidateEvidence],
-        rapid_candidates: Iterable[CandidateEvidence],
-        primary_resolved: ResolvedCase,
-        rapid_resolved: ResolvedCase,
-        primary_outcome: AdjudicationOutcome,
-    ) -> PredictionRow:
-        """Replay ordinary policy over both OCR passes, failing closed.
-
-        This is the last and lowest-precedence decision head.  It can change
-        only adjudication and confidence on a final review whose case identity
-        and all nine extracted output values are already identical to a clean
-        combined resolution.  Any authority, ambiguity, disagreement, or
-        exception preserves the incoming row byte-for-byte.
-        """
-
-        ordinary = self._ordinary_policy_adjudicator
-        if ordinary is None or final_row.adjudication != "NEEDS_REVIEW":
-            return final_row
-
-        primary_candidates = tuple(primary_candidates)
-        rapid_candidates = tuple(rapid_candidates)
-        if (
-            final_row.case_id != rendered.case_id
-            or primary_outcome.row.case_id != rendered.case_id
-            or primary_outcome.trace.decision
-            != primary_outcome.row.adjudication
-            or primary_outcome.row.adjudication != "NEEDS_REVIEW"
-            or self._primary_authoritative_decision(primary_outcome)
-            or primary_outcome.trace.exception_ids
-            or self._contains_visible_authority(primary_candidates)
-            or self._contains_visible_authority(rapid_candidates)
-            or primary_resolved.case_id != rendered.case_id
-            or rapid_resolved.case_id != rendered.case_id
-            or primary_resolved.active_applicant is None
-            or primary_resolved.active_applicant != final_row.applicant_name
-            or rapid_resolved.active_applicant
-            != primary_resolved.active_applicant
-            or primary_resolved.unresolved_linkage
-            or rapid_resolved.unresolved_linkage
-            or primary_resolved.contested_fields
-            or rapid_resolved.contested_fields
-        ):
-            return final_row
-
-        try:
-            combined_linked = self._linker.link(
-                rendered.case_id,
-                primary_candidates + rapid_candidates,
-            )
-            combined_resolved = self._resolver.resolve(combined_linked)
-            if (
-                combined_resolved.case_id != rendered.case_id
-                or combined_resolved.active_applicant
-                != primary_resolved.active_applicant
-                or combined_resolved.active_applicant
-                != final_row.applicant_name
-                or combined_resolved.unresolved_linkage
-                or combined_resolved.contested_fields
-                or not self._resolved_output_exactly_matches(
-                    resolved=combined_resolved,
-                    row=final_row,
-                )
-            ):
-                return final_row
-
-            replay = ordinary.adjudicate_case(combined_resolved)
-            decision = replay.row.adjudication
-            trace = replay.trace
-            if (
-                decision not in {"APPROVED", "DENIED"}
-                or trace.decision != decision
-                or trace.authoritative_source
-                or trace.exception_ids
-                or self._primary_authoritative_decision(replay)
-                or not self._resolved_output_exactly_matches(
-                    resolved=combined_resolved,
-                    row=replay.row,
-                )
-                or any(
-                    getattr(replay.row, field_name)
-                    != getattr(final_row, field_name)
-                    for field_name in (
-                        "case_id",
-                        *_COMPLETE_REVIEW_OUTPUT_FIELDS,
-                    )
-                )
-            ):
-                return final_row
-
-            payload = final_row.to_dict()
-            payload["adjudication"] = decision
-            payload["confidence"] = replay.row.confidence
-            return PredictionRow.from_mapping(
-                payload,
-                fallback_case_id=final_row.case_id,
-            )
-        except Exception:
-            return final_row
-
-    def _final_review_ordinary_policy_replay(
-        self,
-        *,
-        final_row: PredictionRow,
-        rendered: RenderedCase,
-        primary_candidates: Iterable[CandidateEvidence],
-        rapid_candidates: Iterable[CandidateEvidence],
-        primary_resolved: ResolvedCase,
-        rapid_resolved: ResolvedCase,
-        primary_outcome: AdjudicationOutcome,
-    ) -> PredictionRow:
-        """Preserve the incoming row if any replay precondition raises."""
-
-        if (
-            self._ordinary_policy_adjudicator is None
-            or final_row.adjudication != "NEEDS_REVIEW"
-        ):
-            return final_row
-        try:
-            return self._final_review_ordinary_policy_replay_unchecked(
-                final_row=final_row,
-                rendered=rendered,
-                primary_candidates=primary_candidates,
-                rapid_candidates=rapid_candidates,
-                primary_resolved=primary_resolved,
-                rapid_resolved=rapid_resolved,
-                primary_outcome=primary_outcome,
-            )
-        except Exception:
-            return final_row
-
-    def _policy_only_rapid_replay(
-        self,
-        *,
-        final_row: PredictionRow,
-        rendered: RenderedCase,
-        primary_candidates: Iterable[CandidateEvidence],
-        primary_resolved: ResolvedCase,
-        primary_outcome: AdjudicationOutcome,
-    ) -> PredictionRow:
-        """Read Rapid once and replay policy without touching output fields."""
-
-        try:
-            rapid_candidates = tuple(self._rapid_extractor().extract(rendered))
-            rapid_linked = self._linker.link(
-                rendered.case_id,
-                rapid_candidates,
-            )
-            rapid_resolved = self._resolver.resolve(rapid_linked)
-            return self._final_review_ordinary_policy_replay(
-                final_row=final_row,
-                rendered=rendered,
-                primary_candidates=primary_candidates,
-                rapid_candidates=rapid_candidates,
-                primary_resolved=primary_resolved,
-                rapid_resolved=rapid_resolved,
-                primary_outcome=primary_outcome,
-            )
-        except Exception:
-            return final_row
-
-    @staticmethod
     def _repair_biometric_applicant(
         *,
         case_id: str,
@@ -1461,22 +1184,13 @@ class RapidOutputRecoveryProcessor:
             payload,
             fallback_case_id=primary_row.case_id,
         )
-        final_row = self._apply_review_approval_heads(
+        return self._apply_review_approval_heads(
             final_row=final_row,
             primary_candidates=primary_candidates,
             primary_outcome=primary_outcome,
             primary_resolved=primary_resolved,
             rapid_candidates=rapid_candidates,
             rapid_resolved=rapid_resolved,
-        )
-        return self._final_review_ordinary_policy_replay(
-            final_row=final_row,
-            rendered=rendered,
-            primary_candidates=primary_candidates,
-            rapid_candidates=rapid_candidates,
-            primary_resolved=primary_resolved,
-            rapid_resolved=rapid_resolved,
-            primary_outcome=primary_outcome,
         )
 
     def process_case(self, pdf_path: Path) -> PredictionRow:
@@ -1509,26 +1223,11 @@ class RapidOutputRecoveryProcessor:
             unknown_fields,
         )
         if not unknown_fields and not recover_risk:
-            final_primary_row = self._apply_review_approval_heads(
+            return self._apply_review_approval_heads(
                 final_row=primary_row,
                 primary_candidates=primary_candidates,
                 primary_outcome=primary_outcome,
                 primary_resolved=primary_resolved,
-            )
-            if not self._eligible_for_policy_only_rapid_replay(
-                final_row=final_primary_row,
-                rendered=rendered,
-                primary_candidates=primary_candidates,
-                primary_resolved=primary_resolved,
-                primary_outcome=primary_outcome,
-            ):
-                return final_primary_row
-            return self._policy_only_rapid_replay(
-                final_row=final_primary_row,
-                rendered=rendered,
-                primary_candidates=primary_candidates,
-                primary_resolved=primary_resolved,
-                primary_outcome=primary_outcome,
             )
 
         try:
