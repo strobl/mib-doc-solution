@@ -23,6 +23,7 @@ from mib_pipeline import (
     RapidOutputRecoveryProcessor,
     ReviewDenialRecoveryAdjudicator,
     VisibleEvidenceExtractor,
+    VisibleOcrTextStore,
     discover_case_pdfs,
 )
 from mib_pipeline.score_finalizer import VisibleScoreFinalizer
@@ -89,12 +90,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = sys.argv if argv is None else argv
     try:
         input_dir, output_path = parse_paths(arguments)
+        visible_text_store = VisibleOcrTextStore()
         runner = BatchRunner(
             OutputConfidenceRecalibrationProcessor(
                 processor=RapidOutputRecoveryProcessor(
                     renderer=DocumentRenderer(),
                     primary_extractor=VisibleEvidenceExtractor(
                         packet_page_type_markers=True,
+                        visible_text_store=visible_text_store,
                     ),
                     linker=CaseLinker(),
                     resolver=EvidencePrecedenceResolver(),
@@ -108,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 recalibrator=OutputConfidenceRecalibrator.from_pinned_artifact(),
             ),
             max_workers=configured_worker_limit(),
-            row_finalizer=VisibleScoreFinalizer(),
+            row_finalizer=VisibleScoreFinalizer(visible_text_store),
         )
         report = runner.run(input_dir, output_path)
     except (CalibrationArtifactError, ContractError, OSError, PolicyArtifactError) as exc:

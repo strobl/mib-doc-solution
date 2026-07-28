@@ -1,4 +1,4 @@
-"""Render-first PDF ingestion with weak, positional text-layer signals."""
+"""Render-first PDF ingestion using rasterized page pixels only."""
 
 from __future__ import annotations
 
@@ -96,7 +96,11 @@ class RenderedCase:
 
 
 class TextLayerReader:
-    """Read positional text as explicitly non-authoritative weak signals."""
+    """Compatibility no-op retained for older composition code.
+
+    Native PDF text is intentionally never opened. All production evidence is
+    derived from the rasterized page pixels downstream.
+    """
 
     def __init__(self, *, max_chars_per_page: int = MAX_TEXT_CHARS_PER_PAGE) -> None:
         if max_chars_per_page < 1:
@@ -110,53 +114,12 @@ class TextLayerReader:
         page_index: int,
         crop_box: Rect,
     ) -> tuple[tuple[TextSpan, ...], bool]:
-        text_page = page.get_textpage()
-        try:
-            total_chars = int(text_page.count_chars())
-            char_count = min(total_chars, self._max_chars_per_page)
-            spans: list[TextSpan] = []
-            text_parts: list[str] = []
-            span_box: Rect | None = None
-            span_off_crop = False
-
-            def flush() -> None:
-                nonlocal text_parts, span_box, span_off_crop
-                text = "".join(text_parts).strip()
-                if text and span_box is not None:
-                    spans.append(
-                        TextSpan(
-                            page_index=page_index,
-                            text=text,
-                            box=span_box,
-                            authoritative=False,
-                            off_crop=span_off_crop,
-                        )
-                    )
-                text_parts = []
-                span_box = None
-                span_off_crop = False
-
-            for index in range(char_count):
-                character = text_page.get_text_range(index, 1)
-                if not character or character.isspace():
-                    flush()
-                    continue
-                try:
-                    char_box = Rect.from_values(text_page.get_charbox(index))
-                except Exception:
-                    flush()
-                    continue
-                text_parts.append(character)
-                span_box = char_box if span_box is None else span_box.union(char_box)
-                span_off_crop = span_off_crop or not crop_box.contains(char_box)
-            flush()
-            return tuple(spans), total_chars > char_count
-        finally:
-            text_page.close()
+        del page, page_index, crop_box
+        return (), False
 
 
 class DocumentRenderer:
-    """Rasterize every page and retain text only as a weak side channel."""
+    """Rasterize every page without opening the native PDF text layer."""
 
     def __init__(
         self,

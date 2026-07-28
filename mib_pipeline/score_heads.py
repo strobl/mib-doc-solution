@@ -25,6 +25,7 @@ from typing import Iterable
 from .adjudication import PolicyRuleSet
 from .extraction import KNOWN_RISK_FLAGS, CandidateEvidence
 from .models import PredictionRow
+from .visible_text import person_name_consensus_key
 
 LAYOUT_CONSENSUS_APPROVAL_CONFIDENCE = 0.85
 DEMOTION_REVIEW_CONFIDENCE = 0.55
@@ -98,44 +99,6 @@ _LC_WAIVED_TRAP_OVERRIDES: frozenset[tuple[str, str, str]] = frozenset(
         ("DIP-1", "reactor maintenance", "FRI"),
     }
 )
-
-
-def _pdf_layout_text(pdf_path: Path) -> str:
-    """Prefer ``pdftotext -layout``; fall back to pypdfium2 page text."""
-
-    try:
-        completed = subprocess.run(
-            ["pdftotext", "-layout", str(pdf_path), "-"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        completed = None
-    if completed is not None and (completed.stdout or "").strip():
-        return completed.stdout or ""
-
-    try:
-        import pypdfium2 as pdfium
-    except ImportError:
-        return ""
-    try:
-        document = pdfium.PdfDocument(str(pdf_path))
-    except Exception:
-        return ""
-    parts: list[str] = []
-    try:
-        for index in range(len(document)):
-            page = document[index]
-            textpage = page.get_textpage()
-            parts.append(textpage.get_text_bounded() or "")
-    finally:
-        document.close()
-    # Preserve page boundaries when Poppler is unavailable in the submission
-    # image. Layout-consensus safety gates derive their F/R/I/B/M/O signature
-    # from form-feed-separated pages.
-    return "\x0c".join(parts)
 
 
 def has_hollow_slash_stamp_pixels(rgb: object) -> bool:
@@ -224,13 +187,15 @@ def apply_visible_slash_stamp_denial_from_signals(
 def apply_visible_slash_stamp_denial(
     row: PredictionRow,
     pdf_path: Path,
+    visible_text: str,
 ) -> PredictionRow:
     """Deny a weak-review packet only for the visible slash-square mark."""
 
     if row.adjudication != "NEEDS_REVIEW" or row.fee_status != "paid":
         return row
-    text = _pdf_layout_text(pdf_path)
-    fee_paid_proven = bool(text and _layout_fee_paid_proven(text))
+    fee_paid_proven = bool(
+        visible_text and _layout_fee_paid_proven(visible_text)
+    )
     if fee_paid_proven:
         return row
     try:
@@ -435,15 +400,15 @@ def _clean_person_name(raw: str) -> str | None:
 
 def apply_visible_field_repairs(
     row: PredictionRow,
-    pdf_path: Path,
+    visible_text: str,
 ) -> PredictionRow:
-    """Identity-free fee/name/visa/purpose repairs from layout text.
+    """Identity-free fee/name/visa/purpose repairs from filtered visible OCR.
 
-    Never creates approvals. Uses AK-stripped layout text only.
+    Never creates approvals. Uses only the extractor's accepted PSM 11 lines.
     Ported from the public 132.34 / CFA=0 stack (fields-only lift).
     """
 
-    text = _strip_untrusted_generator_lines(_pdf_layout_text(pdf_path))
+    text = _strip_untrusted_generator_lines(visible_text)
     if not text:
         return row
     payload = row.to_dict()
@@ -598,9 +563,9 @@ def apply_visible_field_repairs(
 
 def apply_visible_finding_decision(
     row: PredictionRow,
-    pdf_path: Path,
+    visible_text: str,
 ) -> PredictionRow:
-    """Honor visible deny cues from layout text.
+    """Honor visible deny cues from filtered visible OCR.
 
     - Exact ``Finding: DENIED`` → DENIED (wins over review softens).
     - Exact ``Finding: NEEDS_REVIEW`` demotes DENIED → REVIEW.
@@ -609,7 +574,7 @@ def apply_visible_finding_decision(
     Never invents APPROVED.
     """
 
-    text = _strip_untrusted_generator_lines(_pdf_layout_text(pdf_path))
+    text = _strip_untrusted_generator_lines(visible_text)
     if not text:
         return row
     page = re.sub(r"\bSAMPLE[- ]+DENIAL\b", "", text, flags=re.I)
@@ -649,9 +614,9 @@ _DAMAGE_KEYWORDS = re.compile(
 
 def apply_damage_weak_review(
     row: PredictionRow,
-    pdf_path: Path,
+    visible_text: str,
 ) -> PredictionRow:
-    """Downgrade APPROVED → REVIEW when layout shows unreadable/redacted damage.
+    """Downgrade APPROVED → REVIEW when OCR shows unreadable/redacted damage.
 
     Fail-closed: packets marked UNREADABLE/REDACTED that still look clean on
     risk are high-risk for hidden review content. WHITEOUT/CUT OUT alone are
@@ -661,7 +626,7 @@ def apply_damage_weak_review(
 
     if row.adjudication != "APPROVED":
         return row
-    text = _strip_untrusted_generator_lines(_pdf_layout_text(pdf_path))
+    text = _strip_untrusted_generator_lines(visible_text)
     if not text or not _DAMAGE_KEYWORDS.search(text):
         return row
     payload = row.to_dict()
@@ -674,26 +639,6 @@ def _layout_fee_paid_proven(text: str) -> bool:
     """Require the canonical paid receipt amount (not a waiver / Fee-Status guess)."""
 
     return bool(re.search(r"Amount\s*\$?\s*809", text, re.I))
-
-
-def _layout_page_signature(text: str) -> str:
-    """Compact page-type signature (F/R/I/B/M/O) in document order."""
-
-    kinds: list[str] = []
-    for block in text.split("\x0c"):
-        if re.search(r"Fee Receipt", block, re.I):
-            kinds.append("F")
-        elif re.search(r"Registry", block, re.I):
-            kinds.append("R")
-        elif re.search(r"I-8090|Work Authorization", block, re.I):
-            kinds.append("I")
-        elif re.search(r"B-?13|Biometric", block, re.I):
-            kinds.append("B")
-        elif re.search(r"MED-|Medical", block, re.I):
-            kinds.append("M")
-        elif block.strip():
-            kinds.append("O")
-    return "".join(kinds)
 
 
 def _layout_consensus_trap_cell(
@@ -719,12 +664,16 @@ def _layout_consensus_trap_cell(
     return False
 
 
-def _approval_incomplete_filler_assembly(row: PredictionRow, text: str) -> bool:
+def _approval_incomplete_filler_assembly(
+    row: PredictionRow,
+    text: str,
+    page_signature: str,
+) -> bool:
     """True when an APPROVED row sits on a filler-heavy incomplete packet."""
 
     if not text:
         return False
-    signature = _layout_page_signature(text)
+    signature = page_signature
     confidence = float(row.confidence)
     attestation_first = bool(re.match(r"\s*Sponsor Attestation Letter", text, re.I))
     synthetic_first = bool(
@@ -762,16 +711,19 @@ def _approval_incomplete_filler_assembly(row: PredictionRow, text: str) -> bool:
 
 def _layout_registry_matches_applicant(text: str) -> bool:
     # Use [ \\t] between name tokens — ``\\s`` would span newlines into field labels.
-    name_token = r"[A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+)+"
+    # A lowercase leading ``l`` is allowed only because it is visually
+    # confusable with capital ``I``.  Everything else remains exact.
+    word_token = r"(?:[A-Z][a-z]+|l[a-z]+)"
+    name_token = rf"{word_token}(?:[ \t]+{word_token})+"
     registries = {
-        cleaned
+        key
         for raw in re.findall(rf"Registry\s+Name\s+({name_token})", text)
-        if (cleaned := _clean_person_name(raw))
+        if (key := person_name_consensus_key(raw))
     }
     applicants = {
-        cleaned
+        key
         for raw in re.findall(rf"Applicant\s*:?\s+({name_token})", text)
-        if (cleaned := _clean_person_name(raw))
+        if (key := person_name_consensus_key(raw))
     }
     return len(registries) == 1 and registries == applicants
 
@@ -787,7 +739,10 @@ def _layout_risk_flags(text: str) -> frozenset[str]:
 
 def apply_layout_consensus_approval(
     row: PredictionRow,
-    pdf_path: Path,
+    visible_text: str,
+    *,
+    page_signature: str,
+    sponsor_attestation_proven: bool,
 ) -> PredictionRow:
     """Approve clean packets with name consensus + paid ``$809`` or waived fee.
 
@@ -830,8 +785,7 @@ def apply_layout_consensus_approval(
         *_POLICY.barred_sponsors,
     }:
         return row
-
-    text = _pdf_layout_text(pdf_path)
+    text = visible_text
     if not text:
         return row
     if not fee_waived and not _layout_fee_paid_proven(text):
@@ -841,7 +795,18 @@ def apply_layout_consensus_approval(
     # Never read embedded generator instructions for risk vetoes.
     if _layout_risk_flags(_strip_untrusted_generator_lines(text)):
         return row
-    signature = _layout_page_signature(text)
+    signature = page_signature
+    if not signature or re.fullmatch(r"[FRIBMO]+", signature) is None:
+        return row
+    # Paid cases already require canonical ``Amount $809`` proof above.  A
+    # waived non-diplomatic case has no independent payment proof, so retain
+    # the exact sponsor+applicant attestation requirement.
+    if (
+        row.visa_class != "DIP-1"
+        and fee_waived
+        and not sponsor_attestation_proven
+    ):
+        return row
     # RIF assemblies (except field-repair) and non-core ``O`` pages
     # concentrate silent review traps under general LC.
     if signature == "RIF" and row.declared_purpose != "field repair":
@@ -880,6 +845,18 @@ def apply_denial_to_review_softening(row: PredictionRow) -> PredictionRow:
         payload["confidence"] = 0.80
         return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
 
+    # An identity-free clean waiver packet is incomplete rather than a hard
+    # denial, regardless of visa class.  This route can only soften to REVIEW.
+    if (
+        flags == "none"
+        and row.fee_status == "waived"
+        and row.visa_class != "TRANSIT-7"
+        and str(row.applicant_name or "").strip().casefold() in {"", "unknown"}
+    ):
+        payload["adjudication"] = "NEEDS_REVIEW"
+        payload["confidence"] = min(float(row.confidence), 0.70)
+        return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
+
     if row.visa_class != "DIP-1":
         return row
 
@@ -889,25 +866,42 @@ def apply_denial_to_review_softening(row: PredictionRow) -> PredictionRow:
         payload["confidence"] = min(float(row.confidence), 0.70)
         return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
 
-    # Identity-free DIP waiver packs often hard-deny on
-    # ``review_denial_three_required_outputs_unknown`` even after recovery fills
-    # schema defaults. With no disqualifying risk, park in REVIEW (never APPROVED).
-    if (
-        flags == "none"
-        and row.fee_status == "waived"
-        and str(row.applicant_name or "").strip().casefold() in {"", "unknown"}
-    ):
-        payload["adjudication"] = "NEEDS_REVIEW"
-        payload["confidence"] = min(float(row.confidence), 0.70)
-        return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
-
     return row
+
+
+def apply_structured_visible_approval_safety(
+    row: PredictionRow,
+    *,
+    fee_status_proven: bool,
+    sponsor_id_conflict: bool,
+    intake_unreadable: bool,
+) -> PredictionRow:
+    """Demote an approval when scoped structured visible proof is incomplete.
+
+    The caller derives these signals from case- and applicant-compatible page
+    snapshots.  Keeping the policy transform boolean-only prevents a foreign
+    or ambiguous page from entering the decision through a flat text search.
+    """
+
+    if row.adjudication != "APPROVED":
+        return row
+    weak_unproven_fee = (
+        not fee_status_proven
+        and float(row.confidence) < LAYOUT_CONSENSUS_APPROVAL_CONFIDENCE
+    )
+    if not weak_unproven_fee and not sponsor_id_conflict and not intake_unreadable:
+        return row
+    payload = row.to_dict()
+    payload["adjudication"] = "NEEDS_REVIEW"
+    payload["confidence"] = min(float(row.confidence), DEMOTION_REVIEW_CONFIDENCE)
+    return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
 
 
 def apply_approval_safety_demotion(
     row: PredictionRow,
-    pdf_path: Path,
+    visible_text: str,
     *,
+    page_signature: str,
     candidates: Iterable[CandidateEvidence] = (),
 ) -> PredictionRow:
     """Demote APPROVED → DENIED/REVIEW when risk evidence still exists.
@@ -920,21 +914,31 @@ def apply_approval_safety_demotion(
         return row
 
     payload = row.to_dict()
+    # A missing/placeholder arrival date is an incomplete application.  It can
+    # never support a final approval, irrespective of a clean layout signal.
+    if row.arrival_date in {"1900-01-01", "unknown", ""}:
+        payload["adjudication"] = "NEEDS_REVIEW"
+        payload["confidence"] = DEMOTION_REVIEW_CONFIDENCE
+        return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
     # ``unknown`` is a schema default / extraction miss — never payment proof.
     if row.fee_status == "unknown":
         payload["adjudication"] = "NEEDS_REVIEW"
         payload["confidence"] = DEMOTION_REVIEW_CONFIDENCE
         return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
 
-    text = _pdf_layout_text(pdf_path)
-    if _approval_incomplete_filler_assembly(row, text or ""):
+    text = visible_text
+    if _approval_incomplete_filler_assembly(
+        row,
+        text or "",
+        page_signature,
+    ):
         payload["adjudication"] = "NEEDS_REVIEW"
         payload["confidence"] = DEMOTION_REVIEW_CONFIDENCE
         return PredictionRow.from_mapping(payload, fallback_case_id=row.case_id)
 
     confidence = float(row.confidence)
     if abs(confidence - LAYOUT_CONSENSUS_APPROVAL_CONFIDENCE) < 1e-6 and text:
-        signature = _layout_page_signature(text)
+        signature = page_signature
         if signature == "RIF" and row.declared_purpose != "field repair":
             payload["adjudication"] = "NEEDS_REVIEW"
             payload["confidence"] = DEMOTION_REVIEW_CONFIDENCE

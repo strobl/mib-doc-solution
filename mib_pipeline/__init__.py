@@ -77,6 +77,16 @@ from .pipeline import (
     SafeFallbackProcessor,
 )
 from .writer import CanonicalJsonlWriter, DuplicateCaseIdError
+from .visible_text import (
+    VisibleOcrLineRecord,
+    VisibleOcrPageSnapshot,
+    VisibleOcrSnapshot,
+    VisibleOcrTextStore,
+    VisibleSponsorAttestation,
+    VisibleTextSnapshotError,
+    VisibleTextSnapshotMismatch,
+    VisibleTextSnapshotMissing,
+)
 
 __all__ = [
     "AdjudicatingCaseProcessor",
@@ -133,6 +143,14 @@ __all__ = [
     "TesseractOcrEngine",
     "UntrustedContentFilter",
     "VisibleEvidenceExtractor",
+    "VisibleOcrLineRecord",
+    "VisibleOcrPageSnapshot",
+    "VisibleOcrSnapshot",
+    "VisibleOcrTextStore",
+    "VisibleSponsorAttestation",
+    "VisibleTextSnapshotError",
+    "VisibleTextSnapshotMismatch",
+    "VisibleTextSnapshotMissing",
     "VisualCueDetector",
     "build_rapid_extractor",
     "discover_case_pdfs",
