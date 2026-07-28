@@ -40,9 +40,11 @@ RUN python3 -m pip install \
 COPY run.sh solution.py /app/
 COPY mib_pipeline /app/mib_pipeline
 COPY third_party_licenses /app/third_party_licenses
+COPY LICENSE ATTRIBUTION.md /app/
 RUN chmod 0555 /app/run.sh /app/solution.py \
     && chmod -R a=rX /app/mib_pipeline \
     && chmod -R a=rX /app/third_party_licenses \
+    && chmod 0444 /app/LICENSE /app/ATTRIBUTION.md \
     && chmod 0444 /app/requirements.lock
 
 # The evaluator supplies an arbitrary host-owned bind directory for /output and

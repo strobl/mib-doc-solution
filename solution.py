@@ -25,6 +25,7 @@ from mib_pipeline import (
     VisibleEvidenceExtractor,
     discover_case_pdfs,
 )
+from mib_pipeline.score_finalizer import VisibleScoreFinalizer
 
 
 USAGE = "usage: solution.py <input_pdf_dir> <output_predictions_path>"
@@ -107,6 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 recalibrator=OutputConfidenceRecalibrator.from_pinned_artifact(),
             ),
             max_workers=configured_worker_limit(),
+            row_finalizer=VisibleScoreFinalizer(),
         )
         report = runner.run(input_dir, output_path)
     except (CalibrationArtifactError, ContractError, OSError, PolicyArtifactError) as exc:
