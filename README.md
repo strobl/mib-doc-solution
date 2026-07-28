@@ -54,7 +54,15 @@ The repository root also contains the production-oriented offline runtime. Its
 visible-pixel Tesseract path remains authoritative, with fail-closed RapidOCR
 recovery and frozen, identity-free evidence guards for genuinely unresolved
 fields or low-confidence review decisions. A final confidence-only calibration
-stage cannot modify the extracted record or adjudication. See
+stage cannot modify the extracted record or adjudication. An outer,
+answer-key-free visible-layout finalizer then applies narrow field repairs,
+deny/demotion safety signals, guarded clean-packet consensus, and
+identity-free confidence calibration. It fails closed to the valid base row.
+On the complete 1,000-case public training diagnostic, this candidate scores
+**135.25135290765877 / 150** with zero catastrophic false approvals. This is a
+public-data engineering result, not a private-test or leaderboard claim. See
+[`evaluation/FULL_PUBLIC_1000_135_25.md`](evaluation/FULL_PUBLIC_1000_135_25.md)
+for the exact audit and
 [`RUNTIME.md`](RUNTIME.md) for the clean-checkout build command, exact
 constrained Docker invocation, offline model details, and recovery safety
 boundary. Third-party OCR model provenance and licenses are retained under

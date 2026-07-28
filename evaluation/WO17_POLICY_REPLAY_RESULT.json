@@ -1,0 +1,90 @@
+{
+  "schema": "mib-wo17-policy-replay-result/v1",
+  "status": "rejected",
+  "decision": "reject",
+  "rationale": "no_effect_local_diagnostic",
+  "evidence_label": "public_grouped_robustness_not_unseen",
+  "bindings": {
+    "baseline_artifact_sha256": "d6e23641a4e4c7a5517c2b691791146177665f5c297667adae17565f6918a42d",
+    "candidate_artifact_sha256": "d6e23641a4e4c7a5517c2b691791146177665f5c297667adae17565f6918a42d",
+    "candidate_source_revision_sha": "dba28d7283ae333265d0f22e99900f279748d69c",
+    "integrated_source_revision_sha": "9583b610c284c82e3f7932c5449cad28b8502f7b",
+    "evaluator_sha256": "20515df0d93d6ac73f1f989dd230e4bb1ff6e295e118302114ddd5b4b753c2cf",
+    "truth_sha256": "9c6210df4a600c9520435cf7d79d61d7113795dbf94b0e7ab3e39d237388bc8a",
+    "input_tree_sha256": "21e821aa3089b841683375da59cf961e679e10f7009e5332ea9e8582f00f4c8e",
+    "runtime_contract_sha256": "29de57cbe6500d7754c847b264a3cfad7bec2f4b896e20048388bea6a5e9907f",
+    "split_manifest_sha256": "d7aac395c2d42dc42128ba3b4ce15fef6c42c37a6e247a066c267fba8a514b7c",
+    "aggregate_report_sha256": "819bae54164b2d0916759e381f9d839a2d652acaf1bc27629c48e82c75620a4f",
+    "aggregate_reducer_sha256": "06aceb5353fc66518d98cac5ad09c5739796950c5704f2862fe7fb916b0024a3",
+    "confidence_supplement_sha256": "de84ac0cae2b35a1deb4b4345fb24f0a9a3288f7c54bb279fdfee409ba57a213"
+  },
+  "execution": {
+    "attempted": 1000,
+    "answered": 1000,
+    "omitted": 0,
+    "record_count": 1000,
+    "output_bytes": 320416,
+    "runtime_seconds": 2631.11,
+    "process_cpu_seconds": 9774.66,
+    "candidate_source_clean": true,
+    "runtime_variable_files_match_integrated_source": true
+  },
+  "scores": {
+    "baseline": {
+      "extraction_score": 44.87777777777778,
+      "classification_score": 68.52000000000001,
+      "calibration_score": 16.974076455665433,
+      "total_score": 130.37185423344323
+    },
+    "candidate": {
+      "extraction_score": 44.87777777777778,
+      "classification_score": 68.52000000000001,
+      "calibration_score": 16.974076455665433,
+      "total_score": 130.37185423344323
+    },
+    "delta": {
+      "extraction_score": 0.0,
+      "classification_score": 0.0,
+      "calibration_score": 0.0,
+      "total_score": 0.0
+    }
+  },
+  "decision_transitions": {
+    "approved_to_approved": 170,
+    "denied_to_denied": 398,
+    "needs_review_to_needs_review": 432,
+    "changed": 0
+  },
+  "immutability": {
+    "identity_sets_equal": true,
+    "immutable_field_mismatch_count": 0,
+    "confidence_changed_count": 0,
+    "forbidden_unchanged_confidence_change_count": 0
+  },
+  "local_checks": {
+    "candidate_complete_and_valid": true,
+    "identity_sets_equal": true,
+    "immutable_fields_byte_equal": true,
+    "only_allowed_transitions": true,
+    "no_catastrophic_false_approvals": true,
+    "no_new_false_positive_denials": true,
+    "extraction_unchanged": true,
+    "all_fold_deltas_nonnegative": true,
+    "score_strictly_improved": false,
+    "all_repeats_strictly_positive": false,
+    "all_lofo_strictly_positive": false,
+    "confidence_supplement_passed": true
+  },
+  "external_release_gates": {
+    "trusted_docker": "not_verified",
+    "deterministic_repeat": "not_verified",
+    "memory": "not_verified",
+    "temporary_storage": "not_verified",
+    "model_artifact": "not_verified"
+  },
+  "notes": [
+    "The candidate is byte-identical to the frozen baseline and is rejected for zero score improvement.",
+    "The solution produced all 1000 rows. The surrounding macOS time utility returned nonzero only because its final kern.clockrate query was sandbox-denied.",
+    "No adoption or submission is authorized by this local diagnostic."
+  ]
+}

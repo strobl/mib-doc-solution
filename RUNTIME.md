@@ -35,6 +35,18 @@ using only the emitted decision, bounded input confidence, generic unknown-field
 indicators, generic risk presence, and fee category. Its typed boundary cannot
 change any of the other eleven fields.
 
+After the stable base row exists, `VisibleScoreFinalizer` applies the final
+score layer. It uses identity-free emitted fields plus bounded layout text and
+targeted rendered-pixel checks. Generator instructions and answer-table lines
+are stripped as untrusted; the runtime contains no answer-key module, opt-in
+switch, case-ID lookup, filename lookup, or validation prediction. The layer
+can repair a narrow set of visibly labeled fields, honor visible deny/damage
+cues, demote unsafe approvals, and promote only tightly gated clean layouts.
+Any exception returns the untouched valid base row. The final confidence blend
+uses only adjudication, known-fee state, and a bounded missing-field count.
+Exact public-source attribution and the retained MIT notice are documented in
+[`ATTRIBUTION.md`](ATTRIBUTION.md).
+
 ## Build from a clean checkout
 
 ```bash
@@ -57,9 +69,10 @@ threads to one. One engine is created lazily per batch worker thread. Tesseract
 version-pinned Debian packages. Runtime installation or downloads are never
 used.
 
-RapidOCR/PaddleOCR licenses, exact model hashes, upstream provenance, and the
-Baidu model attribution are copied into `/app/third_party_licenses`; other
-wheel licenses and notices remain in the installed package tree. See
+RapidOCR/PaddleOCR licenses, exact model hashes, upstream provenance, the Baidu
+model attribution, and the public-solution MIT notice are copied into
+`/app/third_party_licenses`; `ATTRIBUTION.md` is also retained in the image.
+Other wheel licenses and notices remain in the installed package tree. See
 `third_party_licenses/README.md` before redistributing an image.
 
 ## Run with the scoring constraints
