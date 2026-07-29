@@ -4,7 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, Lock
 from time import sleep
+from unittest.mock import patch
 
+import mib_pipeline.rapid_recovery as rapid_recovery
 from mib_pipeline.adjudication import AdjudicationOutcome, DecisionTrace
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
 from mib_pipeline.ingestion import Rect
@@ -412,6 +414,75 @@ class RapidOcrEngineTests(unittest.TestCase):
 
         self.assertEqual(results, ((), ()))
         self.assertEqual(maximum_active, 1)
+
+    def test_keeps_native_result_materialization_inside_inference_lock(self):
+        start = Barrier(2)
+        counter_lock = Lock()
+        active = 0
+        maximum_active = 0
+
+        class Result:
+            @property
+            def boxes(self):
+                nonlocal active, maximum_active
+                with counter_lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                sleep(0.05)
+                with counter_lock:
+                    active -= 1
+                return []
+
+            txts = []
+            scores = []
+
+        class Engine:
+            def __call__(self, image):
+                return Result()
+
+        def factory(**_kwargs):
+            return Engine()
+
+        adapters = tuple(
+            RapidOcrEngine(
+                engine_factory=factory,
+                package_root=Path("/opt/rapidocr"),
+            )
+            for _index in range(2)
+        )
+
+        def infer(adapter):
+            start.wait()
+            return adapter.read_page(
+                types.SimpleNamespace(index=0, image_png=b"png")
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = tuple(pool.map(infer, adapters))
+
+        self.assertEqual(results, ((), ()))
+        self.assertEqual(maximum_active, 1)
+
+    def test_production_extractors_share_one_native_engine(self):
+        native_engine = object()
+        with (
+            patch.object(
+                rapid_recovery,
+                "_SHARED_RAPID_OCR_ENGINE",
+                None,
+            ),
+            patch.object(
+                rapid_recovery,
+                "RapidOcrEngine",
+                return_value=native_engine,
+            ) as engine_factory,
+        ):
+            first = rapid_recovery.build_rapid_extractor()
+            second = rapid_recovery.build_rapid_extractor()
+
+        self.assertIs(first._ocr, native_engine)
+        self.assertIs(second._ocr, native_engine)
+        engine_factory.assert_called_once_with()
 
 
 class RapidPackagingContractTests(unittest.TestCase):

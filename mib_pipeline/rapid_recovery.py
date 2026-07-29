@@ -96,9 +96,10 @@ SEMANTIC_DENIAL_RULE_IDS = (
 # Python objects are still not safe to construct or invoke concurrently in one
 # process: the exact dual 5,000-case runtime gate exposed allocator corruption
 # when four worker-local engines crossed these native boundaries at once.
-# Keep the worker-local engines, but serialize only their native construction
-# and inference.  Rendering, primary OCR, linking, and adjudication remain
-# parallel.
+# Keep worker-local extraction wrappers, but use one process-wide engine and
+# serialize its native construction, inference, result materialization, and
+# native-result destruction.  Rendering, primary OCR, linking, and
+# adjudication remain parallel.
 _RAPID_OCR_NATIVE_LOCK = threading.RLock()
 
 
@@ -150,7 +151,15 @@ class RapidOcrEngine:
 
     def read_page(self, page: RenderedPage) -> tuple[OcrToken, ...]:
         with _RAPID_OCR_NATIVE_LOCK:
-            result = self._engine(page.image_png)
+            return self._read_page_under_native_lock(page)
+
+    def _read_page_under_native_lock(
+        self,
+        page: RenderedPage,
+    ) -> tuple[OcrToken, ...]:
+        """Materialize native-backed output before releasing the process lock."""
+
+        result = self._engine(page.image_png)
         boxes = getattr(result, "boxes", None)
         texts = getattr(result, "txts", None)
         scores = getattr(result, "scores", None)
@@ -185,11 +194,24 @@ class RapidOcrEngine:
         return tuple(tokens)
 
 
+_SHARED_RAPID_OCR_ENGINE: RapidOcrEngine | None = None
+
+
+def _shared_rapid_ocr_engine() -> RapidOcrEngine:
+    """Return the one native RapidOCR session allowed in this process."""
+
+    global _SHARED_RAPID_OCR_ENGINE
+    with _RAPID_OCR_NATIVE_LOCK:
+        if _SHARED_RAPID_OCR_ENGINE is None:
+            _SHARED_RAPID_OCR_ENGINE = RapidOcrEngine()
+        return _SHARED_RAPID_OCR_ENGINE
+
+
 def build_rapid_extractor() -> VisibleEvidenceExtractor:
     """Create the exact full-page RapidOCR extractor used by the frozen run."""
 
     return VisibleEvidenceExtractor(
-        ocr_engine=RapidOcrEngine(),
+        ocr_engine=_shared_rapid_ocr_engine(),
         psm6_refinement=False,
         consensus_retry=False,
         fee_receipt_retry=False,
@@ -203,10 +225,11 @@ def build_rapid_extractor() -> VisibleEvidenceExtractor:
 class RapidOutputRecoveryProcessor:
     """Run primary OCR once, then conservatively repair serialized output.
 
-    A separate RapidOCR extractor is initialized lazily per worker thread.
-    This avoids sharing ONNX Runtime sessions across the four-worker batch
-    pool.  Any RapidOCR import, initialization, extraction, linking,
-    resolution, or overlay failure returns the primary-only repaired row.
+    A separate extraction wrapper is initialized lazily per worker thread.
+    Those wrappers share one process-wide RapidOCR session whose complete
+    native boundary is serialized.  Any RapidOCR import, initialization,
+    extraction, linking, resolution, or overlay failure returns the
+    primary-only repaired row.
     """
 
     def __init__(
