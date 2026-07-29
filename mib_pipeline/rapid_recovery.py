@@ -92,6 +92,15 @@ SEMANTIC_DENIAL_RULE_IDS = (
     "semantic_rapid_barred_sponsor",
 )
 
+# RapidOCR owns native ONNX Runtime and image-processing state.  Separate
+# Python objects are still not safe to construct or invoke concurrently in one
+# process: the exact dual 5,000-case runtime gate exposed allocator corruption
+# when four worker-local engines crossed these native boundaries at once.
+# Keep the worker-local engines, but serialize only their native construction
+# and inference.  Rendering, primary OCR, linking, and adjudication remain
+# parallel.
+_RAPID_OCR_NATIVE_LOCK = threading.RLock()
+
 
 class PrimaryAdjudicator(Protocol):
     def adjudicate_case(self, resolved_case: ResolvedCase) -> AdjudicationOutcome:
@@ -128,18 +137,20 @@ class RapidOcrEngine:
             raise ValueError("package_root is required with a custom engine_factory")
 
         model_root = str(Path(package_root).resolve() / "models")
-        self._engine = engine_factory(
-            params={
-                "Global.model_root_dir": model_root,
-                "Global.log_level": "error",
-                "Global.text_score": 0.30,
-                "EngineConfig.onnxruntime.intra_op_num_threads": 1,
-                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-            }
-        )
+        with _RAPID_OCR_NATIVE_LOCK:
+            self._engine = engine_factory(
+                params={
+                    "Global.model_root_dir": model_root,
+                    "Global.log_level": "error",
+                    "Global.text_score": 0.30,
+                    "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+                    "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+                }
+            )
 
     def read_page(self, page: RenderedPage) -> tuple[OcrToken, ...]:
-        result = self._engine(page.image_png)
+        with _RAPID_OCR_NATIVE_LOCK:
+            result = self._engine(page.image_png)
         boxes = getattr(result, "boxes", None)
         texts = getattr(result, "txts", None)
         scores = getattr(result, "scores", None)

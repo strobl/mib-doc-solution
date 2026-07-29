@@ -1,6 +1,9 @@
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, Lock
+from time import sleep
 
 from mib_pipeline.adjudication import AdjudicationOutcome, DecisionTrace
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
@@ -336,6 +339,79 @@ class RapidOcrEngineTests(unittest.TestCase):
         self.assertEqual(len(tokens), 1)
         self.assertEqual(tokens[0].text, "visible text")
         self.assertEqual(tokens[0].box, Rect(1, 2, 5, 7))
+
+    def test_serializes_native_construction_across_worker_engines(self):
+        start = Barrier(2)
+        counter_lock = Lock()
+        active = 0
+        maximum_active = 0
+
+        class Engine:
+            def __call__(self, image):
+                return types.SimpleNamespace(boxes=[], txts=[], scores=[])
+
+        def factory(**_kwargs):
+            nonlocal active, maximum_active
+            with counter_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            sleep(0.05)
+            with counter_lock:
+                active -= 1
+            return Engine()
+
+        def construct():
+            start.wait()
+            return RapidOcrEngine(
+                engine_factory=factory,
+                package_root=Path("/opt/rapidocr"),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            adapters = tuple(pool.map(lambda _index: construct(), range(2)))
+
+        self.assertEqual(len(adapters), 2)
+        self.assertEqual(maximum_active, 1)
+
+    def test_serializes_native_inference_across_worker_engines(self):
+        start = Barrier(2)
+        counter_lock = Lock()
+        active = 0
+        maximum_active = 0
+
+        class Engine:
+            def __call__(self, image):
+                nonlocal active, maximum_active
+                with counter_lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                sleep(0.05)
+                with counter_lock:
+                    active -= 1
+                return types.SimpleNamespace(boxes=[], txts=[], scores=[])
+
+        def factory(**_kwargs):
+            return Engine()
+
+        adapters = tuple(
+            RapidOcrEngine(
+                engine_factory=factory,
+                package_root=Path("/opt/rapidocr"),
+            )
+            for _index in range(2)
+        )
+
+        def infer(adapter):
+            start.wait()
+            return adapter.read_page(
+                types.SimpleNamespace(index=0, image_png=b"png")
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = tuple(pool.map(infer, adapters))
+
+        self.assertEqual(results, ((), ()))
+        self.assertEqual(maximum_active, 1)
 
 
 class RapidPackagingContractTests(unittest.TestCase):
