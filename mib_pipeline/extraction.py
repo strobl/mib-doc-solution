@@ -19,6 +19,13 @@ from typing import Any, Iterable, Protocol
 
 from .ingestion import Rect, RenderedCase, RenderedPage
 from .models import ADJUDICATION_VALUES, CASE_ID_PATTERN, FEE_VALUES, SPONSOR_ID_PATTERN
+from .visible_text import (
+    VisibleOcrLineRecord,
+    VisibleOcrPageSnapshot,
+    VisibleOcrSnapshot,
+    VisibleOcrTextStore,
+    VisibleSponsorAttestation,
+)
 
 
 class RecoverableOcrError(RuntimeError):
@@ -516,6 +523,17 @@ CONSENSUS_RETRY_FIELDS = (
     "fee_status",
 )
 
+# A sideways page is admitted only after the primary pass found no candidates.
+# Unlike other retry routes, its two rotated OCR views may recover the
+# applicant name and risk flags because an otherwise unreadable orientation
+# cannot provide primary-pass identity or a policy-safe risk state.  The
+# relaxed, candidate-free route below additionally requires every recovered
+# field to carry the exact active case anchor.
+ORIENTATION_RETRY_FIELDS = CONSENSUS_RETRY_FIELDS + (
+    "applicant_name",
+    "risk_flags",
+)
+
 # Applicant names are generated compositionally.  Storing the 12 stems and 12
 # endings is a general OCR language model, not a case/name lookup table.
 APPLICANT_STEMS = (
@@ -763,6 +781,7 @@ class VisibleEvidenceExtractor:
         risk_flag_retry: bool | None = None,
         risk_flag_ocr_engines: tuple[Any, Any, Any] | None = None,
         packet_page_type_markers: bool = False,
+        visible_text_store: VisibleOcrTextStore | None = None,
     ) -> None:
         if not 0.0 <= minimum_legible_confidence <= refinement_gate <= 1.0:
             raise ValueError("confidence thresholds must satisfy 0 <= minimum <= gate <= 1")
@@ -841,6 +860,7 @@ class VisibleEvidenceExtractor:
         # it opt-in so secondary OCR passes and generic extraction consumers
         # retain their original field-candidate contract.
         self._packet_page_type_markers = packet_page_type_markers
+        self._visible_text_store = visible_text_store
 
     @staticmethod
     def _page_image(page: RenderedPage) -> Any:
@@ -880,6 +900,25 @@ class VisibleEvidenceExtractor:
         ):
             return "intake_form"
         return "other"
+
+    @classmethod
+    def _visible_case_ids(
+        cls,
+        lines: Iterable[OcrLine],
+    ) -> frozenset[str]:
+        """Return every six-digit case identifier visibly read in the lines."""
+
+        found: set[str] = set()
+        pattern = re.compile(
+            r"M[I1L]B\s*[-:]?\s*(?:[0-9OQCDILSB]\s*){6}",
+            re.I,
+        )
+        for line in lines:
+            for match in pattern.finditer(line.text):
+                normalized = cls._normalize_value("case_id", match.group(0))
+                if normalized is not None:
+                    found.add(normalized)
+        return frozenset(found)
 
     @classmethod
     def _packet_page_type_marker(
@@ -2377,7 +2416,7 @@ class VisibleEvidenceExtractor:
         baseline: tuple[CandidateEvidence, ...],
         routing_lines: dict[int, tuple[OcrLine, ...]],
     ) -> tuple[RenderedPage, ...]:
-        """Route at most two candidate-free pages using primary OCR only."""
+        """Route at most two candidate-free, blank-or-anchored primary pages."""
 
         case_id = rendered_case.case_id
         if not isinstance(case_id, str) or not CASE_ID_PATTERN.fullmatch(case_id):
@@ -2404,7 +2443,12 @@ class VisibleEvidenceExtractor:
                 for line in lines
                 if (match := self._ORIENTATION_FOOTER_RE.search(line.text))
             )
-            if not exact_footer:
+            # A physically quarter-turned raster can leave the primary OCR
+            # completely empty, including the normally trusted footer. Admit
+            # that narrow blank-primary case; the retry result is accepted
+            # only when both rotated views bind every field to the exact
+            # active case. Non-empty unanchored OCR still fails closed.
+            if not exact_footer and lines:
                 continue
             # Any structured primary candidate, including illegible evidence,
             # makes this an ordinary precedence/linkage problem rather than a
@@ -2512,7 +2556,7 @@ class VisibleEvidenceExtractor:
         grouped: dict[str, list[CandidateEvidence]] = {}
         for candidate in retry_candidates:
             if (
-                candidate.field_name not in CONSENSUS_RETRY_FIELDS
+                candidate.field_name not in ORIENTATION_RETRY_FIELDS
                 or candidate.value is None
                 or not candidate.legible
                 or candidate.superseded
@@ -2635,6 +2679,16 @@ class VisibleEvidenceExtractor:
             tuple[tuple[CandidateEvidence, ...], set[str]]
         ] = []
         for page in pages:
+            primary_case_anchor = any(
+                match is not None
+                and match.group(1).upper() == rendered_case.case_id.upper()
+                for line in routing_lines.get(page.index, ())
+                if (
+                    match := self._ORIENTATION_FOOTER_RE.search(
+                        line.text
+                    )
+                )
+            )
             scans: list[
                 tuple[
                     int,
@@ -2672,6 +2726,21 @@ class VisibleEvidenceExtractor:
                         best_pass[1],
                         confirmation[1],
                     )
+                    if not primary_case_anchor:
+                        accepted = tuple(
+                            candidate
+                            for candidate in accepted
+                            if (
+                                best_pass[1][
+                                    candidate.field_name
+                                ].case_id_hint
+                                == rendered_case.case_id
+                                and confirmation[1][
+                                    candidate.field_name
+                                ].case_id_hint
+                                == rendered_case.case_id
+                            )
+                        )
             accepted_fields = {candidate.field_name for candidate in accepted}
             unconfirmed_labels = set(best_labels) - accepted_fields
             page_results.append((accepted, unconfirmed_labels))
@@ -3568,6 +3637,7 @@ class VisibleEvidenceExtractor:
         page_type_markers: list[CandidateEvidence] = []
         pending_note_decisions: list[CandidateEvidence] = []
         routing_lines: dict[int, tuple[OcrLine, ...]] = {}
+        snapshot_pages: list[VisibleOcrPageSnapshot] = []
         risk_observations: list[
             tuple[
                 tuple[str, ...],
@@ -3589,11 +3659,7 @@ class VisibleEvidenceExtractor:
                 evidence_type = self._evidence_type(
                     heading_line.text, evidence_type
                 )
-            visible_case_ids = {
-                value
-                for line in lines
-                if (value := self._normalize_value("case_id", line.text)) is not None
-            }
+            visible_case_ids = self._visible_case_ids(lines)
             page_case_id_locked = rendered_case.case_id in visible_case_ids
             if page_case_id_locked:
                 current_case_id = rendered_case.case_id
@@ -3959,6 +4025,80 @@ class VisibleEvidenceExtractor:
                             )
                         )
 
+            accepted_case_ids = self._visible_case_ids(accepted_lines)
+            accepted_applicants = {
+                str(candidate.value)
+                for candidate in candidates
+                if (
+                    candidate.page_index == page.index
+                    and candidate.field_name == "applicant_name"
+                    and candidate.legible
+                    and candidate.value is not None
+                    and not candidate.superseded
+                    and candidate.source == "visible_ocr"
+                )
+            }
+            accepted_source_category = EvidenceType.INTAKE_FORM
+            for line in accepted_lines:
+                accepted_source_category = self._evidence_type(
+                    line.text,
+                    accepted_source_category,
+                )
+            accepted_page_category = self.packet_page_type(accepted_lines)
+            sponsor_attestations: tuple[VisibleSponsorAttestation, ...] = ()
+            if accepted_page_category == "sponsor_attestation":
+                attestation_values: dict[str, set[str]] = {
+                    "sponsor_id": set(),
+                    "applicant_name": set(),
+                }
+                for field_name, raw_value in self._sponsor_narrative_matches(
+                    " ".join(line.text for line in accepted_lines)
+                ):
+                    if field_name not in attestation_values:
+                        continue
+                    normalized = self._normalize_value(field_name, raw_value)
+                    if normalized is not None:
+                        attestation_values[field_name].add(normalized)
+                if all(
+                    len(attestation_values[field_name]) == 1
+                    for field_name in ("sponsor_id", "applicant_name")
+                ):
+                    sponsor_attestations = (
+                        VisibleSponsorAttestation(
+                            sponsor_id=next(
+                                iter(attestation_values["sponsor_id"])
+                            ),
+                            applicant_name=next(
+                                iter(attestation_values["applicant_name"])
+                            ),
+                        ),
+                    )
+            snapshot_pages.append(
+                VisibleOcrPageSnapshot(
+                    page_index=page.index,
+                    lines=tuple(
+                        VisibleOcrLineRecord(
+                            page_index=page.index,
+                            text=line.text,
+                            bbox=(
+                                line.box.left,
+                                line.box.bottom,
+                                line.box.right,
+                                line.box.top,
+                            ),
+                            ocr_confidence=line.confidence,
+                            visual_cues=cues,
+                        )
+                        for line, cues in accepted_line_cues
+                    ),
+                    page_category=accepted_page_category,
+                    source_category=accepted_source_category.value,
+                    visible_case_ids=accepted_case_ids,
+                    visible_applicants=frozenset(accepted_applicants),
+                    sponsor_attestations=sponsor_attestations,
+                )
+            )
+
         existing_authoritative = any(
             candidate.field_name == "adjudication"
             and candidate.value in ADJUDICATION_VALUES
@@ -4135,4 +4275,12 @@ class VisibleEvidenceExtractor:
         if marker is not None:
             candidates.append(marker)
         candidates.extend(page_type_markers)
+        if self._visible_text_store is not None:
+            self._visible_text_store.publish(
+                rendered_case.source_path,
+                snapshot=VisibleOcrSnapshot(
+                    source_sha256=rendered_case.source_sha256,
+                    pages=tuple(snapshot_pages),
+                ),
+            )
         return tuple(candidates)

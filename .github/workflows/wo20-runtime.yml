@@ -1,0 +1,626 @@
+name: WO20 Docker runtime evidence
+
+run-name: WO20 runtime @ ${{ github.sha }}
+
+on:
+  push:
+    branches:
+      - agent/mib-score-recovery
+  workflow_dispatch:
+    inputs:
+      confirm_full_5000:
+        description: Run two full 5,000-case captures
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wo20-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  DATA_ARCHIVE: mib-doc-challenge-public-data-v2026-07-07.zip
+  DATA_SHA256: a9bb8c1bbf51346ebf49c2e3e1acdb7a5d6cd0760162767b0d133c7b7200f3c4
+  DATA_URL: https://huggingface.co/datasets/arjun-krishna1/mib-doc-challenge-data/resolve/main/mib-doc-challenge-public-data-v2026-07-07.zip?download=true
+  DATA_CACHE_KEY: mib-public-v2026-07-07-a9bb8c1bbf51346e
+  CAPTURE_TIMEOUT_SECONDS: "19500"
+
+jobs:
+  preflight:
+    if: >-
+      github.repository == 'strobl/mib-doc-solution' &&
+      github.actor == github.repository_owner &&
+      github.ref == 'refs/heads/agent/mib-score-recovery' &&
+      (
+        (
+          github.event_name == 'push' &&
+          contains(github.event.head_commit.message, '[wo20-runtime]')
+        ) ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.confirm_full_5000
+        )
+      )
+    runs-on: ubuntu-latest
+    # The immutable public archive is 2.88 GB and the first trusted download
+    # can exceed one hour on a cold GitHub-hosted runner.  The hash check and
+    # all later runtime limits remain unchanged.
+    timeout-minutes: 120
+
+    outputs:
+      source-sha: ${{ steps.source.outputs.sha }}
+
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source binding
+        id: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Run focused runtime tests
+        run: |
+          python3 -m unittest \
+            tests.test_runtime_scaffold \
+            tests.test_docker_runtime_envelope \
+            tests.test_wo20_parallel_compare
+
+      - name: Verify Docker host
+        run: |
+          docker version
+          docker info
+          df -h
+          free -h
+
+      - name: Build clean source-bound image
+        id: image
+        run: |
+          revision="$(git rev-parse HEAD)"
+          producer_graph="$(
+            python3 -c \
+              'from pathlib import Path; from scripts.run_docker_submission import source_bindings; print(source_bindings(Path.cwd())["producer_graph_sha256"])'
+          )"
+          image_tag="mib-wo20-preflight:${GITHUB_SHA:0:12}"
+
+          timeout --signal=TERM --kill-after=30s 1800s \
+            docker build \
+              --pull=false \
+              --label "mib.wo20.source_revision=$revision" \
+              --label "mib.wo20.producer_graph_sha256=$producer_graph" \
+              --tag "$image_tag" \
+              "$GITHUB_WORKSPACE"
+
+          docker image inspect "$image_tag" >/dev/null
+          docker builder prune --all --force
+          echo "image-tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Restore immutable public dataset cache
+        id: dataset-cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
+
+      - name: Download and verify public dataset
+        run: |
+          archive="$RUNNER_TEMP/$DATA_ARCHIVE"
+
+          if [[ ! -f "$archive" ]]; then
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              "$DATA_URL" \
+              --output "$archive"
+          fi
+
+          printf '%s  %s\n' "$DATA_SHA256" "$archive" |
+            sha256sum --check --strict -
+
+      - name: Save verified immutable public dataset cache
+        if: steps.dataset-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
+
+      - name: Prepare eight-case smoke input
+        id: smoke
+        run: |
+          archive="$RUNNER_TEMP/$DATA_ARCHIVE"
+          smoke_dir="$RUNNER_TEMP/wo20-smoke"
+          mkdir -p "$smoke_dir"
+
+          mapfile -t members < <(
+            unzip -Z1 "$archive" |
+              LC_ALL=C sort |
+              awk '/^data\/validation\/[^/]+\.pdf$/ {print}' |
+              head -n 8
+          )
+          (( ${#members[@]} == 8 ))
+
+          for member in "${members[@]}"; do
+            unzip -p "$archive" "$member" \
+              > "$smoke_dir/${member##*/}"
+          done
+
+          echo "input-dir=$smoke_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Scan image and run smoke twice
+        run: |
+          output_dir="$RUNNER_TEMP/wo20-smoke-output"
+          mkdir -p "$output_dir"
+
+          python3 scripts/run_docker_submission.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --input-dir "${{ steps.smoke.outputs.input-dir }}" \
+            --output "$output_dir/predictions.jsonl" \
+            --evidence-json "$output_dir/evidence.json" \
+            --image-tag "${{ steps.image.outputs.image-tag }}" \
+            --skip-build \
+            --repeat-count 2 \
+            --timeout-seconds 1800 \
+            --stats-interval-seconds 1 \
+            --cpus 4 \
+            --memory 8g \
+            --max-image-gib 4 \
+            --max-model-mib 250 \
+            --max-total-model-mib 1024 \
+            --max-output-mib 25 \
+            --max-average-seconds-per-pdf 60 \
+            --require-complete
+
+          jq -e \
+            '.status == "PASS" or .status == "PASS_WITH_WARNINGS"' \
+            "$output_dir/evidence.json"
+
+      - name: Delete smoke predictions
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/wo20-smoke-output/predictions.jsonl"
+
+      - name: Upload aggregate smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wo20-smoke-${{ steps.source.outputs.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wo20-smoke-output/evidence.json
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9
+
+  capture:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        capture:
+          - a
+          - b
+
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.preflight.outputs.source-sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify clean exact source
+        run: |
+          test "$(git rev-parse HEAD)" = \
+            "${{ needs.preflight.outputs.source-sha }}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Build independent clean image
+        id: image
+        env:
+          CAPTURE: ${{ matrix.capture }}
+        run: |
+          revision="$(git rev-parse HEAD)"
+          producer_graph="$(
+            python3 -c \
+              'from pathlib import Path; from scripts.run_docker_submission import source_bindings; print(source_bindings(Path.cwd())["producer_graph_sha256"])'
+          )"
+          image_tag="mib-wo20-${CAPTURE}:${GITHUB_SHA:0:12}"
+
+          timeout --signal=TERM --kill-after=30s 900s \
+            docker build \
+              --pull=false \
+              --label "mib.wo20.source_revision=$revision" \
+              --label "mib.wo20.producer_graph_sha256=$producer_graph" \
+              --tag "$image_tag" \
+              "$GITHUB_WORKSPACE"
+
+          docker image inspect "$image_tag" >/dev/null
+          docker builder prune --all --force
+
+          available_kib="$(
+            df --output=avail -k "$RUNNER_TEMP" |
+              tail -n 1 |
+              tr -d ' '
+          )"
+          (( available_kib >= 6 * 1024 * 1024 ))
+
+          echo "image-tag=$image_tag" >> "$GITHUB_OUTPUT"
+          docker system df
+          df -h
+
+      - name: Restore exact public dataset cache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/${{ env.DATA_ARCHIVE }}
+          key: ${{ env.DATA_CACHE_KEY }}
+
+      - name: Ensure and verify public dataset
+        run: |
+          archive="$RUNNER_TEMP/$DATA_ARCHIVE"
+
+          if [[ ! -f "$archive" ]]; then
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              "$DATA_URL" \
+              --output "$archive"
+          fi
+
+          printf '%s  %s\n' "$DATA_SHA256" "$archive" |
+            sha256sum --check --strict -
+
+      - name: Extract validation split only
+        id: data
+        run: |
+          archive="$RUNNER_TEMP/$DATA_ARCHIVE"
+          data_root="$RUNNER_TEMP/mib-validation"
+          validation_dir="$data_root/data/validation"
+          manifest="$data_root/data/validation_manifest.csv"
+
+          mkdir -p "$data_root"
+          unzip -q "$archive" \
+            'data/validation/*' \
+            'data/validation_manifest.csv' \
+            -d "$data_root"
+
+          test -f "$manifest"
+
+          pdf_count="$(
+            find "$validation_dir" \
+              -maxdepth 1 \
+              -type f \
+              -iname '*.pdf' \
+              -printf '%f\n' |
+              wc -l |
+              tr -d ' '
+          )"
+          test "$pdf_count" = "5000"
+
+          rm -f "$archive"
+
+          available_kib="$(
+            df --output=avail -k "$RUNNER_TEMP" |
+              tail -n 1 |
+              tr -d ' '
+          )"
+          (( available_kib >= 2 * 1024 * 1024 ))
+
+          echo "input-dir=$validation_dir" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+
+          du -sh "$validation_dir"
+          df -h
+
+      - name: Run one full constrained capture
+        env:
+          CAPTURE: ${{ matrix.capture }}
+        run: |
+          capture_root="$RUNNER_TEMP/wo20-capture-$CAPTURE"
+          prediction_path="$capture_root/predictions.jsonl"
+          evidence_path="$capture_root/evidence-$CAPTURE.json"
+          mkdir -p "$capture_root"
+
+          python3 scripts/run_docker_submission.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --input-dir "${{ steps.data.outputs.input-dir }}" \
+            --manifest "${{ steps.data.outputs.manifest }}" \
+            --output "$prediction_path" \
+            --evidence-json "$evidence_path" \
+            --image-tag "${{ steps.image.outputs.image-tag }}" \
+            --skip-build \
+            --single-run-capture \
+            --repeat-count 1 \
+            --timeout-seconds "$CAPTURE_TIMEOUT_SECONDS" \
+            --stats-interval-seconds 1 \
+            --cpus 4 \
+            --memory 8g \
+            --max-image-gib 4 \
+            --max-model-mib 250 \
+            --max-total-model-mib 1024 \
+            --max-output-mib 25 \
+            --max-average-seconds-per-pdf 6 \
+            --require-complete
+
+          jq -e '
+            .mode == "single_run_capture" and
+            (
+              .status == "CAPTURE_COMPLETE" or
+              .status == "CAPTURE_COMPLETE_WITH_WARNINGS"
+            ) and
+            .requested_repeat_count == 1 and
+            (.runs | length) == 1 and
+            .coverage.attempted == 5000 and
+            .coverage.answered == 5000 and
+            .coverage.omitted == 0 and
+            .coverage.invalid == 0 and
+            .image.source_binding_labels_match == true
+          ' "$evidence_path"
+
+          test "$(
+            sha256sum "$prediction_path" |
+              cut -d ' ' -f 1
+          )" = "$(
+            jq -r '.runs[0].output_sha256' "$evidence_path"
+          )"
+
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Delete predictions before artifact handling
+        if: always()
+        env:
+          CAPTURE: ${{ matrix.capture }}
+        run: |
+          rm -f \
+            "$RUNNER_TEMP/wo20-capture-$CAPTURE/predictions.jsonl"
+
+      - name: Upload aggregate capture evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wo20-capture-${{ matrix.capture }}-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wo20-capture-${{ matrix.capture }}/evidence-${{ matrix.capture }}.json
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9
+
+  compare:
+    if: ${{ always() && needs.preflight.result == 'success' }}
+    needs:
+      - preflight
+      - capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout exact comparator
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.preflight.outputs.source-sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download both aggregate captures
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wo20-capture-*-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wo20-captures
+          merge-multiple: false
+
+      - name: Compare aggregate evidence fail closed
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.source-sha }}
+          EVIDENCE_ROOT: ${{ runner.temp }}/wo20-captures
+          AGGREGATE_PATH: ${{ runner.temp }}/wo20-aggregate.json
+        run: |
+          mapfile -t evidence_files < <(
+            find "$EVIDENCE_ROOT" \
+              -type f \
+              -name 'evidence-*.json' \
+              -print |
+              LC_ALL=C sort
+          )
+
+          capture_arguments=()
+          for evidence_file in "${evidence_files[@]}"; do
+            capture_arguments+=(--capture "$evidence_file")
+          done
+
+          python3 devtools/wo20_parallel_compare.py \
+            "${capture_arguments[@]}" \
+            --expected-source-revision "$EXPECTED_SHA" \
+            --expected-pdf-count 5000 \
+            --output "$AGGREGATE_PATH"
+
+      - name: Upload final aggregate-only evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wo20-aggregate-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wo20-aggregate.json
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9
+
+  adversarial:
+    needs:
+      - preflight
+      - capture
+      - compare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout exact audited source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.preflight.outputs.source-sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify clean exact source
+        run: |
+          test "$(git rev-parse HEAD)" = \
+            "${{ needs.preflight.outputs.source-sha }}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Download exact WO20 aggregate prerequisite
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wo20-aggregate-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/wo20-prerequisite
+
+      - name: Build clean adversarial-audit image
+        id: image
+        run: |
+          revision="$(git rev-parse HEAD)"
+          producer_graph="$(
+            python3 -c \
+              'from pathlib import Path; from scripts.run_docker_submission import source_bindings; print(source_bindings(Path.cwd())["producer_graph_sha256"])'
+          )"
+          image_tag="mib-wo21:${GITHUB_SHA:0:12}"
+
+          timeout --signal=TERM --kill-after=30s 1800s \
+            docker build \
+              --pull=false \
+              --label "mib.wo20.source_revision=$revision" \
+              --label "mib.wo20.producer_graph_sha256=$producer_graph" \
+              --tag "$image_tag" \
+              "$GITHUB_WORKSPACE"
+
+          echo "image-tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Run clean constrained adversarial audit
+        run: |
+          evidence_dir="$RUNNER_TEMP/wo21-evidence"
+          mkdir -p "$evidence_dir"
+          chmod 0777 "$evidence_dir"
+
+          mapfile -t wo20_aggregates < <(
+            find "$RUNNER_TEMP/wo20-prerequisite" \
+              -type f \
+              -name 'wo20-aggregate.json' \
+              -print
+          )
+          test "${#wo20_aggregates[@]}" -eq 1
+          wo20_aggregate="${wo20_aggregates[0]}"
+          jq -e \
+            --arg revision "${{ needs.preflight.outputs.source-sha }}" \
+            '
+              (.status == "PASS" or .status == "PASS_WITH_WARNINGS") and
+              .aggregate_only == true and
+              .source_binding.git_revision == $revision and
+              .determinism.byte_identical == true and
+              .runtime.all_captures_within_official_runtime_limit == true and
+              .runtime.all_captures_within_official_memory_limit == true
+            ' \
+            "$wo20_aggregate"
+          wo20_aggregate_sha="$(
+            sha256sum "$wo20_aggregate" |
+              cut -d ' ' -f 1
+          )"
+
+          docker run \
+            --rm \
+            --network none \
+            --cpus 4 \
+            --memory 8g \
+            --memory-swap 8g \
+            --pids-limit 512 \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+            --mount \
+              "type=bind,src=$GITHUB_WORKSPACE,dst=/repo,readonly" \
+            --mount \
+              "type=bind,src=$evidence_dir,dst=/evidence" \
+            --workdir /repo \
+            --entrypoint python3 \
+            "${{ steps.image.outputs.image-tag }}" \
+            -m devtools.wo21_adversarial_audit \
+            --external-dir /tmp/wo21 \
+            --evidence-json /evidence/wo21.json \
+            --evidence-markdown /evidence/wo21.md \
+            --regression-filed-count 0 \
+            --source-revision \
+              "${{ needs.preflight.outputs.source-sha }}" \
+            --source-clean-verified \
+            --docker-available-verified \
+            --docker-reproducibility-verified \
+            --docker-runtime-verified \
+            --github-repository "$GITHUB_REPOSITORY" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --wo20-aggregate-sha256 "$wo20_aggregate_sha"
+
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg wo20_sha "$wo20_aggregate_sha" \
+            '
+            .status == "pass" and
+            .counts.category_count == 13 and
+            .counts.scenario_count == 15 and
+            .counts.failed_scenario_count == 0 and
+            .counts.new_approval_count == 0 and
+            .counts.decoy_adoption_count == 0 and
+            .counts.missing_record_count == 0 and
+            .counts.invalid_record_count == 0 and
+            .counts.identity_finding_count == 0 and
+            .counts.model_artifact_scan_count > 0 and
+            .counts.regression_waiver_count == 0 and
+            .checks.all_categories_exercised == true and
+            .checks.host_runs_byte_identical == true and
+            .checks.host_oracles_passed == true and
+            .checks.runtime_identity_scan_clean == true and
+            .checks.model_identity_scan_clean == true and
+            .checks.source_revision_clean == true and
+            .checks.source_revision_external_attestation_verified == true and
+            .checks.workflow_attestation_provenance_verified == true and
+            .checks.docker_available == true and
+            .checks.docker_reproducibility_verified == true and
+            .checks.docker_runtime_verified == true and
+            .attestation_provenance.provider == "github_actions" and
+            .attestation_provenance.repository == $repository and
+            .attestation_provenance.workflow_run_id == $run_id and
+            .attestation_provenance.workflow_run_attempt == $run_attempt and
+            .attestation_provenance.wo20_aggregate_sha256 == $wo20_sha
+            ' \
+            "$evidence_dir/wo21.json"
+
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Upload aggregate-only WO21 evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wo21-aggregate-${{ needs.preflight.outputs.source-sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/wo21-evidence/wo21.json
+            ${{ runner.temp }}/wo21-evidence/wo21.md
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9

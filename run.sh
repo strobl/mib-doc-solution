@@ -6,4 +6,5 @@ if [ "$#" -ne 2 ]; then
   exit 64
 fi
 
-exec python3 -I -B /app/solution.py "$1" "$2"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 -B "$SCRIPT_DIR/solution.py" "$1" "$2"

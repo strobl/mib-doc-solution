@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .models import PredictionRow
 from .pipeline import CaseProcessor
@@ -56,12 +56,14 @@ class BatchRunner:
         *,
         writer: CanonicalJsonlWriter | None = None,
         max_workers: int = 4,
+        row_finalizer: Callable[[Path, PredictionRow], PredictionRow] | None = None,
     ) -> None:
         if max_workers < 1 or max_workers > 4:
             raise ValueError("max_workers must be between 1 and 4")
         self._processor = processor
         self._writer = writer or CanonicalJsonlWriter()
         self._max_workers = max_workers
+        self._row_finalizer = row_finalizer
 
     def _process_one(self, pdf_path: Path) -> CaseResult:
         try:
@@ -100,6 +102,21 @@ class BatchRunner:
     def run(self, input_dir: Path, output_path: Path) -> BatchRunReport:
         pdf_paths = discover_case_pdfs(input_dir)
         results = self._process_all(pdf_paths)
+        if self._row_finalizer is not None:
+            finalized: list[CaseResult] = []
+            for pdf_path, result in zip(pdf_paths, results, strict=True):
+                if result.row is None:
+                    finalized.append(result)
+                    continue
+                try:
+                    row = self._row_finalizer(pdf_path, result.row)
+                    finalized.append(CaseResult(row=row, failure=None))
+                except Exception:
+                    # This optional score lift must fail closed. A valid base
+                    # row is safer than turning a layout-only failure into an
+                    # omitted case.
+                    finalized.append(result)
+            results = tuple(finalized)
         rows = tuple(result.row for result in results if result.row is not None)
         failures = tuple(
             result.failure for result in results if result.failure is not None

@@ -4,6 +4,13 @@ This directory adds the license and model provenance files that are not
 present in the `rapidocr==3.9.2` wheel itself. The Docker image copies this
 directory to `/app/third_party_licenses`.
 
+The visible-evidence scoring layer adapts MIT-licensed public challenge work
+from `arjunkshah12345-hash/mib-doc-solution`, via the audited answer-key-free
+finalizer published by `vibemarketer94/mib-doc-solution`. The original Arjun
+MIT notice is retained under `PublicSolutions/LICENSE-Arjun`; exact repository
+commits and excluded unsafe paths are documented in the root
+[`ATTRIBUTION.md`](../ATTRIBUTION.md).
+
 The remaining pinned Python wheels retain their own license and NOTICE files
 inside the installed package tree. In particular, redistribution must retain:
 

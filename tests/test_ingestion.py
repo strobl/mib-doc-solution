@@ -19,67 +19,25 @@ except ImportError:
     Image = None
 
 
-class FakeTextPage:
-    def __init__(self, characters):
-        self.characters = characters
-        self.closed = False
-
-    def count_chars(self):
-        return len(self.characters)
-
-    def get_text_range(self, index, count):
-        return self.characters[index][0]
-
-    def get_charbox(self, index):
-        return self.characters[index][1]
-
-    def close(self):
-        self.closed = True
-
-
 class FakePage:
-    def __init__(self, text_page):
-        self.text_page = text_page
-
     def get_textpage(self):
-        return self.text_page
+        raise AssertionError("native PDF text must never be opened")
 
 
 class TextLayerTests(unittest.TestCase):
-    def test_text_is_non_authoritative_and_off_crop_is_flagged(self):
-        text_page = FakeTextPage(
-            [
-                ("A", (10, 10, 15, 20)),
-                ("B", (16, 10, 21, 20)),
-                (" ", (22, 10, 24, 20)),
-                ("X", (150, 150, 160, 165)),
-            ]
-        )
+    def test_compatibility_reader_is_a_native_text_noop(self):
         spans, truncated = TextLayerReader().read_page(
-            FakePage(text_page),
+            FakePage(),
             page_index=0,
             crop_box=Rect(0, 0, 100, 100),
         )
 
         self.assertFalse(truncated)
-        self.assertTrue(text_page.closed)
-        self.assertEqual([span.text for span in spans], ["AB", "X"])
-        self.assertFalse(spans[0].authoritative)
-        self.assertFalse(spans[0].off_crop)
-        self.assertTrue(spans[1].off_crop)
+        self.assertEqual(spans, ())
 
-    def test_text_work_is_bounded_and_truncation_recorded(self):
-        text_page = FakeTextPage(
-            [(str(index % 10), (index, 0, index + 1, 10)) for index in range(100)]
-        )
-        spans, truncated = TextLayerReader(max_chars_per_page=10).read_page(
-            FakePage(text_page),
-            page_index=2,
-            crop_box=Rect(0, 0, 200, 200),
-        )
-
-        self.assertTrue(truncated)
-        self.assertEqual("".join(span.text for span in spans), "0123456789")
+    def test_compatibility_reader_keeps_positive_limit_validation(self):
+        with self.assertRaises(ValueError):
+            TextLayerReader(max_chars_per_page=0)
 
 
 class RenderFirstCompositionTests(unittest.TestCase):

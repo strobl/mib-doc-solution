@@ -104,10 +104,44 @@ class RuntimeScaffoldTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text()
 
         self.assertIn('if [ "$#" -ne 2 ]', run_script)
+        self.assertIn('SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")"', run_script)
+        self.assertIn(
+            'exec python3 -B "$SCRIPT_DIR/solution.py" "$1" "$2"',
+            run_script,
+        )
+        self.assertNotIn("python3 -I", run_script)
         self.assertIn('ENTRYPOINT ["/app/run.sh"]', dockerfile)
         self.assertIn("FROM python:3.12.11-slim-bookworm", dockerfile)
-        self.assertIn("USER mib:mib", dockerfile)
+        self.assertIn("USER root", dockerfile)
         self.assertIn("MIB_MAX_WORKERS=4", dockerfile)
+
+    def test_real_shell_launcher_resolves_solution_and_package_from_its_directory(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            output_dir.mkdir()
+            output_path = output_dir / "predictions.jsonl"
+            launcher_env = dict(os.environ)
+            launcher_env["PATH"] = (
+                str(Path(sys.executable).parent)
+                + os.pathsep
+                + launcher_env.get("PATH", "")
+            )
+
+            result = subprocess.run(
+                ["sh", str(ROOT / "run.sh"), str(input_dir), str(output_path)],
+                cwd=root,
+                env=launcher_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output_path.read_bytes(), b"")
+            self.assertNotIn("ModuleNotFoundError", result.stderr)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,11 @@ from .output_confidence import (
     OutputConfidenceRecalibrator,
     PinnedOutputConfidenceMap,
 )
+from .production import (
+    IsolatedProductionProcessor,
+    build_isolated_production_processor,
+    build_production_processor,
+)
 from .pipeline import (
     AdjudicatingCaseProcessor,
     ExtractThenFallbackProcessor,
@@ -77,6 +82,16 @@ from .pipeline import (
     SafeFallbackProcessor,
 )
 from .writer import CanonicalJsonlWriter, DuplicateCaseIdError
+from .visible_text import (
+    VisibleOcrLineRecord,
+    VisibleOcrPageSnapshot,
+    VisibleOcrSnapshot,
+    VisibleOcrTextStore,
+    VisibleSponsorAttestation,
+    VisibleTextSnapshotError,
+    VisibleTextSnapshotMismatch,
+    VisibleTextSnapshotMissing,
+)
 
 __all__ = [
     "AdjudicatingCaseProcessor",
@@ -101,6 +116,7 @@ __all__ = [
     "FIELD_NAMES",
     "FieldState",
     "LinkedCase",
+    "IsolatedProductionProcessor",
     "GeneralizablePolicyExceptionStore",
     "PolicyArtifactError",
     "PolicyException",
@@ -133,8 +149,18 @@ __all__ = [
     "TesseractOcrEngine",
     "UntrustedContentFilter",
     "VisibleEvidenceExtractor",
+    "VisibleOcrLineRecord",
+    "VisibleOcrPageSnapshot",
+    "VisibleOcrSnapshot",
+    "VisibleOcrTextStore",
+    "VisibleSponsorAttestation",
+    "VisibleTextSnapshotError",
+    "VisibleTextSnapshotMismatch",
+    "VisibleTextSnapshotMissing",
     "VisualCueDetector",
     "build_rapid_extractor",
+    "build_isolated_production_processor",
+    "build_production_processor",
     "discover_case_pdfs",
     "group_ocr_lines",
     "OcrLine",
