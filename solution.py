@@ -9,24 +9,12 @@ from pathlib import Path
 from typing import Sequence
 
 from mib_pipeline import (
-    AdjudicationEngine,
     BatchRunner,
     CalibrationArtifactError,
-    CaseLinker,
-    ConfidenceCalibrator,
-    DocumentRenderer,
-    EvidencePrecedenceResolver,
-    GeneralizablePolicyExceptionStore,
-    OutputConfidenceRecalibrationProcessor,
-    OutputConfidenceRecalibrator,
     PolicyArtifactError,
-    RapidOutputRecoveryProcessor,
-    ReviewDenialRecoveryAdjudicator,
-    VisibleEvidenceExtractor,
-    VisibleOcrTextStore,
+    build_production_processor,
     discover_case_pdfs,
 )
-from mib_pipeline.score_finalizer import VisibleScoreFinalizer
 
 
 USAGE = "usage: solution.py <input_pdf_dir> <output_predictions_path>"
@@ -90,28 +78,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = sys.argv if argv is None else argv
     try:
         input_dir, output_path = parse_paths(arguments)
-        visible_text_store = VisibleOcrTextStore()
         runner = BatchRunner(
-            OutputConfidenceRecalibrationProcessor(
-                processor=RapidOutputRecoveryProcessor(
-                    renderer=DocumentRenderer(),
-                    primary_extractor=VisibleEvidenceExtractor(
-                        packet_page_type_markers=True,
-                        visible_text_store=visible_text_store,
-                    ),
-                    linker=CaseLinker(),
-                    resolver=EvidencePrecedenceResolver(),
-                    adjudicator=ReviewDenialRecoveryAdjudicator(
-                        AdjudicationEngine(
-                            calibrator=ConfidenceCalibrator.from_pinned_artifact(),
-                            exceptions=GeneralizablePolicyExceptionStore.from_pinned_artifact(),
-                        )
-                    ),
-                ),
-                recalibrator=OutputConfidenceRecalibrator.from_pinned_artifact(),
-            ),
+            build_production_processor(),
             max_workers=configured_worker_limit(),
-            row_finalizer=VisibleScoreFinalizer(visible_text_store),
         )
         report = runner.run(input_dir, output_path)
     except (CalibrationArtifactError, ContractError, OSError, PolicyArtifactError) as exc:
