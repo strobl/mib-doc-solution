@@ -12,9 +12,16 @@ contains one stronger, exact-case biometric value.
 
 from __future__ import annotations
 
+import atexit
+import json
+import select
+import struct
+import subprocess
+import sys
 import threading
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Protocol
 
 from .adjudication import AdjudicationOutcome, PolicyRuleSet
@@ -101,6 +108,177 @@ SEMANTIC_DENIAL_RULE_IDS = (
 # native-result destruction.  Rendering, primary OCR, linking, and
 # adjudication remain parallel.
 _RAPID_OCR_NATIVE_LOCK = threading.RLock()
+_RAPID_OCR_FRAME = struct.Struct(">Q")
+_RAPID_OCR_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+# Linux allocator corruption appeared only after sustained native use.  Eight
+# requests keeps each disposable worker far below the observed failure window
+# while adding little startup cost relative to full-page OCR.
+_RAPID_OCR_REQUESTS_PER_WORKER = 8
+_RAPID_OCR_RESPONSE_TIMEOUT_SECONDS = 120
+
+
+def _rapid_ocr_params(model_root: str) -> dict[str, Any]:
+    return {
+        "Global.model_root_dir": model_root,
+        "Global.log_level": "error",
+        "Global.text_score": 0.30,
+        "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+        "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+    }
+
+
+def _read_exact(stream: Any, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise EOFError("RapidOCR worker closed its response stream")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+class _RapidOcrWorkerClient:
+    """Call crash-prone native OCR through a bounded recyclable subprocess."""
+
+    def __init__(
+        self,
+        *,
+        max_requests: int = _RAPID_OCR_REQUESTS_PER_WORKER,
+        popen_factory: Callable[..., Any] = subprocess.Popen,
+        register_atexit: bool = True,
+    ) -> None:
+        if max_requests < 1:
+            raise ValueError("max_requests must be positive")
+        self._max_requests = max_requests
+        self._popen_factory = popen_factory
+        self._process: Any | None = None
+        self._successful_requests = 0
+        if register_atexit:
+            atexit.register(self.close)
+
+    def _start(self) -> None:
+        process = self._popen_factory(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "mib_pipeline.rapid_worker",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        if process.stdin is None or process.stdout is None:
+            process.terminate()
+            raise RuntimeError("RapidOCR worker pipes are unavailable")
+        self._process = process
+        self._successful_requests = 0
+
+    def _stop(self, *, force: bool = False) -> None:
+        process = self._process
+        self._process = None
+        self._successful_requests = 0
+        if process is None:
+            return
+        try:
+            if process.poll() is None and not force and process.stdin is not None:
+                process.stdin.write(_RAPID_OCR_FRAME.pack(0))
+                process.stdin.flush()
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+    def close(self) -> None:
+        with _RAPID_OCR_NATIVE_LOCK:
+            self._stop()
+
+    def _request(self, image_png: bytes) -> SimpleNamespace:
+        process = self._process
+        if (
+            process is None
+            or process.poll() is not None
+            or process.stdin is None
+            or process.stdout is None
+        ):
+            self._stop(force=True)
+            self._start()
+            process = self._process
+        if process is None or process.stdin is None or process.stdout is None:
+            raise RuntimeError("RapidOCR worker failed to start")
+
+        process.stdin.write(_RAPID_OCR_FRAME.pack(len(image_png)))
+        process.stdin.write(image_png)
+        process.stdin.flush()
+        try:
+            stdout_descriptor = process.stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            stdout_descriptor = None
+        if stdout_descriptor is not None:
+            readable, _, _ = select.select(
+                [stdout_descriptor],
+                [],
+                [],
+                _RAPID_OCR_RESPONSE_TIMEOUT_SECONDS,
+            )
+            if not readable:
+                raise RuntimeError("RapidOCR worker response timed out")
+        response_size = _RAPID_OCR_FRAME.unpack(
+            _read_exact(process.stdout, _RAPID_OCR_FRAME.size)
+        )[0]
+        if response_size < 2 or response_size > _RAPID_OCR_MAX_RESPONSE_BYTES:
+            raise RuntimeError("RapidOCR worker returned an invalid response size")
+        payload = json.loads(
+            _read_exact(process.stdout, response_size).decode("utf-8")
+        )
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise RuntimeError("RapidOCR worker could not read the page")
+        boxes = payload.get("boxes")
+        texts = payload.get("txts")
+        scores = payload.get("scores")
+        if not isinstance(boxes, list) or not isinstance(texts, list):
+            raise RuntimeError("RapidOCR worker returned invalid OCR arrays")
+        if not isinstance(scores, list):
+            raise RuntimeError("RapidOCR worker returned invalid OCR scores")
+        self._successful_requests += 1
+        result = SimpleNamespace(boxes=boxes, txts=texts, scores=scores)
+        if self._successful_requests >= self._max_requests:
+            self._stop()
+        return result
+
+    def __call__(self, image_png: bytes) -> SimpleNamespace:
+        if not isinstance(image_png, bytes) or not image_png:
+            raise ValueError("RapidOCR worker requires non-empty PNG bytes")
+        last_error: Exception | None = None
+        for _attempt in range(2):
+            try:
+                return self._request(image_png)
+            except (
+                BrokenPipeError,
+                EOFError,
+                OSError,
+                RuntimeError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as exc:
+                last_error = exc
+                self._stop(force=True)
+        raise RuntimeError("RapidOCR worker failed twice") from last_error
 
 
 class PrimaryAdjudicator(Protocol):
@@ -125,28 +303,15 @@ class RapidOcrEngine:
         package_root: Path | str | None = None,
     ) -> None:
         if engine_factory is None:
-            try:
-                import rapidocr as rapidocr_package
-            except ImportError as exc:  # pragma: no cover - production image path
-                raise RuntimeError("RapidOCR is not installed") from exc
-            engine_factory = rapidocr_package.RapidOCR
-            package_file = getattr(rapidocr_package, "__file__", None)
-            if package_file is None:
-                raise RuntimeError("RapidOCR package location is unavailable")
-            package_root = Path(package_file).resolve().parent
+            self._engine = _RapidOcrWorkerClient()
+            return
         if package_root is None:
             raise ValueError("package_root is required with a custom engine_factory")
 
         model_root = str(Path(package_root).resolve() / "models")
         with _RAPID_OCR_NATIVE_LOCK:
             self._engine = engine_factory(
-                params={
-                    "Global.model_root_dir": model_root,
-                    "Global.log_level": "error",
-                    "Global.text_score": 0.30,
-                    "EngineConfig.onnxruntime.intra_op_num_threads": 1,
-                    "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-                }
+                params=_rapid_ocr_params(model_root)
             )
 
     def read_page(self, page: RenderedPage) -> tuple[OcrToken, ...]:

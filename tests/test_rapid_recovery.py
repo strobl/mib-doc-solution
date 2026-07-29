@@ -1,3 +1,5 @@
+import io
+import json
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -7,6 +9,7 @@ from time import sleep
 from unittest.mock import patch
 
 import mib_pipeline.rapid_recovery as rapid_recovery
+from mib_pipeline import rapid_worker
 from mib_pipeline.adjudication import AdjudicationOutcome, DecisionTrace
 from mib_pipeline.extraction import CandidateEvidence, EvidenceType
 from mib_pipeline.ingestion import Rect
@@ -17,6 +20,7 @@ from mib_pipeline.rapid_recovery import (
     REVIEW_APPROVAL_CONFIDENCE,
     SEMANTIC_DENIAL_CONFIDENCE,
     XW1_MULTISOURCE_REVIEW_APPROVAL_CONFIDENCE,
+    _RapidOcrWorkerClient,
 )
 from mib_pipeline.resolution import (
     FieldState,
@@ -302,6 +306,19 @@ def processor(
 
 
 class RapidOcrEngineTests(unittest.TestCase):
+    def test_default_engine_uses_recyclable_isolated_worker(self):
+        worker = object()
+        with patch.object(
+            rapid_recovery,
+            "_RapidOcrWorkerClient",
+            return_value=worker,
+        ) as worker_factory:
+            adapter = RapidOcrEngine()
+
+        self.assertIs(adapter._engine, worker)
+        worker_factory.assert_called_once_with()
+        self.assertEqual(rapid_recovery._RAPID_OCR_REQUESTS_PER_WORKER, 8)
+
     def test_uses_string_wheel_model_root_and_one_plus_one_threads(self):
         captured = {}
 
@@ -483,6 +500,120 @@ class RapidOcrEngineTests(unittest.TestCase):
         self.assertIs(first._ocr, native_engine)
         self.assertIs(second._ocr, native_engine)
         engine_factory.assert_called_once_with()
+
+
+class RapidOcrWorkerTests(unittest.TestCase):
+    class FakeProcess:
+        def __init__(self, response_bytes):
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(response_bytes)
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    @staticmethod
+    def _response(payload):
+        encoded = json.dumps(payload).encode("utf-8")
+        return rapid_recovery._RAPID_OCR_FRAME.pack(len(encoded)) + encoded
+
+    def test_worker_materializes_native_values_to_json_primitives(self):
+        result = types.SimpleNamespace(
+            boxes=[
+                [
+                    (1, 2),
+                    (5, 2),
+                    (5, 7),
+                    (1, 7),
+                ]
+            ],
+            txts=["visible"],
+            scores=[0.97],
+        )
+
+        payload = rapid_worker._materialize_result(result)
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(
+            payload["boxes"],
+            [[[1.0, 2.0], [5.0, 2.0], [5.0, 7.0], [1.0, 7.0]]],
+        )
+        self.assertEqual(payload["txts"], ["visible"])
+        self.assertEqual(payload["scores"], [0.97])
+
+    def test_client_restarts_and_retries_after_worker_eof(self):
+        good_payload = {
+            "status": "ok",
+            "boxes": [[[1.0, 2.0], [5.0, 2.0], [5.0, 7.0], [1.0, 7.0]]],
+            "txts": ["visible"],
+            "scores": [0.97],
+        }
+        processes = [
+            self.FakeProcess(b""),
+            self.FakeProcess(self._response(good_payload)),
+        ]
+        starts = []
+
+        def popen_factory(*args, **kwargs):
+            starts.append((args, kwargs))
+            return processes[len(starts) - 1]
+
+        client = _RapidOcrWorkerClient(
+            popen_factory=popen_factory,
+            register_atexit=False,
+        )
+
+        result = client(b"png")
+        client.close()
+
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(result.txts, ["visible"])
+        self.assertEqual(result.scores, [0.97])
+
+    def test_client_recycles_after_bounded_request_count(self):
+        payload = {
+            "status": "ok",
+            "boxes": [],
+            "txts": [],
+            "scores": [],
+        }
+        processes = [
+            self.FakeProcess(self._response(payload)),
+            self.FakeProcess(self._response(payload)),
+        ]
+        starts = []
+
+        def popen_factory(*args, **kwargs):
+            starts.append((args, kwargs))
+            return processes[len(starts) - 1]
+
+        client = _RapidOcrWorkerClient(
+            max_requests=1,
+            popen_factory=popen_factory,
+            register_atexit=False,
+        )
+
+        first = client(b"first")
+        second = client(b"second")
+        client.close()
+
+        self.assertEqual(first.txts, [])
+        self.assertEqual(second.txts, [])
+        self.assertEqual(len(starts), 2)
 
 
 class RapidPackagingContractTests(unittest.TestCase):
