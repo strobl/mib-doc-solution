@@ -12,7 +12,7 @@ from mib_pipeline import (
     BatchRunner,
     CalibrationArtifactError,
     PolicyArtifactError,
-    build_production_processor,
+    build_isolated_production_processor,
     discover_case_pdfs,
 )
 
@@ -79,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         input_dir, output_path = parse_paths(arguments)
         runner = BatchRunner(
-            build_production_processor(),
+            build_isolated_production_processor(),
             max_workers=configured_worker_limit(),
         )
         report = runner.run(input_dir, output_path)

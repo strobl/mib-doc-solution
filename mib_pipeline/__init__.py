@@ -68,7 +68,11 @@ from .output_confidence import (
     OutputConfidenceRecalibrator,
     PinnedOutputConfidenceMap,
 )
-from .production import build_production_processor
+from .production import (
+    IsolatedProductionProcessor,
+    build_isolated_production_processor,
+    build_production_processor,
+)
 from .pipeline import (
     AdjudicatingCaseProcessor,
     ExtractThenFallbackProcessor,
@@ -112,6 +116,7 @@ __all__ = [
     "FIELD_NAMES",
     "FieldState",
     "LinkedCase",
+    "IsolatedProductionProcessor",
     "GeneralizablePolicyExceptionStore",
     "PolicyArtifactError",
     "PolicyException",
@@ -154,6 +159,7 @@ __all__ = [
     "VisibleTextSnapshotMissing",
     "VisualCueDetector",
     "build_rapid_extractor",
+    "build_isolated_production_processor",
     "build_production_processor",
     "discover_case_pdfs",
     "group_ocr_lines",
