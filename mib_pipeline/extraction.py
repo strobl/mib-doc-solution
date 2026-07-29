@@ -523,6 +523,17 @@ CONSENSUS_RETRY_FIELDS = (
     "fee_status",
 )
 
+# A sideways page is admitted only after the primary pass found no candidates.
+# Unlike other retry routes, its two rotated OCR views may recover the
+# applicant name and risk flags because an otherwise unreadable orientation
+# cannot provide primary-pass identity or a policy-safe risk state.  The
+# relaxed, candidate-free route below additionally requires every recovered
+# field to carry the exact active case anchor.
+ORIENTATION_RETRY_FIELDS = CONSENSUS_RETRY_FIELDS + (
+    "applicant_name",
+    "risk_flags",
+)
+
 # Applicant names are generated compositionally.  Storing the 12 stems and 12
 # endings is a general OCR language model, not a case/name lookup table.
 APPLICANT_STEMS = (
@@ -2405,7 +2416,7 @@ class VisibleEvidenceExtractor:
         baseline: tuple[CandidateEvidence, ...],
         routing_lines: dict[int, tuple[OcrLine, ...]],
     ) -> tuple[RenderedPage, ...]:
-        """Route at most two candidate-free pages using primary OCR only."""
+        """Route at most two candidate-free, blank-or-anchored primary pages."""
 
         case_id = rendered_case.case_id
         if not isinstance(case_id, str) or not CASE_ID_PATTERN.fullmatch(case_id):
@@ -2432,7 +2443,12 @@ class VisibleEvidenceExtractor:
                 for line in lines
                 if (match := self._ORIENTATION_FOOTER_RE.search(line.text))
             )
-            if not exact_footer:
+            # A physically quarter-turned raster can leave the primary OCR
+            # completely empty, including the normally trusted footer. Admit
+            # that narrow blank-primary case; the retry result is accepted
+            # only when both rotated views bind every field to the exact
+            # active case. Non-empty unanchored OCR still fails closed.
+            if not exact_footer and lines:
                 continue
             # Any structured primary candidate, including illegible evidence,
             # makes this an ordinary precedence/linkage problem rather than a
@@ -2540,7 +2556,7 @@ class VisibleEvidenceExtractor:
         grouped: dict[str, list[CandidateEvidence]] = {}
         for candidate in retry_candidates:
             if (
-                candidate.field_name not in CONSENSUS_RETRY_FIELDS
+                candidate.field_name not in ORIENTATION_RETRY_FIELDS
                 or candidate.value is None
                 or not candidate.legible
                 or candidate.superseded
@@ -2663,6 +2679,16 @@ class VisibleEvidenceExtractor:
             tuple[tuple[CandidateEvidence, ...], set[str]]
         ] = []
         for page in pages:
+            primary_case_anchor = any(
+                match is not None
+                and match.group(1).upper() == rendered_case.case_id.upper()
+                for line in routing_lines.get(page.index, ())
+                if (
+                    match := self._ORIENTATION_FOOTER_RE.search(
+                        line.text
+                    )
+                )
+            )
             scans: list[
                 tuple[
                     int,
@@ -2700,6 +2726,21 @@ class VisibleEvidenceExtractor:
                         best_pass[1],
                         confirmation[1],
                     )
+                    if not primary_case_anchor:
+                        accepted = tuple(
+                            candidate
+                            for candidate in accepted
+                            if (
+                                best_pass[1][
+                                    candidate.field_name
+                                ].case_id_hint
+                                == rendered_case.case_id
+                                and confirmation[1][
+                                    candidate.field_name
+                                ].case_id_hint
+                                == rendered_case.case_id
+                            )
+                        )
             accepted_fields = {candidate.field_name for candidate in accepted}
             unconfirmed_labels = set(best_labels) - accepted_fields
             page_results.append((accepted, unconfirmed_labels))
